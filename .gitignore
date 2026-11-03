@@ -1,0 +1,59 @@
+# Secrets - never commit
+liam_secrets.py
+.env
+.env.*
+*.pem
+*.key
+
+# WhatsApp / Chrome session credentials
+liam_session/
+tokens/
+
+# Runtime state and data (stored in %LOCALAPPDATA%\LiamWhatsApp by default)
+liam_memory.db
+liam_memory.db-wal
+liam_memory.db-shm
+.stop
+.brain_state
+stop_flag
+brain_state
+tool_token
+qr.png
+liam_qr.png
+whatsapp_qr.png
+scan_liam.png
+outbox/
+
+# Logs and old run artifacts
+*.log
+liam_err.txt
+liam_log.txt
+liam_out.log
+out.txt
+brain_out.txt
+brain_err.txt
+err.txt
+
+# WhatsApp Web cache
+.wwebjs_cache/
+
+# Node
+node_modules/
+npm-debug.log*
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
