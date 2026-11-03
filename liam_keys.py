@@ -38,26 +38,8 @@ MOON_FALLBACK = os.environ.get("MOON_FALLBACK", "glm-5.3-flash")
 UNO_KEYS = _keys("UNO_KEYS")
 UNO_BASE = os.environ.get("UNO_BASE", "https://api.unorouter.com/v1")
 UNO_MODELS = [
-    "deepseek-chat-v3",
-    "deepseek-reasoner",
-    "gpt-4o",
-    "gpt-4.1",
-    "claude-sonnet-4-5",
-    "claude-opus-4-5",
-    "llama-4-maverick",
-    "llama-4-scout",
-    "mixtral-8x22b",
-    "mistral-large-latest",
-    "grok-3-latest",
-    "grok-2-latest",
-    "command-r-plus",
-    "command-r",
-    "gpt-4.1-nano",
-    "gpt-4.1-mini",
-    "o3-mini",
-    "o4-mini",
-    "deepseek-v4-flash",
-    "deepseek-v4-pro",
+    "gpt-4o:free", "llama-4-scout:free", "mistral-small-4-119b-2603:free",
+    "qwen3.6-35b-a3b:free", "deepseek-r1-distill-llama-70b:free",
 ]
 
 # --- Agnes 3 Flash (free, always available) ---
@@ -71,7 +53,10 @@ HF_MODEL = os.environ.get("HF_MODEL", "nicoboss/Qwen3-32B-Uncensored")
 HF_MODEL_8B = os.environ.get("HF_MODEL_8B", "Qwen/Qwen3-8B")
 HF_KEY = str(_secret("HF_KEY", "")).strip()
 
-# --- Google Gemini (optional: image generation + voice notes) ---
+# --- HCNSec (secondary brain, replaces Unorouter) ---
+HCN_BASE = os.environ.get("HCN_BASE", "https://api.hcnsec.cn/v1")
+HCN_MODEL = os.environ.get("HCN_MODEL", "DeepSeek-V4-Flash")
+HCN_KEY = str(_secret("HCN_KEY", "")).strip()
 GOOGLE_API_KEY = str(_secret("GOOGLE_API_KEY", "")).strip()
 GOOGLE_IMAGE_MODEL = os.environ.get("LIAM_IMAGE_MODEL", "gemini-2.5-flash-image-preview")
 GOOGLE_TTS_MODEL = os.environ.get("LIAM_TTS_MODEL", "gemini-2.5-flash-preview-tts")

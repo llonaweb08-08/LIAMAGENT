@@ -239,14 +239,14 @@ class AgentToolTests(unittest.TestCase):
     def test_memory_tools_are_scoped(self):
         with mock.patch.object(agent, "remember", return_value="ok") as remember:
             agent._tools_for(MEMBER)["remember"](user="owner", fact="fact")
-            remember.assert_called_once_with(MEMBER, "fact", source=MEMBER)
+            remember.assert_called_once_with(MEMBER, "fact", source=MEMBER, scope="personal")
         with mock.patch.object(agent, "remember", return_value="ok") as remember:
             agent._tools_for(OWNER)["remember"](user="babe", fact="fact")
-            remember.assert_called_once_with(OWNER, "fact", source=OWNER)
+            remember.assert_called_once_with(OWNER, "fact", source=OWNER, scope="personal")
         with mock.patch.object(agent, "remember", return_value="ok") as remember:
             admin_name = agent.ADMS[ADMIN]["name"]
             agent._tools_for(OWNER)["remember"](user=admin_name, fact="fact")
-            remember.assert_called_once_with(ADMIN, "fact", source=OWNER)
+            remember.assert_called_once_with(ADMIN, "fact", source=OWNER, scope="personal")
 
     def test_brain_switch_is_owner_only(self):
         self.assertIn("only the owner", agent.switch_brain("moon", MEMBER))
@@ -466,7 +466,7 @@ class HygieneTests(unittest.TestCase):
             spec.loader.exec_module(module)
         self.assertEqual(out.getvalue(), "")
         self.assertEqual(err.getvalue(), "")
-        with mock.patch.object(module.socket, "gethostbyname", return_value="1.2.3.4"):
+        with mock.patch.object(module.socket, "getaddrinfo", return_value=[(None, None, None, None, ("1.2.3.4", 0))]):
             self.assertIn("1.2.3.4", module.get_domain_info("example.com"))
         with contextlib.redirect_stderr(err):
             self.assertEqual(module.main([]), 2)

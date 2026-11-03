@@ -17,9 +17,12 @@ def get_domain_info(domain: str) -> str:
     if not domain:
         return "Could not resolve an empty domain"
     try:
-        ip = socket.gethostbyname(domain)
+        infos = socket.getaddrinfo(domain, None)
+        ip = infos[0][4][0] if infos else ""
     except (socket.gaierror, OSError) as exc:
         return f"Could not resolve {domain}: {exc}"
+    if not ip:
+        return f"Could not resolve {domain}: no address"
     return f"Domain: {domain}\nIP Address: {ip}"
 
 

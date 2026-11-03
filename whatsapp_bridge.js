@@ -123,9 +123,14 @@ const TOOL_TOKEN = loadToken();
 
 function writeFileAtomic(file, value) {
   const temp = file + "." + process.pid + "." + Date.now() + ".tmp";
-  fs.writeFileSync(temp, value, { mode: 0o600 });
-  try { fs.chmodSync(temp, 0o600); } catch (e) {}
-  fs.renameSync(temp, file);
+  try {
+    fs.writeFileSync(temp, value, { mode: 0o600 });
+    try { fs.chmodSync(temp, 0o600); } catch (e) {}
+    fs.renameSync(temp, file);
+  } catch (e) {
+    try { fs.rmSync(temp, { force: true }); } catch (e2) {}
+    throw e;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -210,7 +215,10 @@ function stopAgent() {
   try { proc.kill(); } catch (e) {}
 }
 
-const lidCache = new Map();
+const LID_MAP_FILE = path.join(DATA_DIR, "lid_map.json");
+let lidCache = new Map();
+try { const raw = JSON.parse(fs.readFileSync(LID_MAP_FILE, "utf8")); for (const [k,v] of Object.entries(raw)) lidCache.set(k,v); } catch (e) {}
+function saveLidMap() { try { fs.writeFileSync(LID_MAP_FILE, JSON.stringify(Object.fromEntries(lidCache)), { mode: 0o600 }); } catch (e) {} }
 async function resolvePhone(id) {
   const raw = String(id || "");
   const base = bareId(raw);
@@ -228,7 +236,7 @@ async function resolvePhone(id) {
       if (c && c.number) phone = bareId(c.number);
     } catch (e) { console.log("🔍 contact lookup failed:", String(e)); }
   }
-  if (phone) lidCache.set(base, phone);
+  if (phone) { lidCache.set(base, phone); saveLidMap(); }
   return phone || base;
 }
 
@@ -326,7 +334,8 @@ client.on("message", async (msg) => {
   const mentioned =
     (Array.isArray(msg.mentionedIds) && msg.mentionedIds.some((id) => bareId(id) === selfBare)) ||
     (!!selfBare && text.includes("@" + selfBare)) ||
-    /@Liam\b/i.test(text);
+    /@Liam\b/i.test(text) ||
+    /\bliam\b/i.test(text);
   const replyingToLiam = !!replyTo && lastLiam[from] === replyTo;
   if (!mentioned && !replyingToLiam) return;
 
@@ -335,6 +344,23 @@ client.on("message", async (msg) => {
   else if (phone in ADMINS) who = "admin";
   else who = "member";
 
+  // Permission gate for non-owners/admins mentioning Liam
+  if (who === "member" && mentioned) {
+    if (!global.pendingPerm) global.pendingPerm = {};
+    const ownerTag = OWNERS[0] ? "@" + OWNERS[0] : "";
+    global.pendingPerm[from] = { text, phone, ts: Date.now() };
+    await client.sendMessage(from, `${ownerTag} Babe, can I reply to ${phone}?`);
+    return;
+  }
+
+  // Owner approval of pending permission
+  if (who === "owner" && /^(yes|allow|ok|sure)$/i.test(text.trim()) && global.pendingPerm && global.pendingPerm[from]) {
+    const p = global.pendingPerm[from]; delete global.pendingPerm[from];
+    const reply = await askLiam(p.text, p.phone, true, from, true, false);
+    const sent = await client.sendMessage(from, reply);
+    lastLiam[from] = sent && sent.id ? sent.id._serialized : null;
+    return;
+  }
   const reply = await askLiam(text, phone, true, from, mentioned, replyingToLiam);
   console.log(`\n📩 [${from}] ${who} ${phone}: ${text}\n💬 Liam: ${reply}\n`);
   const sent = await client.sendMessage(from, reply);
@@ -490,7 +516,7 @@ function authorized(req) {
 
 function allowedHost(host) {
   const address = server.address();
-  const port = address && typeof address === "object" ? address.port : PORT;
+  const port = (address && typeof address === "object" ? address.port : null) || PORT;
   return host === `127.0.0.1:${port}` ||
     host === `localhost:${port}` ||
     host === `[::1]:${port}`;

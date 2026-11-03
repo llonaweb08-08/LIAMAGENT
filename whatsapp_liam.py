@@ -21,7 +21,6 @@ DATA_DIR = os.environ.get("LIAM_DATA_DIR") or os.path.join(
 )
 TOKEN_FILE = os.path.join(DATA_DIR, "tool_token")
 STOP_FILE = os.path.join(DATA_DIR, "stop_flag")
-LEGACY_STOP_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".stop")
 
 
 class ToolError(RuntimeError):
@@ -116,10 +115,8 @@ def set_stop(value: bool) -> None:
 
 
 def get_stop() -> bool:
-    for path in (STOP_FILE, LEGACY_STOP_FILE):
-        try:
-            with open(path, encoding="utf-8") as handle:
-                return handle.read().strip() == "1"
-        except OSError:
-            continue
-    return False
+    try:
+        with open(STOP_FILE, encoding="utf-8") as handle:
+            return handle.read().strip() == "1"
+    except OSError:
+        return False

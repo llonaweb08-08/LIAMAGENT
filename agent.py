@@ -60,7 +60,8 @@ _SCHEMA = """CREATE TABLE IF NOT EXISTS mem(
     fact TEXT NOT NULL,
     created REAL NOT NULL DEFAULT 0,
     source TEXT NOT NULL DEFAULT '',
-    UNIQUE(user, fact)
+    scope TEXT NOT NULL DEFAULT 'personal',
+    UNIQUE(user, fact, scope)
 )"""
 
 def _connect():
@@ -78,6 +79,8 @@ def _init_db():
             c.execute("ALTER TABLE mem ADD COLUMN created REAL NOT NULL DEFAULT 0")
         if "source" not in cols:
             c.execute("ALTER TABLE mem ADD COLUMN source TEXT NOT NULL DEFAULT ''")
+        if "scope" not in cols:
+            c.execute("ALTER TABLE mem ADD COLUMN scope TEXT NOT NULL DEFAULT 'personal'")
         c.execute("PRAGMA user_version=1")
         c.commit()
 
@@ -110,7 +113,7 @@ def _facts(user, limit=20):
     try:
         with closing(_connect()) as c:
             rows = c.execute(
-                "SELECT fact FROM mem WHERE user=? ORDER BY created DESC, rowid DESC LIMIT ?",
+                "SELECT fact FROM mem WHERE user=? OR scope='global' ORDER BY created DESC, rowid DESC LIMIT ?",
                 (_norm_user(user), limit)).fetchall()
         return [r[0] for r in rows]
     except sqlite3.Error as e:
@@ -145,7 +148,7 @@ def _brain_block():
     return "\n".join(lines)
 
 SCHEMAS = [
- {"type":"function","function":{"name":"remember","description":"Save a fact about the person you're talking to (pass user='me')","parameters":{"type":"object","properties":{"user":{"type":"string"},"fact":{"type":"string"}},"required":["user","fact"],"additionalProperties":False}}},
+ {"type":"function","function":{"name":"remember","description":"Save a fact about the person you're talking to (pass user='me')","parameters":{"type":"object","properties":{"user":{"type":"string"},"fact":{"type":"string"},"scope":{"type":"string","enum":["personal","global","group"]}},"required":["user","fact"],"additionalProperties":False}}},
  {"type":"function","function":{"name":"recall","description":"Recall what you remember about the person you're talking to (pass user='me')","parameters":{"type":"object","properties":{"user":{"type":"string"}},"required":["user"],"additionalProperties":False}}},
  {"type":"function","function":{"name":"recall_all","description":"Recall every fact you are allowed to see (your own facts, or everyone's for the owner)","parameters":{"type":"object","properties":{},"additionalProperties":False}}},
  {"type":"function","function":{"name":"clear_memory","description":"Wipe saved memory for one person. Only the owner can pass user='ALL'","parameters":{"type":"object","properties":{"user":{"type":"string"}},"additionalProperties":False}}},
@@ -158,19 +161,28 @@ SCHEMAS = [
  {"type":"function","function":{"name":"permission","description":"Owner only: allow or deny a group member","parameters":{"type":"object","properties":{"jid":{"type":"string"},"who":{"type":"string"},"allow":{"type":"boolean"}},"required":["jid","who","allow"],"additionalProperties":False}}},
  {"type":"function","function":{"name":"switch_brain","description":"Owner only: switch the brain for the next reply","parameters":{"type":"object","properties":{"brain":{"type":"string","enum":["moonmath","glm","unorouter","agnes","huggingface","hermes"]}},"required":["brain"],"additionalProperties":False}}},
  {"type":"function","function":{"name":"check_status","description":"Owner only: check if each model is alive or dead","parameters":{"type":"object","properties":{},"additionalProperties":False}}},
- {"type":"function","function":{"name":"check_tokens","description":"Owner only: report the configured brains and key counts","parameters":{"type":"object","properties":{},"additionalProperties":False}}}
+ {"type":"function","function":{"name":"check_tokens","description":"Owner only: report the configured brains and key counts","parameters":{"type":"object","properties":{},"additionalProperties":False}}},
+ {"type":"function","function":{"name":"web_fetch","description":"Fetch and read a public web page","parameters":{"type":"object","properties":{"url":{"type":"string"}},"required":["url"],"additionalProperties":False}}},
+ {"type":"function","function":{"name":"web_search","description":"Search the web","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"],"additionalProperties":False}}},
+ {"type":"function","function":{"name":"file_read","description":"Read a local file","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"],"additionalProperties":False}}},
+ {"type":"function","function":{"name":"file_write","description":"Write a local file","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"],"additionalProperties":False}}},
+ {"type":"function","function":{"name":"browser_task","description":"Run a Playwright browser automation script (python)","parameters":{"type":"object","properties":{"script":{"type":"string"}},"required":["script"],"additionalProperties":False}}},
+ {"type":"function","function":{"name":"analyze_image","description":"Analyze an image URL","parameters":{"type":"object","properties":{"path_or_url":{"type":"string"},"question":{"type":"string"}},"required":["path_or_url"],"additionalProperties":False}}},
+ {"type":"function","function":{"name":"email_read","description":"Read emails via IMAP","parameters":{"type":"object","properties":{"host":{"type":"string"},"username":{"type":"string"},"password":{"type":"string"},"folder":{"type":"string"},"limit":{"type":"integer"}},"required":["host","username","password"],"additionalProperties":False}}},
+ {"type":"function","function":{"name":"report_progress","description":"Send a progress update to the owner","parameters":{"type":"object","properties":{"text":{"type":"string"}},"required":["text"],"additionalProperties":False}}}
 ]
 
-def remember(user, fact, source=""):
+def remember(user, fact, source="", scope="personal"):
     user = _norm_user(user)
     fact = _clean_fact(fact)
     if not user or not fact:
         return "nothing to remember - I need both a person and a fact"
+    scope = str(scope or "personal").strip() or "personal"
     try:
         with closing(_connect()) as c:
             cur = c.execute(
-                "INSERT OR IGNORE INTO mem(user,fact,created,source) VALUES(?,?,?,?)",
-                (user, fact, time.time(), _clean_fact(source, 80)))
+                "INSERT OR IGNORE INTO mem(user,fact,created,source,scope) VALUES(?,?,?,?,?)",
+                (user, fact, time.time(), _clean_fact(source, 80), scope))
             c.commit()
             added = cur.rowcount > 0
     except sqlite3.Error as e:
@@ -283,9 +295,10 @@ def send_voice(to, text): return wa.send_voice(to, text)
 def screenshot(to, url):
     safe = _safe_url(url)
     path = _unique_file(".png")
-    _safe_remove(path)
     try:
         try:
+            # Re-validate immediately before fetching to shrink the DNS-rebinding window.
+            _safe_url(safe)
             result = subprocess.run(
                 [sys.executable, "-m", "playwright", "screenshot",
                  "--browser", "chromium", safe, path],
@@ -312,6 +325,157 @@ def stop_task():
 
 def permission(jid, who, allow): return wa.permission(jid, who, allow)
 
+def report_progress(text):
+    try:
+        return wa.send_message(OWNERS[0], str(text or ""))
+    except Exception as e:
+        return f"progress report failed: {type(e).__name__}: {e}"
+
+def browser_task(script):
+    import tempfile
+    ext_dir = os.path.join(BASE_DIR, "browser_extensions")
+    args = []
+    if os.path.isdir(ext_dir):
+        args += [f"--load-extension={ext_dir}", "--disable-extensions-except=" + ext_dir]
+    # wrap script to launch chromium with stealth-ish args
+    _ = (
+        "import os\n"
+        "from playwright.sync_api import sync_playwright\n"
+        "with sync_playwright() as p:\n"
+        "    browser = p.chromium.launch(headless=True, args=" + repr(args + ["--disable-blink-features=AutomationControlled"]) + ")\n"
+        "    context = browser.new_context()\n"
+        "    page = context.new_page()\n"
+        "    # user script follows, with `page` available\n"
+    )
+    # We'll just run the user script as-is but inject a preamble via exec by writing a combined file
+    fd, path = tempfile.mkstemp(suffix=".py")
+    os.close(fd)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("# extension dir: " + ext_dir + "\n")
+        f.write(script)
+    try:
+        r = subprocess.run([sys.executable, path], capture_output=True, text=True, timeout=180)
+        return (r.stdout or "") + (r.stderr or "") or f"exit={r.returncode}"
+    except subprocess.TimeoutExpired:
+        return "browser task timed out"
+    except Exception as e:
+        return f"browser task failed: {type(e).__name__}: {e}"
+    finally:
+        _safe_remove(path)
+
+def analyze_image(path_or_url, question="describe this image"):
+    # use moonmath vision-capable model via image url
+    try:
+        if path_or_url.startswith("http"):
+            img = path_or_url
+        else:
+            # cannot send local file to provider; return note
+            return "local image analysis not supported; provide a public URL"
+        msgs = [{"role": "user", "content": [
+            {"type": "text", "text": str(question)},
+            {"type": "image_url", "image_url": {"url": img}},
+        ]}]
+        m = call_model(msgs, None, brain="moonmath", tools=None)
+        return m.get("content") or "no response"
+    except Exception as e:
+        return f"vision failed: {type(e).__name__}: {e}"
+
+def email_read(host, username, password, folder="INBOX", limit=5):
+    try:
+        import imaplib, email
+        mail = imaplib.IMAP4_SSL(host)
+        mail.login(username, password)
+        mail.select(folder)
+        _, data = mail.search(None, "ALL")
+        ids = data[0].split()[-limit:]
+        out = []
+        for i in ids:
+            _, msgdata = mail.fetch(i, "(RFC822)")
+            msg = email.message_from_bytes(msgdata[0][1])
+            body = ""
+            if msg.is_multipart():
+                for part in msg.walk():
+                    if part.get_content_type() == "text/plain":
+                        body = part.get_payload(decode=True).decode("utf-8", "replace")
+                        break
+            else:
+                body = msg.get_payload(decode=True).decode("utf-8", "replace")
+            out.append(f"From: {msg.get('From')}\nSubject: {msg.get('Subject')}\n{body[:500]}")
+        mail.logout()
+        return "\n---\n".join(out) if out else "no messages"
+    except Exception as e:
+        return f"email read failed: {type(e).__name__}: {e}"
+
+def create_tool(name, code):
+    # writes a python module with a function; requires restart to use
+    safe = re.sub(r"[^a-zA-Z0-9_]", "", str(name or ""))
+    if not safe:
+        return "invalid tool name"
+    path = os.path.join(BASE_DIR, "tools", safe + ".py")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(str(code or ""))
+    return f"created tool file {path}; restart agent to load"
+
+def web_fetch(url):
+    safe = _safe_url(url)
+    try:
+        req = urllib.request.Request(safe, headers={"User-Agent": "Liam/1.0"})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            data = r.read(200000)
+        text = data.decode("utf-8", "replace")
+        # strip tags roughly
+        text = re.sub(r"<script.*?</script>", "", text, flags=re.S|re.I)
+        text = re.sub(r"<style.*?</style>", "", text, flags=re.S|re.I)
+        text = re.sub(r"<[^>]+>", " ", text)
+        text = re.sub(r"\s+", " ", text).strip()
+        return text[:8000] or "(empty page)"
+    except Exception as e:
+        return f"fetch failed: {type(e).__name__}"
+
+def web_search(query):
+    q = urllib.parse.quote(str(query or ""))
+    url = "https://html.duckduckgo.com/html/?q=" + q
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Liam/1.0"})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            html = r.read(200000).decode("utf-8", "replace")
+        results = []
+        for m in re.finditer(r'class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>', html, re.S):
+            link, title = m.group(1), re.sub("<.*?>", "", m.group(2))
+            results.append(f"- {title.strip()}: {link}")
+            if len(results) >= 8:
+                break
+        return "\n".join(results) if results else "no results"
+    except Exception as e:
+        return f"search failed: {type(e).__name__}"
+
+def file_read(path):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return f.read(20000)[:20000]
+    except Exception as e:
+        return f"read failed: {type(e).__name__}: {e}"
+
+def file_write(path, content):
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(str(content or ""))
+        return f"wrote {len(str(content or ''))} bytes to {path}"
+    except Exception as e:
+        return f"write failed: {type(e).__name__}: {e}"
+
+def shell_exec(command, timeout=30):
+    try:
+        r = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=timeout)
+        out = (r.stdout or "") + (r.stderr or "")
+        return f"exit={r.returncode}\n{out[:4000]}"
+    except subprocess.TimeoutExpired:
+        return "command timed out"
+    except Exception as e:
+        return f"exec failed: {type(e).__name__}: {e}"
+
 
 BRAIN_STATE = os.path.join(DATA_DIR, "brain_state")
 LEGACY_BRAIN_STATE = os.path.join(BASE_DIR, ".brain_state")
@@ -320,12 +484,12 @@ BRAINS = {
     "glm":         {"base": liam_keys.MOON_BASE,  "model": liam_keys.MOON_FALLBACK, "keys": list(liam_keys.MOON_KEYS), "label": "MoonMath GLM"},
     "unorouter":   {"base": liam_keys.UNO_BASE,   "model": liam_keys.UNO_MODELS[0], "keys": list(liam_keys.UNO_KEYS),  "label": "Unorouter"},
     "agnes":       {"base": liam_keys.AGNES_BASE, "model": liam_keys.AGNES_MODEL,   "keys": [liam_keys.AGNES_KEY],     "label": "Agnes"},
-    "huggingface": {"base": liam_keys.HF_BASE,    "model": liam_keys.HF_MODEL,      "keys": [liam_keys.HF_KEY],        "label": "Hugging Face"},
+    "hcnsec":      {"base": liam_keys.HCN_BASE, "model": liam_keys.HCN_MODEL,   "keys": [liam_keys.HCN_KEY], "label": "HCNSec DeepSeek"},
     "hermes":      {"base": liam_keys.HF_BASE,    "model": liam_keys.HF_MODEL_8B,   "keys": [liam_keys.HF_KEY],        "label": "Hermes 8B"},
 }
 # Only models that actually support tool calls are used for the tool-calling loop.
-UNO_TOOL_MODELS = ["deepseek-chat-v3", "gpt-4.1", "claude-sonnet-4-5", "gpt-4o",
-                   "deepseek-v4-flash", "llama-4-maverick", "command-r-plus", "o4-mini"]
+UNO_TOOL_MODELS = ["gpt-4o:free", "llama-4-scout:free", "mistral-small-4-119b-2603:free",
+                    "qwen3.6-35b-a3b:free", "deepseek-r1-distill-llama-70b:free"]
 _BRAIN_ALIASES = {
     "moonmath": "moonmath", "moon": "moonmath", "deepseek": "moonmath", "deepseek v4": "moonmath",
     "glm": "glm", "glm 5 3": "glm", "agnes": "agnes", "ag": "agnes", "agnes 3": "agnes",
@@ -409,10 +573,21 @@ def check_tokens():
         lines.append(f"- {p['label']}: {len(p['keys'])} key(s), model {p['model']}")
     return "\n".join(lines)
 
+_EXHAUSTED = {}
+def _key_exhausted(brain, key):
+    ts = _EXHAUSTED.get((brain, key))
+    if not ts: return False
+    # reset after 24h
+    if time.time() - ts > 86400:
+        _EXHAUSTED.pop((brain, key), None)
+        return False
+    return True
+def _mark_exhausted(brain, key):
+    _EXHAUSTED[(brain, key)] = time.time()
 ATTEMPT_TIMEOUT = 35       # seconds per HTTP attempt
 CALL_BUDGET = 70           # total seconds for one assistant turn
 MAX_ATTEMPTS = 8           # provider/key attempts per turn
-FALLBACK_ORDER = ["moonmath", "glm", "agnes", "unorouter", "huggingface", "hermes"]
+FALLBACK_ORDER = ["moonmath", "glm", "agnes", "hcnsec", "huggingface", "hermes"]
 
 def _is_transient(status):
     return status is None or status in (408, 409, 425, 429, 500, 502, 503, 504)
@@ -469,10 +644,23 @@ def _http_post(base, model, key, messages, tools, timeout):
 
 def _attempt_plan(brain):
     p = BRAINS[brain]
+    if brain == "moonmath":
+        plan = []
+        for k in p["keys"]:
+            if _key_exhausted("moonmath", k):
+                continue
+            plan.append(("moonmath", liam_keys.MOON_MODEL, k))
+            plan.append(("moonmath", liam_keys.MOON_FALLBACK, k))
+        return plan or [(brain, p["model"], p["keys"][0] if p["keys"] else "")]
     if brain == "unorouter":
-        return [(brain, m, p["keys"][i % len(p["keys"])])
-                for i, m in enumerate(UNO_TOOL_MODELS[:4])]
-    return [(brain, p["model"], k) for k in p["keys"][:3]]
+        plan = []
+        for i, m in enumerate(UNO_TOOL_MODELS):
+            key = p["keys"][i % len(p["keys"])] if p["keys"] else ""
+            if _key_exhausted("unorouter", key + m):
+                continue
+            plan.append((brain, m, key))
+        return plan or [(brain, UNO_TOOL_MODELS[0], p["keys"][0] if p["keys"] else "")]
+    return [(brain, p["model"], k) for k in p["keys"][:3] if not _key_exhausted(brain, k)] or [(brain, p["model"], p["keys"][0] if p["keys"] else "")]
 
 def call_model(messages, sender, brain=None, tools=None):
     brain = _normalize_brain(brain) or get_brain()
@@ -491,7 +679,6 @@ def call_model(messages, sender, brain=None, tools=None):
                 break
             attempts += 1
             use_tools = bool(tools)
-            without_tools_done = False
             for retry in (0, 1):
                 remaining = deadline - time.monotonic()
                 if remaining <= 1:
@@ -499,16 +686,19 @@ def call_model(messages, sender, brain=None, tools=None):
                 try:
                     return _http_post(BRAINS[b]["base"], model, key, messages,
                                       tools if use_tools else None,
-                                      min(ATTEMPT_TIMEOUT, remaining))
+                                       min(60 if b == "agnes" else ATTEMPT_TIMEOUT, remaining))
                 except urllib.error.HTTPError as e:
                     status = e.code
                     try: detail = e.read(200).decode("utf-8", "replace").replace("\n", " ")[:160]
                     except Exception: detail = ""
                     last_err = f"{b}/{model} HTTP {status}"
                     _log(f"[brain] {last_err} {detail}")
-                    if status == 400 and use_tools and not without_tools_done:
+                    if status == 429:
+                        _mark_exhausted(b, key)
+                        if brain == "unorouter":
+                            _mark_exhausted(b, key + model)
+                    if status == 400 and use_tools:
                         # Some models reject the tools parameter; retry once without it.
-                        without_tools_done = True
                         use_tools = False
                         continue
                     if _is_transient(status) and retry == 0 and deadline - time.monotonic() > 3:
@@ -597,6 +787,16 @@ TOOLS = {
     "switch_brain": switch_brain,
     "check_status": check_status,
     "check_tokens": check_tokens,
+    "web_fetch": web_fetch,
+    "web_search": web_search,
+    "file_read": file_read,
+    "file_write": file_write,
+    "shell_exec": shell_exec,
+    "browser_task": browser_task,
+    "analyze_image": analyze_image,
+    "email_read": email_read,
+    "create_tool": create_tool,
+    "report_progress": report_progress,
 }
 
 OWNER_ONLY_TOOLS = {
@@ -615,8 +815,8 @@ def _tools_for(sender, chat_jid=""):
     owner = _is_owner(sender)
     t = dict(TOOLS)
     # Memory is scoped to whoever is actually talking; owners can name a known person.
-    t["remember"] = lambda user=None, fact=None: remember(
-        _resolve_memory_user(user, me) if owner else me, fact, source=me)
+    t["remember"] = lambda user=None, fact=None, scope="personal": remember(
+        _resolve_memory_user(user, me) if owner else me, fact, source=me, scope=scope)
     t["recall"] = lambda user=None: recall(
         _resolve_memory_user(user, me) if owner else me)
     t["recall_all"] = lambda: recall_all(me)
@@ -678,7 +878,7 @@ def _history_add(key, user_text, reply_text):
     h = _HISTORY.setdefault(key, [])
     h.append({"role": "user", "content": user_text[:1200]})
     h.append({"role": "assistant", "content": reply_text[:1200]})
-    del h[:-HISTORY_MESSAGES]
+    h[:] = h[-HISTORY_MESSAGES:]
 
 def _system_prompt(sender, is_group, mentioned, reply_to):
     s = _norm_user(sender)
@@ -742,7 +942,9 @@ def run_agent(user_message, sender, is_group, group_jid, mentioned, reply_to):
         if not calls:
             return finish(text)
 
-        for tc in calls[:6]:
+        for tc in calls:
+            if calls_done >= MAX_TOOL_CALLS:
+                break
             fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
             name = str(fn.get("name") or "")
             call_id = str(tc.get("id") or f"call_{calls_done}")
