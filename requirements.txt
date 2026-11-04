@@ -1,3 +1,5 @@
 # Runtime dependencies for the Python agent (pinned to the versions tested here).
 requests==2.34.2
-playwright==1.64.1
+playwright==1.49.0
+# ffmpeg is optional (for voice note conversion to OGG/Opus)
+EOF

@@ -151,7 +151,15 @@ let agentQueue = Promise.resolve();
 
 function startAgent() {
   if (agentProc) return agentProc;
-  agentProc = spawn("python", ["-X", "utf8", "agent.py"], {
+function pythonBin() {
+  if (process.env.LIAM_PYTHON) return process.env.LIAM_PYTHON;
+  try {
+    const r = spawnSync("python", ["-c", "import sys;print(sys.executable)"], { encoding: "utf8" });
+    if (r.status === 0 && r.stdout) return r.stdout.trim();
+  } catch (e) {}
+  return "python";
+}
+  agentProc = spawn(pythonBin(), ["-X", "utf8", "agent.py"], {
     cwd: BASE_DIR,
     env: {
       ...process.env,
@@ -237,7 +245,7 @@ async function resolvePhone(id) {
     } catch (e) { console.log("🔍 contact lookup failed:", String(e)); }
   }
   if (phone) { lidCache.set(base, phone); saveLidMap(); }
-  return phone || base;
+  return phone || null;
 }
 
 function askLiam(user, phone, isGroup, groupJid, mentioned, replyTo) {
@@ -259,8 +267,9 @@ function askLiam(user, phone, isGroup, groupJid, mentioned, replyTo) {
     catch (e) { agentPending = null; reject(e); }
   });
   const run = agentQueue.then(job, job);
+  const timed = Promise.race([run, new Promise((_, rej) => setTimeout(() => rej(new Error("agent timed out")), 120000))]);
   agentQueue = run.catch(() => {});
-  return run;
+  return timed;
 }
 
 // sweep temp permissions that are 30 min old
@@ -348,15 +357,18 @@ client.on("message", async (msg) => {
   if (who === "member" && mentioned) {
     if (!global.pendingPerm) global.pendingPerm = {};
     const ownerTag = OWNERS[0] ? "@" + OWNERS[0] : "";
-    global.pendingPerm[from] = { text, phone, ts: Date.now() };
+    global.pendingPerm[from] = global.pendingPerm[from] || [];
+    global.pendingPerm[from].push({ id: Date.now(), text, phone, ts: Date.now() });
     await client.sendMessage(from, `${ownerTag} Babe, can I reply to ${phone}?`);
     return;
   }
 
   // Owner approval of pending permission
-  if (who === "owner" && /^(yes|allow|ok|sure)$/i.test(text.trim()) && global.pendingPerm && global.pendingPerm[from]) {
-    const p = global.pendingPerm[from]; delete global.pendingPerm[from];
-    const reply = await askLiam(p.text, p.phone, true, from, true, false);
+  if (who === "owner" && /^(yes|allow|ok|sure)$/i.test(text.trim()) && global.pendingPerm && global.pendingPerm[from] && global.pendingPerm[from].length) {
+    const list = global.pendingPerm[from];
+    const p = list[list.length - 1];
+    global.pendingPerm[from] = list.filter((x) => x !== p);
+    const reply = await askLiam(p.text, p.phone || bareId(p.phone), true, from, true, false);
     const sent = await client.sendMessage(from, reply);
     lastLiam[from] = sent && sent.id ? sent.id._serialized : null;
     return;

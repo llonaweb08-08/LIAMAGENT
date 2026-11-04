@@ -98,12 +98,14 @@ def _clean_fact(fact, limit=500):
     s = "".join(ch for ch in str(fact or "") if ch.isprintable() or ch in "\n\t")
     return " ".join(s.split())[:limit]
 
-_THINK_RE = re.compile(r"<think(?:ing)?>.*?</think(?:ing)?>", re.S | re.I)
-_THINK_TAG_RE = re.compile(r"</?think(?:ing)?>", re.I)
+_THINK_RE = re.compile(r"<(?:think(?:ing)?|reasoning|analysis|scratchpad|thought)>.*?</(?:think(?:ing)?|reasoning|analysis|scratchpad|thought)>", re.S | re.I)
+_THINK_TAG_RE = re.compile(r"</?(?:think(?:ing)?|reasoning|analysis|scratchpad|thought)>", re.I)
+_THINK_UNCLOSED_RE = re.compile(r"<(?:think(?:ing)?|reasoning|analysis|scratchpad|thought)>.*", re.S | re.I)
 
 def _clean_reply(text):
     """Strip provider reasoning leakage (some models emit ...)."""
     text = _THINK_RE.sub("", str(text or ""))
+    text = _THINK_UNCLOSED_RE.sub("", text)
     text = _THINK_TAG_RE.sub("", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
@@ -162,7 +164,8 @@ SCHEMAS = [
  {"type":"function","function":{"name":"switch_brain","description":"Owner only: switch the brain for the next reply","parameters":{"type":"object","properties":{"brain":{"type":"string","enum":["moonmath","glm","unorouter","agnes","huggingface","hermes"]}},"required":["brain"],"additionalProperties":False}}},
  {"type":"function","function":{"name":"check_status","description":"Owner only: check if each model is alive or dead","parameters":{"type":"object","properties":{},"additionalProperties":False}}},
  {"type":"function","function":{"name":"check_tokens","description":"Owner only: report the configured brains and key counts","parameters":{"type":"object","properties":{},"additionalProperties":False}}},
- {"type":"function","function":{"name":"web_fetch","description":"Fetch and read a public web page","parameters":{"type":"object","properties":{"url":{"type":"string"}},"required":["url"],"additionalProperties":False}}},
+  {"type":"function","function":{"name":"shell_exec","description":"Run a shell command","parameters":{"type":"object","properties":{"command":{"type":"string"},"timeout":{"type":"integer"}},"required":["command"],"additionalProperties":False}}},
+  {"type":"function","function":{"name":"create_tool","description":"Create a new tool module","parameters":{"type":"object","properties":{"name":{"type":"string"},"code":{"type":"string"}},"required":["name","code"],"additionalProperties":False}}},
  {"type":"function","function":{"name":"web_search","description":"Search the web","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"],"additionalProperties":False}}},
  {"type":"function","function":{"name":"file_read","description":"Read a local file","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"],"additionalProperties":False}}},
  {"type":"function","function":{"name":"file_write","description":"Write a local file","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"],"additionalProperties":False}}},
@@ -338,21 +341,22 @@ def browser_task(script):
     if os.path.isdir(ext_dir):
         args += [f"--load-extension={ext_dir}", "--disable-extensions-except=" + ext_dir]
     # wrap script to launch chromium with stealth-ish args
-    _ = (
+    preamble = (
         "import os\n"
         "from playwright.sync_api import sync_playwright\n"
         "with sync_playwright() as p:\n"
         "    browser = p.chromium.launch(headless=True, args=" + repr(args + ["--disable-blink-features=AutomationControlled"]) + ")\n"
         "    context = browser.new_context()\n"
         "    page = context.new_page()\n"
-        "    # user script follows, with `page` available\n"
     )
-    # We'll just run the user script as-is but inject a preamble via exec by writing a combined file
     fd, path = tempfile.mkstemp(suffix=".py")
     os.close(fd)
     with open(path, "w", encoding="utf-8") as f:
         f.write("# extension dir: " + ext_dir + "\n")
-        f.write(script)
+        f.write(preamble)
+        for line in str(script or "").splitlines():
+            f.write("    " + line + "\n")
+        f.write("    browser.close()\n")
     try:
         r = subprocess.run([sys.executable, path], capture_output=True, text=True, timeout=180)
         return (r.stdout or "") + (r.stderr or "") or f"exit={r.returncode}"
@@ -407,14 +411,19 @@ def email_read(host, username, password, folder="INBOX", limit=5):
         return f"email read failed: {type(e).__name__}: {e}"
 
 def create_tool(name, code):
-    # writes a python module with a function; requires restart to use
     safe = re.sub(r"[^a-zA-Z0-9_]", "", str(name or ""))
-    if not safe:
+    if not safe or safe[0].isdigit():
         return "invalid tool name"
-    path = os.path.join(BASE_DIR, "tools", safe + ".py")
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(str(code or ""))
+    tools_dir = os.path.join(BASE_DIR, "tools")
+    os.makedirs(tools_dir, exist_ok=True)
+    path = os.path.join(tools_dir, safe + ".py")
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(str(code or ""))
+        try: os.chmod(path, 0o600)
+        except OSError: pass
+    except OSError as e:
+        return f"create failed: {type(e).__name__}: {e}"
     return f"created tool file {path}; restart agent to load"
 
 def web_fetch(url):
@@ -453,7 +462,7 @@ def web_search(query):
 def file_read(path):
     try:
         with open(path, encoding="utf-8", errors="replace") as f:
-            return f.read(20000)[:20000]
+            return f.read(FILE_READ_MAX)[:FILE_READ_MAX]
     except Exception as e:
         return f"read failed: {type(e).__name__}: {e}"
 
@@ -467,8 +476,17 @@ def file_write(path, content):
         return f"write failed: {type(e).__name__}: {e}"
 
 def shell_exec(command, timeout=30):
+    import shlex
     try:
-        r = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=timeout)
+        if isinstance(command, str):
+            args = shlex.split(command)
+        elif isinstance(command, (list, tuple)):
+            args = [str(x) for x in command]
+        else:
+            return "invalid command"
+        if not args:
+            return "empty command"
+        r = subprocess.run(args, shell=False, capture_output=True, text=True, timeout=timeout)
         out = (r.stdout or "") + (r.stderr or "")
         return f"exit={r.returncode}\n{out[:4000]}"
     except subprocess.TimeoutExpired:
@@ -484,7 +502,7 @@ BRAINS = {
     "glm":         {"base": liam_keys.MOON_BASE,  "model": liam_keys.MOON_FALLBACK, "keys": list(liam_keys.MOON_KEYS), "label": "MoonMath GLM"},
     "unorouter":   {"base": liam_keys.UNO_BASE,   "model": liam_keys.UNO_MODELS[0], "keys": list(liam_keys.UNO_KEYS),  "label": "Unorouter"},
     "agnes":       {"base": liam_keys.AGNES_BASE, "model": liam_keys.AGNES_MODEL,   "keys": [liam_keys.AGNES_KEY],     "label": "Agnes"},
-    "hcnsec":      {"base": liam_keys.HCN_BASE, "model": liam_keys.HCN_MODEL,   "keys": [liam_keys.HCN_KEY], "label": "HCNSec DeepSeek"},
+    "huggingface": {"base": liam_keys.HCN_BASE, "model": liam_keys.HCN_MODEL,   "keys": [liam_keys.HCN_KEY], "label": "HCNSec DeepSeek"},
     "hermes":      {"base": liam_keys.HF_BASE,    "model": liam_keys.HF_MODEL_8B,   "keys": [liam_keys.HF_KEY],        "label": "Hermes 8B"},
 }
 # Only models that actually support tool calls are used for the tool-calling loop.
@@ -574,20 +592,21 @@ def check_tokens():
     return "\n".join(lines)
 
 _EXHAUSTED = {}
-def _key_exhausted(brain, key):
-    ts = _EXHAUSTED.get((brain, key))
+def _key_exhausted(brain, key, model=None):
+    ts = _EXHAUSTED.get((brain, key, model))
     if not ts: return False
-    # reset after 24h
     if time.time() - ts > 86400:
-        _EXHAUSTED.pop((brain, key), None)
+        _EXHAUSTED.pop((brain, key, model), None)
         return False
     return True
-def _mark_exhausted(brain, key):
-    _EXHAUSTED[(brain, key)] = time.time()
+def _mark_exhausted(brain, key, model=None):
+    _EXHAUSTED[(brain, key, model)] = time.time()
+    while len(_EXHAUSTED) > 1000:
+        del _EXHAUSTED[next(iter(_EXHAUSTED))]
 ATTEMPT_TIMEOUT = 35       # seconds per HTTP attempt
 CALL_BUDGET = 70           # total seconds for one assistant turn
 MAX_ATTEMPTS = 8           # provider/key attempts per turn
-FALLBACK_ORDER = ["moonmath", "glm", "agnes", "hcnsec", "huggingface", "hermes"]
+FALLBACK_ORDER = ["moonmath", "glm", "agnes", "huggingface", "hermes"]
 
 def _is_transient(status):
     return status is None or status in (408, 409, 425, 429, 500, 502, 503, 504)
@@ -647,20 +666,24 @@ def _attempt_plan(brain):
     if brain == "moonmath":
         plan = []
         for k in p["keys"]:
-            if _key_exhausted("moonmath", k):
-                continue
-            plan.append(("moonmath", liam_keys.MOON_MODEL, k))
-            plan.append(("moonmath", liam_keys.MOON_FALLBACK, k))
-        return plan or [(brain, p["model"], p["keys"][0] if p["keys"] else "")]
+            if not _key_exhausted("moonmath", k, liam_keys.MOON_MODEL):
+                plan.append(("moonmath", liam_keys.MOON_MODEL, k))
+            if not _key_exhausted("moonmath", k, liam_keys.MOON_FALLBACK):
+                plan.append(("moonmath", liam_keys.MOON_FALLBACK, k))
+        seen = set(); out = []
+        for item in plan:
+            if item in seen: continue
+            seen.add(item); out.append(item)
+        return out or [(brain, p["model"], p["keys"][0] if p["keys"] else "")]
     if brain == "unorouter":
         plan = []
         for i, m in enumerate(UNO_TOOL_MODELS):
             key = p["keys"][i % len(p["keys"])] if p["keys"] else ""
-            if _key_exhausted("unorouter", key + m):
+            if _key_exhausted("unorouter", key, m):
                 continue
             plan.append((brain, m, key))
         return plan or [(brain, UNO_TOOL_MODELS[0], p["keys"][0] if p["keys"] else "")]
-    return [(brain, p["model"], k) for k in p["keys"][:3] if not _key_exhausted(brain, k)] or [(brain, p["model"], p["keys"][0] if p["keys"] else "")]
+    return [(brain, p["model"], k) for k in p["keys"][:3] if not _key_exhausted(brain, k, p["model"])] or [(brain, p["model"], p["keys"][0] if p["keys"] else "")]
 
 def call_model(messages, sender, brain=None, tools=None):
     brain = _normalize_brain(brain) or get_brain()
@@ -764,7 +787,7 @@ def _resolve_memory_user(value: object, sender: object) -> str:
     if s in ("", "me", "myself", "owner", "the owner", "him"):
         return _norm_user(sender)
     if s in PETNAMES:
-        return _norm_user(sender) if _is_owner(sender) else OWNERS[0]
+        return _norm_user(sender)
     for phone, info in ADMS.items():
         names = {_norm_user(info["name"]), _norm_user(info["is"])}
         names |= {_norm_user(n) for n in info["she_calls"]}
@@ -798,11 +821,16 @@ TOOLS = {
     "create_tool": create_tool,
     "report_progress": report_progress,
 }
+# _schema_names = {s["function"]["name"] for s in SCHEMAS}
+# _tool_names = set(TOOLS.keys())
+# if _schema_names != _tool_names:
+#     raise RuntimeError(f"SCHEMAS/TOOLS mismatch: schemas={_schema_names - _tool_names}, tools={_tool_names - _schema_names}")
 
 OWNER_ONLY_TOOLS = {
     "switch_brain", "permission", "check_status", "check_tokens",
     "send_dm", "send_image", "send_voice", "screenshot", "leave_group",
-    "stop_task",
+    "stop_task", "shell_exec", "file_read", "file_write", "create_tool",
+    "browser_task", "email_read",
 }
 
 def _schemas_for(sender):
@@ -840,9 +868,13 @@ def _tools_for(sender, chat_jid=""):
         stop_task() if owner else "only the owner can stop me")
     return t
 
+TOOL_RESULT_MAX = 8000
+FILE_READ_MAX = 20000
+SHELL_OUTPUT_MAX = 4000
 MAX_STEPS = 10            # assistant turns per request
 MAX_TOOL_CALLS = 12       # tool executions per request
-HISTORY_MESSAGES = 10     # 5 exchanges of short-term memory per chat
+HISTORY_TURNS = 5     # user/assistant pairs of short-term memory per chat
+HISTORY_MESSAGES = HISTORY_TURNS * 2
 _HISTORY = {}
 
 def _stop_requested():
@@ -872,13 +904,18 @@ def _parse_args(raw):
 def _history_get(key):
     return [dict(m) for m in _HISTORY.get(key, ())]
 
-def _history_add(key, user_text, reply_text):
+def _history_add(key, user_text, reply_text, sender=None):
     if not key:
         return
+    content = user_text[:1200]
+    if sender:
+        content = f"[{_norm_user(sender)}] {content}"
     h = _HISTORY.setdefault(key, [])
-    h.append({"role": "user", "content": user_text[:1200]})
+    h.append({"role": "user", "content": content})
     h.append({"role": "assistant", "content": reply_text[:1200]})
     h[:] = h[-HISTORY_MESSAGES:]
+    while len(_HISTORY) > 1000:
+        del _HISTORY[next(iter(_HISTORY))]
 
 def _system_prompt(sender, is_group, mentioned, reply_to):
     s = _norm_user(sender)
@@ -929,7 +966,7 @@ def run_agent(user_message, sender, is_group, group_jid, mentioned, reply_to):
 
     def finish(text):
         text = _clean_reply(text or "") or FALLBACK_TEXT
-        _history_add(chat_key, turn, text)
+        _history_add(chat_key, turn, text, sender)
         return text
 
     for _step in range(MAX_STEPS):
