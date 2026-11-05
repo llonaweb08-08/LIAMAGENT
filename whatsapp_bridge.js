@@ -535,6 +535,11 @@ function allowedHost(host) {
 }
 
 const server = http.createServer((req, res) => {
+  if (req.method === "GET" && (req.url === "/health" || req.url === "/health/")) {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ ok: true, status: "alive" }));
+    return;
+  }
   if (req.method !== "POST") {
     req.resume();
     return sendJson(res, 405, { ok: false, msg: "method not allowed" });
@@ -603,7 +608,13 @@ server.listen(PORT, "127.0.0.1", () => {
   console.log(`⚙️ Liam's tool endpoint is live on :${port}`);
 });
 
-client.initialize();
+const sync = require("./supabase_sync");
+sync.restoreDb(DATA_DIR).then(() => sync.restoreSession(DATA_DIR, SESSION_DIR)).then(() => {
+  sync.startPeriodicBackup(DATA_DIR);
+  // periodic db backup
+  setInterval(() => { sync.backupDb(); }, 10 * 60 * 1000);
+  client.initialize();
+}).catch(() => client.initialize());
 
 module.exports = {
   server,

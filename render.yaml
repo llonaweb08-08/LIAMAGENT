@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: liam-whatsapp-agent
+    env: docker
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: LIAM_DATA_DIR
+        value: /data
+      - key: PORT
+        value: 5678
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SECRET_KEY
+        sync: false
+      - key: SUPABASE_STORAGE_BUCKET
+        value: liam-session
+      - key: DATABASE_URL
+        sync: false
+      - key: LIAM_DB
+        value: /data/liam_memory.db

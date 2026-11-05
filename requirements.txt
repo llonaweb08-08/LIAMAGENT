@@ -2,4 +2,3 @@
 requests==2.34.2
 playwright==1.49.0
 # ffmpeg is optional (for voice note conversion to OGG/Opus)
-EOF

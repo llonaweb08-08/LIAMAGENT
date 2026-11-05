@@ -81,7 +81,6 @@ def _init_db():
             c.execute("ALTER TABLE mem ADD COLUMN source TEXT NOT NULL DEFAULT ''")
         if "scope" not in cols:
             c.execute("ALTER TABLE mem ADD COLUMN scope TEXT NOT NULL DEFAULT 'personal'")
-        c.execute("PRAGMA user_version=1")
         c.commit()
 
 _init_db()
