@@ -536,7 +536,7 @@ function allowedHost(host) {
 }
 
 const server = http.createServer((req, res) => {
-  if (req.method === "GET" && (req.url === "/health" || req.url === "/health/")) {
+  if (req.method === "GET" && (req.url === "/" || req.url === "/health" || req.url === "/health/")) {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ ok: true, status: "alive" }));
     return;
