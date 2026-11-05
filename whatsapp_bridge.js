@@ -138,7 +138,8 @@ function writeFileAtomic(file, value) {
 // ---------------------------------------------------------------------------
 const client = new Client({
   authStrategy: new LocalAuth({ dataPath: SESSION_DIR }),
-  puppeteer: { headless: true, args: ["--disable-dev-shm-usage"] }
+  puppeteer: { headless: true, args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"] }
+
 });
 
 let dmOnlyOwner = false;          // default: DMs open. .disallowdm limits to owners + admins, .allowdm reopens
@@ -602,7 +603,9 @@ server.on("clientError", (err, socket) => {
   try { socket.end("HTTP/1.1 400 Bad Request\r\n\r\n"); } catch (e) {}
 });
 
-server.listen(PORT, "127.0.0.1", () => {
+const HOST = process.env.HOST || "0.0.0.0";
+server.listen(PORT, HOST, () => {
+
   const address = server.address();
   const port = address && typeof address === "object" ? address.port : PORT;
   console.log(`⚙️ Liam's tool endpoint is live on :${port}`);

@@ -147,7 +147,6 @@ def _brain_block():
         f"- hermes: {liam_keys.HF_MODEL_8B} - last-resort 8B fallback",
     ]
     return "\n".join(lines)
-
 SCHEMAS = [
  {"type":"function","function":{"name":"remember","description":"Save a fact about the person you're talking to (pass user='me')","parameters":{"type":"object","properties":{"user":{"type":"string"},"fact":{"type":"string"},"scope":{"type":"string","enum":["personal","global","group"]}},"required":["user","fact"],"additionalProperties":False}}},
  {"type":"function","function":{"name":"recall","description":"Recall what you remember about the person you're talking to (pass user='me')","parameters":{"type":"object","properties":{"user":{"type":"string"}},"required":["user"],"additionalProperties":False}}},
@@ -302,8 +301,8 @@ def screenshot(to, url):
             # Re-validate immediately before fetching to shrink the DNS-rebinding window.
             _safe_url(safe)
             result = subprocess.run(
-                [sys.executable, "-m", "playwright", "screenshot",
-                 "--browser", "chromium", safe, path],
+                [sys.executable, "-m", "playwright", "screenshot", "--no-sandbox",
+ "--browser", "chromium", safe, path],
                 timeout=60, capture_output=True, check=False)
         except subprocess.TimeoutExpired as exc:
             raise RuntimeError("screenshot timed out") from exc
