@@ -2,6 +2,7 @@
 liam_secrets.py
 .env
 .env.*
+!.env.example
 *.pem
 *.key
 

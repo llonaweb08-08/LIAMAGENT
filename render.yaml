@@ -1,21 +1,72 @@
 services:
   - type: web
     name: liam-whatsapp-agent
-    env: docker
+    runtime: docker
+    dockerfilePath: ./Dockerfile
     plan: free
+    # Render's liveness check. It returns 200 as soon as the HTTP server is up,
+    # even while WhatsApp is still restoring or waiting for a QR/pairing code.
+    # Monitor /ready separately (UptimeRobot) to alert when Liam is not linked.
     healthCheckPath: /health
+    autoDeploy: true
     envVars:
+      # --- Runtime paths -----------------------------------------------------
       - key: LIAM_DATA_DIR
         value: /data
-      - key: PORT
-        value: 5678
+      - key: LIAM_DB
+        value: /data/liam_memory.db
+
+      # --- WhatsApp ----------------------------------------------------------
+      - key: LIAM_BOT_PHONE
+        value: "447881161023"
+      # Stable secret for the /qr and /pair pages. Render generates and keeps it
+      # across deploys; the pairing URL is printed in the deploy logs.
+      - key: LIAM_PAIR_TOKEN
+        generateValue: true
+
+      # --- Supabase persistence (required for a usable free deployment) ------
+      # Set these in the Render dashboard. The bucket is created automatically
+      # if it does not exist.
       - key: SUPABASE_URL
         sync: false
       - key: SUPABASE_SECRET_KEY
         sync: false
       - key: SUPABASE_STORAGE_BUCKET
         value: liam-session
-      - key: DATABASE_URL
+      - key: LIAM_SUPABASE_TIMEOUT_MS
+        value: "120000"
+      - key: LIAM_BACKUP_INTERVAL_MS
+        value: "600000"
+
+      # --- Model providers ---------------------------------------------------
+      # Comma-separated lists are accepted for the rotating key pools.
+      - key: MOON_KEYS
         sync: false
-      - key: LIAM_DB
-        value: /data/liam_memory.db
+      - key: UNO_KEYS
+        sync: false
+      - key: AGNES_KEY
+        sync: false
+      - key: HCN_KEY
+        sync: false
+
+      # --- Optional capabilities --------------------------------------------
+      - key: GOOGLE_API_KEY
+        sync: false
+      - key: TAVILY_API_KEY
+        sync: false
+      - key: BRAVE_API_KEY
+        sync: false
+      - key: SERPER_API_KEY
+        sync: false
+      - key: INSTABOX_API_KEY
+        sync: false
+      - key: INSTABOX_MACHINE_ID
+        sync: false
+
+      # --- Behaviour --------------------------------------------------------
+      - key: LIAM_GROUP_PERMISSION_MS
+        value: "10800000"
+      - key: LIAM_TOOL_APPROVAL_MS
+        value: "600000"
+      - key: LIAM_INIT_TIMEOUT_MS
+        value: "300000"

@@ -14,7 +14,16 @@ import requests
 
 import liam_google
 
-BRIDGE_URL = os.environ.get("LIAM_BRIDGE_URL", "http://127.0.0.1:5678")
+def _bridge_url() -> str:
+    # Prefer explicit URL; otherwise follow the same container-local port the
+    # bridge binds to (Render injects PORT).
+    explicit = os.environ.get("LIAM_BRIDGE_URL")
+    if explicit:
+        return explicit.rstrip("/")
+    port = os.environ.get("LIAM_PORT") or os.environ.get("PORT") or "5678"
+    return f"http://127.0.0.1:{port}"
+
+BRIDGE_URL = _bridge_url()
 
 DATA_DIR = os.environ.get("LIAM_DATA_DIR") or os.path.join(
     os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"), "LiamWhatsApp"
@@ -38,13 +47,17 @@ def _token() -> str:
     return token
 
 
-def _post(action: str, timeout: float = 60, **kwargs) -> str:
+def _post(action: str, http_timeout: float = 60, **kwargs) -> str:
+    payload = {"action": action}
+    # The bridge needs to know who is acting so it can enforce owner-only
+    # actions and one-time approvals. Empty values are omitted.
+    payload.update({key: value for key, value in kwargs.items() if value is not None})
     try:
         response = requests.post(
             BRIDGE_URL,
-            json={"action": action, **kwargs},
+            json=payload,
             headers={"Authorization": "Bearer " + _token()},
-            timeout=timeout,
+            timeout=http_timeout,
         )
     except requests.RequestException as exc:
         raise ToolError("the WhatsApp bridge is not reachable") from exc
@@ -62,18 +75,20 @@ def _post(action: str, timeout: float = 60, **kwargs) -> str:
     return message or "ok"
 
 
-def send_message(to: str, text: str) -> str:
-    return _post("send", to=to, text=text)
+def send_message(to: str, text: str, sender: str | None = None) -> str:
+    return _post("send", to=to, text=text, sender=sender)
 
 
-def send_image(to: str, path: str) -> str:
-    return _post("image", to=to, path=path, timeout=120)
+def send_image(to: str, path: str, sender: str | None = None) -> str:
+    return _post("image", to=to, path=path, sender=sender, http_timeout=120)
 
 
-def send_voice(to: str, text: str) -> str:
+def send_voice(to: str, text: str, sender: str | None = None) -> str:
     path, mimetype = liam_google.synth_voice(text)
     try:
-        return _post("voice", to=to, path=path, mimetype=mimetype, timeout=120)
+        return _post(
+            "voice", to=to, path=path, mimetype=mimetype, sender=sender,
+            http_timeout=120)
     finally:
         try:
             os.remove(path)
@@ -81,16 +96,31 @@ def send_voice(to: str, text: str) -> str:
             pass
 
 
-def leave_group(jid: str) -> str:
-    return _post("leave", jid=jid)
+def leave_group(jid: str, sender: str | None = None) -> str:
+    return _post("leave", jid=jid, sender=sender)
 
 
-def permission(jid: str, who: str, allow: bool) -> str:
-    return _post("permission", jid=jid, who=who, allow=bool(allow))
+def permission(jid: str, who: str, allow: bool, sender: str | None = None) -> str:
+    return _post(
+        "permission", jid=jid, who=who, allow=bool(allow), sender=sender)
 
 
-def stop() -> str:
-    return _post("stop")
+def stop(sender: str | None = None) -> str:
+    return _post("stop", sender=sender)
+
+
+def vps_exec(command: str, timeout: int = 120, cwd: str = "",
+             sender: str | None = None, chat: str | None = None,
+             group: bool = False) -> str:
+    """Run a command on the InstaBox VM; non-owner calls need approval."""
+    try:
+        seconds = max(1, min(600, int(timeout or 120)))
+    except (TypeError, ValueError):
+        seconds = 120
+    return _post(
+        "vps_exec", command=command, timeout=seconds, cwd=cwd or "",
+        sender=sender, chat=chat, group=bool(group),
+        http_timeout=max(30, seconds + 30))
 
 
 def _atomic_write(path: str, value: str) -> None:

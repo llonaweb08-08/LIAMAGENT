@@ -17,6 +17,7 @@ import socket
 import tempfile
 import types
 import unittest
+import urllib.request
 import wave
 from pathlib import Path
 from unittest import mock
@@ -122,7 +123,8 @@ class ToolClientTests(unittest.TestCase):
                 mock.patch.object(wa, "_post", return_value="sent") as post:
             self.assertEqual(wa.send_voice("2347000000000@c.us", "hello"), "sent")
         post.assert_called_once_with(
-            "voice", to="2347000000000@c.us", path=path, mimetype="audio/wav", timeout=120)
+            "voice", to="2347000000000@c.us", path=path, mimetype="audio/wav",
+            sender=None, http_timeout=120)
         self.assertFalse(Path(path).exists())
 
     def test_send_voice_cleans_up_when_send_fails(self):
@@ -137,7 +139,7 @@ class ToolClientTests(unittest.TestCase):
     def test_stop_and_control_files(self):
         with mock.patch.object(wa, "_post", return_value="stopping") as post:
             self.assertEqual(wa.stop(), "stopping")
-        post.assert_called_once_with("stop")
+        post.assert_called_once_with("stop", sender=None)
 
         wa.set_stop(True)
         self.assertTrue(wa.get_stop())
@@ -149,12 +151,26 @@ class ToolClientTests(unittest.TestCase):
     def test_leave_and_permission_actions(self):
         with mock.patch.object(wa, "_post", return_value="left") as post:
             self.assertEqual(wa.leave_group("123@g.us"), "left")
-        post.assert_called_once_with("leave", jid="123@g.us")
+        post.assert_called_once_with("leave", jid="123@g.us", sender=None)
 
         with mock.patch.object(wa, "_post", return_value="okay") as post:
             self.assertEqual(wa.permission("123@g.us", "2347000000000", True), "okay")
         post.assert_called_once_with(
-            "permission", jid="123@g.us", who="2347000000000", allow=True)
+            "permission", jid="123@g.us", who="2347000000000", allow=True, sender=None)
+
+    def test_vps_exec_clamps_timeout_and_sends_context(self):
+        with mock.patch.object(wa, "_post", return_value="exit=0") as post:
+            self.assertEqual(
+                wa.vps_exec("id", timeout=9999, cwd="/tmp", sender="2347", chat="1@g.us", group=True),
+                "exit=0")
+        post.assert_called_once_with(
+            "vps_exec", command="id", timeout=600, cwd="/tmp", sender="2347",
+            chat="1@g.us", group=True, http_timeout=630)
+
+    def test_send_message_sends_sender_context(self):
+        with mock.patch.object(wa, "_post", return_value="sent") as post:
+            self.assertEqual(wa.send_message("2347", "hi", sender="2347"), "sent")
+        post.assert_called_once_with("send", to="2347", text="hi", sender="2347")
 
 
 class AgentToolTests(unittest.TestCase):
@@ -215,26 +231,31 @@ class AgentToolTests(unittest.TestCase):
             self.assertIn("only the owner", agent._tools_for(MEMBER)["send_dm"]("2347", "hi"))
             send.assert_not_called()
             self.assertEqual(agent._tools_for(OWNER)["send_dm"]("2347", "hi"), "sent")
-            send.assert_called_once_with("2347", "hi")
+            send.assert_called_once_with("2347", "hi", sender=OWNER)
         with mock.patch.object(agent, "stop_task", return_value="stopping") as stop:
             self.assertIn("only the owner", agent._tools_for(MEMBER)["stop_task"]())
             stop.assert_not_called()
             self.assertEqual(agent._tools_for(OWNER)["stop_task"](), "stopping")
-            stop.assert_called_once_with()
+            stop.assert_called_once_with(sender=OWNER)
+
+    def test_non_owner_cannot_reach_owner_only_tool_even_by_name(self):
+        tools = agent._tools_for(MEMBER)
+        for name in agent.OWNER_ONLY_TOOLS:
+            self.assertIn("only the owner", tools[name]())
 
     def test_leave_uses_the_current_group(self):
         jid = "120363000000000000@g.us"
         with mock.patch.object(agent.wa, "leave_group", return_value="left") as leave:
             self.assertEqual(agent._tools_for(OWNER, jid)["leave_group"](), "left")
-            leave.assert_called_once_with(jid)
+            leave.assert_called_once_with(jid, sender=OWNER)
             self.assertIn("only the owner", agent._tools_for(MEMBER, jid)["leave_group"]())
             self.assertEqual(leave.call_count, 1)
 
     def test_leave_without_group_is_honest(self):
         self.assertIn("inside it", agent.leave_group(None))
         with mock.patch.object(agent.wa, "leave_group", return_value="left") as leave:
-            self.assertEqual(agent.leave_group("123@g.us"), "left")
-        leave.assert_called_once_with("123@g.us")
+            self.assertEqual(agent.leave_group("123@g.us", sender=OWNER), "left")
+        leave.assert_called_once_with("123@g.us", sender=OWNER)
 
     def test_memory_tools_are_scoped(self):
         with mock.patch.object(agent, "remember", return_value="ok") as remember:
@@ -248,6 +269,59 @@ class AgentToolTests(unittest.TestCase):
             agent._tools_for(OWNER)["remember"](user=admin_name, fact="fact")
             remember.assert_called_once_with(ADMIN, "fact", source=OWNER, scope="personal")
 
+    def test_group_memory_never_leaks_across_groups(self):
+        jid = "120363000000000000@g.us"
+        other = "120363000000000001@g.us"
+        with mock.patch.object(agent, "remember", return_value="ok") as remember:
+            agent._tools_for(MEMBER, jid, True)["remember"](fact="likes tea", scope="group")
+            remember.assert_called_once_with(
+                MEMBER, "likes tea", source=MEMBER, scope=f"group:{jid}")
+        with mock.patch.object(agent, "remember", return_value="ok") as remember:
+            agent._tools_for(MEMBER, jid, True)["remember"](fact="global", scope="global")
+        remember.assert_called_once_with(MEMBER, "global", source=MEMBER, scope="personal")
+        with mock.patch.object(agent, "recall_all", return_value="ok") as recall_all:
+            agent._tools_for(MEMBER, other, True)["recall_all"]()
+        recall_all.assert_called_once_with(MEMBER, other)
+        with mock.patch.object(agent, "recall", return_value="ok") as recall:
+            agent._tools_for(MEMBER, jid, True)["recall"](user="someone else")
+        recall.assert_called_once_with(MEMBER, jid)
+
+    def test_clear_memory_me_targets_the_sender(self):
+        with mock.patch.object(agent, "clear_memory", return_value="wiped") as clear:
+            agent._tools_for(OWNER)["clear_memory"](user="me")
+        clear.assert_called_once_with(OWNER, OWNER)
+        with mock.patch.object(agent, "clear_memory", return_value="wiped") as clear:
+            agent._tools_for(MEMBER)["clear_memory"](user="ALL")
+        clear.assert_called_once_with("ALL", MEMBER)
+
+    def test_vps_exec_passes_sender_and_chat_context(self):
+        jid = "120363000000000000@g.us"
+        with mock.patch.object(agent.wa, "vps_exec", return_value="exit=0") as vps:
+            self.assertEqual(
+                agent._tools_for(MEMBER, jid, True)["vps_exec"]("id", timeout=30, cwd="/tmp"),
+                "exit=0")
+        vps.assert_called_once_with(
+            "id", timeout=30, cwd="/tmp", sender=MEMBER, chat=jid, group=True)
+        with mock.patch.object(agent.wa, "vps_exec", return_value="exit=0") as vps:
+            agent._tools_for(OWNER, "", False)["vps_exec"]("id")
+        vps.assert_called_once_with(
+            "id", timeout=120, cwd="", sender=OWNER, chat=OWNER, group=False)
+
+    def test_vps_exec_surfaces_approval_request_id(self):
+        with mock.patch.object(
+                agent.wa, "vps_exec",
+                side_effect=agent.wa.ToolError(
+                    "owner approval required (request t123abc) — I've asked the owner")):
+            result = agent._tools_for(MEMBER, "1@g.us", True)["vps_exec"]("id")
+        self.assertIn("t123abc", result)
+
+    def test_report_progress_is_owner_only(self):
+        with mock.patch.object(agent, "report_progress", return_value="sent") as report:
+            self.assertIn("only the owner", agent._tools_for(MEMBER)["report_progress"]("hi"))
+            report.assert_not_called()
+            self.assertEqual(agent._tools_for(OWNER)["report_progress"]("hi"), "sent")
+        report.assert_called_once_with("hi", sender=OWNER)
+
     def test_brain_switch_is_owner_only(self):
         self.assertIn("only the owner", agent.switch_brain("moon", MEMBER))
         self.assertEqual(agent.get_brain(), "moonmath")
@@ -255,17 +329,21 @@ class AgentToolTests(unittest.TestCase):
         self.assertEqual(agent.get_brain(), "moonmath")
         with self.assertRaises(ValueError):
             agent.set_brain("does-not-exist")
-        self.assertEqual(agent._normalize_brain("hugging face"), "huggingface")
-        self.assertEqual(agent._normalize_brain("8b"), "hermes")
+        self.assertEqual(agent._normalize_brain("hugging face"), "hcn")
+        self.assertEqual(agent._normalize_brain("8b"), "hcn")
+        self.assertEqual(agent._normalize_brain("hermes"), "hcn")
+        self.assertIn("hcn", agent.BRAINS)
+        self.assertNotIn("huggingface", agent.BRAINS)
+        self.assertNotIn("hermes", agent.BRAINS)
 
     def test_stop_task_uses_bridge_with_file_fallback(self):
         with mock.patch.object(agent.wa, "stop", return_value="stopping") as stop:
-            self.assertEqual(agent.stop_task(), "stopping")
-        stop.assert_called_once_with()
+            self.assertEqual(agent.stop_task(sender=OWNER), "stopping")
+        stop.assert_called_once_with(sender=OWNER)
 
         with mock.patch.object(agent.wa, "stop", side_effect=agent.wa.ToolError("down")), \
                 mock.patch.object(agent.wa, "set_stop") as set_stop:
-            self.assertIn("stopping", agent.stop_task())
+            self.assertIn("stopping", agent.stop_task(sender=OWNER))
         set_stop.assert_called_once_with(True)
 
     def test_send_image_removes_temp_file(self):
@@ -291,9 +369,50 @@ class AgentToolTests(unittest.TestCase):
         self.assertNotIn("sk-", text)
         self.assertNotIn("hf_", text)
 
-    def test_probe_without_key_returns_reason(self):
-        self.assertEqual(agent._probe("http://127.0.0.1:1", "model", "", timeout=1),
-                         (False, "no key configured"))
+    def test_schemas_tools_match_and_owner_only(self):
+        schema_names = {s["function"]["name"] for s in agent.SCHEMAS}
+        self.assertEqual(schema_names, set(agent.TOOLS.keys()))
+        self.assertIn("web_fetch", schema_names)
+        self.assertTrue(agent.OWNER_ONLY_TOOLS.issubset(schema_names))
+        self.assertIn("analyze_image", agent.OWNER_ONLY_TOOLS)
+
+    def test_unorouter_exhaustion_marks_model_and_key(self):
+        key = "k" + "1"
+        agent._EXHAUSTED.clear()
+        try:
+            agent._mark_exhausted("unorouter", key, "gpt-4o:free")
+            self.assertTrue(agent._key_exhausted("unorouter", key, "gpt-4o:free"))
+            self.assertFalse(agent._key_exhausted("unorouter", key, "other-model"))
+            agent._mark_exhausted("unorouter", key, None)
+            self.assertTrue(agent._key_exhausted("unorouter", key, None))
+        finally:
+            agent._EXHAUSTED.clear()
+
+    def test_attempt_plan_skips_unconfigured_brains(self):
+        with mock.patch.dict(agent.BRAINS, {
+            "agnes": {"base": "https://x", "model": "m", "keys": [""], "label": "A"},
+        }):
+            self.assertEqual(agent._attempt_plan("agnes"), [])
+
+    def test_offline_mode_short_circuits_without_network(self):
+        with mock.patch.object(agent, "OFFLINE", True), \
+                mock.patch.object(agent, "_http_post") as post:
+            message = agent.call_model([{"role": "user", "content": "hi"}], OWNER)
+        self.assertEqual(message["content"], "offline test reply")
+        post.assert_not_called()
+
+    def test_run_agent_requires_a_sender_even_in_groups(self):
+        with mock.patch.object(agent, "call_model") as cm:
+            out = agent.run_agent("hi", sender="", is_group=True, group_jid="1@g.us",
+                                  mentioned=True, reply_to=False)
+        self.assertIn("couldn't confirm", out.lower())
+        cm.assert_not_called()
+
+    def test_run_agent_rejects_unknown_direct_sender(self):
+        with mock.patch.object(agent, "call_model") as cm:
+            out = agent.run_agent("hi", sender="", is_group=False, group_jid="", mentioned=False, reply_to=False)
+        self.assertIn("couldn't confirm", out.lower())
+        cm.assert_not_called()
 
     def test_unique_temp_files_do_not_collide(self):
         paths = {agent._unique_file(".png") for _ in range(8)}
@@ -342,7 +461,7 @@ class UrlSafetyTests(unittest.TestCase):
 
     def test_screenshot_sends_a_real_capture(self):
         def fake_run(cmd, **kwargs):
-            Path(cmd[-1]).write_bytes(b"PNG")
+            Path(cmd[-2]).write_bytes(b"PNG")
             return types.SimpleNamespace(returncode=0)
 
         with mock.patch.object(agent, "_safe_url", return_value="https://example.com"), \
@@ -351,6 +470,84 @@ class UrlSafetyTests(unittest.TestCase):
             self.assertEqual(agent.screenshot("2347", "https://example.com"), "sent")
         send.assert_called_once()
         self.assertEqual(Path(send.call_args.args[1]).suffix, ".png")
+
+
+class SearchAndFetchTests(unittest.TestCase):
+    def setUp(self):
+        self.saved = {
+            name: getattr(liam_keys, name)
+            for name in ("TAVILY_API_KEY", "BRAVE_API_KEY", "SERPER_API_KEY")
+        }
+
+    def tearDown(self):
+        for name, value in self.saved.items():
+            setattr(liam_keys, name, value)
+
+    def _set_keys(self, tavily="", brave="", serper=""):
+        liam_keys.TAVILY_API_KEY = tavily
+        liam_keys.BRAVE_API_KEY = brave
+        liam_keys.SERPER_API_KEY = serper
+
+    class _Context:
+        def __init__(self, data):
+            self.data = data
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self, _limit=-1):
+            return self.data
+
+    def test_uses_the_first_configured_provider(self):
+        self._set_keys(tavily="t", brave="b", serper="s")
+        body = {"results": [{"title": "T", "url": "https://example.com", "content": "snip"}]}
+        with mock.patch.object(agent, "_http_json", return_value=body) as http:
+            out = agent.web_search("hello")
+        self.assertIn("https://example.com", out)
+        self.assertIn("snip", out)
+        self.assertEqual(http.call_args.args[0], "https://api.tavily.com/search")
+
+    def test_falls_back_to_duckduckgo_when_providers_fail(self):
+        self._set_keys(tavily="t")
+        html = (b'<a class="result__a" href="//duckduckgo.com/l/?uddg='
+                b'https%3A%2F%2Fexample.com%2Fpage">Example</a>')
+        with mock.patch.object(agent, "_search_tavily", side_effect=RuntimeError("down")), \
+                mock.patch.object(agent, "_open_url", return_value=self._Context(html)), \
+                mock.patch.object(agent, "_safe_url", side_effect=lambda value: value):
+            out = agent.web_search("hello")
+        self.assertIn("https://example.com/page", out)
+        self.assertIn("Example", out)
+
+    def test_reports_all_provider_failures_without_crashing(self):
+        self._set_keys()
+        with mock.patch.object(agent, "_search_duckduckgo", side_effect=RuntimeError("down")):
+            out = agent.web_search("hello")
+        self.assertIn("search failed", out)
+        self.assertIn("DuckDuckGo", out)
+
+    def test_redirects_are_revalidated(self):
+        handler = agent._SafeRedirectHandler()
+        request = urllib.request.Request("https://example.com/")
+        with mock.patch.object(agent, "_safe_url", side_effect=ValueError("local")):
+            with self.assertRaises(ValueError):
+                handler.redirect_request(request, None, 302, "Found", {}, "http://127.0.0.1/")
+
+    def test_local_image_must_live_inside_the_data_directory(self):
+        with self.assertRaises(ValueError):
+            agent._local_image_data_url("C:/Windows/win.ini")
+        image = Path(agent.DATA_DIR) / "analysis.png"
+        image.write_bytes(b"PNGDATA")
+        try:
+            url = agent._local_image_data_url(str(image))
+            self.assertTrue(url.startswith("data:image/png;base64,"))
+            with mock.patch.object(agent, "call_model", return_value={"content": "a cat"}) as cm:
+                self.assertEqual(agent.analyze_image(str(image), "what is it?"), "a cat")
+            self.assertEqual(cm.call_args.kwargs["brain"], "moonmath")
+        finally:
+            image.unlink(missing_ok=True)
 
 
 class GoogleHelperTests(unittest.TestCase):

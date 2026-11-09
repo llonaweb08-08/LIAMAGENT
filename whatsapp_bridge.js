@@ -6,9 +6,12 @@ const fs = require("fs");
 const os = require("os");
 const http = require("http");
 const crypto = require("crypto");
+let sync;
+try { sync = require("./supabase_sync"); }
+catch (e) { sync = { restoreSession: async()=>({restored:false}), restoreDb: async()=>({restored:false}), backupSession: async()=>({ok:false}), backupDb: async()=>({ok:false}), backupNow: async()=>({ok:false}), sanitizeChromeLocks: ()=>0, startPeriodicBackup: ()=>null, stopPeriodicBackup: ()=>{}, configured: ()=>false }; }
 
-process.on("unhandledRejection", (r) => { console.log("\n💀 UNHANDLED REJECTION:", String(r)); });
-process.on("uncaughtException", (e) => { console.log("\n💀 UNCAUGHT EXCEPTION:", String(e)); });
+process.on("unhandledRejection", (r) => { console.log("\n💀 UNHANDLED REJECTION:", String(r && r.stack ? r.stack : r)); });
+process.on("uncaughtException", (e) => { console.log("\n💀 UNCAUGHT EXCEPTION:", String(e && e.stack ? e.stack : e)); });
 
 // ---------------------------------------------------------------------------
 // Paths and shared config
@@ -17,20 +20,34 @@ const BASE_DIR = __dirname;
 const DATA_DIR = process.env.LIAM_DATA_DIR || path.join(
   process.env.LOCALAPPDATA || os.homedir(), "LiamWhatsApp");
 const SESSION_DIR = path.join(DATA_DIR, "liam_session");
+const SESSION_PROFILE_DIR = path.join(SESSION_DIR, "session");
 const OUTBOX_DIR = path.join(DATA_DIR, "outbox");
 const TOKEN_FILE = path.join(DATA_DIR, "tool_token");
+const PAIR_TOKEN_FILE = path.join(DATA_DIR, "pair_token");
+const KNOWN_MEMBERS_FILE = path.join(DATA_DIR, "known_members.json");
 const STOP_FILE = path.join(DATA_DIR, "stop_flag");
 const BRAIN_FILE = path.join(DATA_DIR, "brain_state");
 const QR_FILE = path.join(DATA_DIR, "qr.png");
+const DM_OPEN_FILE = path.join(DATA_DIR, "dm_open");
 
 const MAX_BODY = 64 * 1024;
 const MAX_MEDIA = 25 * 1024 * 1024;
 const OUTBOUND_WINDOW = 60 * 1000;
 const OUTBOUND_MAX = 20;
-const PORT = Number.parseInt(process.env.LIAM_PORT || "5678", 10);
-if (!Number.isInteger(PORT) || PORT < 0 || PORT > 65535) {
-  throw new Error("LIAM_PORT must be a TCP port between 0 and 65535");
+const PERMISSION_TTL_MS = Math.max(60_000, Number.parseInt(process.env.LIAM_GROUP_PERMISSION_MS || String(3 * 60 * 60 * 1000), 10));
+const PENDING_TTL_MS = Math.max(60_000, Number.parseInt(process.env.LIAM_PENDING_TTL_MS || String(30 * 60 * 1000), 10));
+const TOOL_APPROVAL_TTL_MS = Math.max(60_000, Number.parseInt(process.env.LIAM_TOOL_APPROVAL_MS || String(10 * 60 * 1000), 10));
+const MAX_PENDING = 40;
+
+function resolvePort() {
+  const raw = process.env.PORT || process.env.LIAM_PORT || "5678";
+  const port = Number.parseInt(raw, 10);
+  if (!Number.isInteger(port) || port < 0 || port > 65535) {
+    throw new Error("PORT/LIAM_PORT must be a TCP port between 0 and 65535");
+  }
+  return port;
 }
+const PORT = resolvePort();
 
 for (const dir of [DATA_DIR, OUTBOX_DIR]) {
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
@@ -56,6 +73,25 @@ const DM_ALLOW = new Set([
   ...String(process.env.LIAM_DM_ALLOWLIST || "")
     .split(",").map(bareId).filter((p) => /^\d{6,20}$/.test(p)),
 ]);
+
+// Known group members are people Liam has actually seen in a group. They are
+// only allowed to DM after the owner runs .allowdm.
+const knownMembers = new Set();
+try {
+  const raw = JSON.parse(fs.readFileSync(KNOWN_MEMBERS_FILE, "utf8"));
+  if (Array.isArray(raw)) raw.map(bareId).filter((p) => /^\d{6,20}$/.test(p)).forEach((p) => knownMembers.add(p));
+} catch (e) {}
+function saveKnownMembers() {
+  try {
+    fs.writeFileSync(KNOWN_MEMBERS_FILE, JSON.stringify([...knownMembers].slice(-5000)), { mode: 0o600 });
+  } catch (e) {}
+}
+function rememberKnownMember(phone) {
+  const p = bareId(phone);
+  if (!/^\d{6,20}$/.test(p) || knownMembers.has(p)) return;
+  knownMembers.add(p);
+  saveKnownMembers();
+}
 
 function copyLegacy(src, dest, mode = 0o600) {
   try {
@@ -107,7 +143,7 @@ if (fs.existsSync(CACHE_DIR)) {
 }
 
 // ---------------------------------------------------------------------------
-// Local tool endpoint token (shared with the Python agent through DATA_DIR)
+// Local tool endpoint token and pairing token
 // ---------------------------------------------------------------------------
 function loadToken() {
   let token = "";
@@ -120,6 +156,27 @@ function loadToken() {
   return token;
 }
 const TOOL_TOKEN = loadToken();
+
+function loadPairToken() {
+  const fromEnv = String(process.env.LIAM_PAIR_TOKEN || "").trim();
+  if (fromEnv) return fromEnv;
+  let token = "";
+  try { token = fs.readFileSync(PAIR_TOKEN_FILE, "utf8").trim(); } catch (e) {}
+  if (!/^[a-f0-9]{32,128}$/.test(token)) {
+    token = crypto.randomBytes(32).toString("hex");
+    fs.writeFileSync(PAIR_TOKEN_FILE, token, { mode: 0o600 });
+    try { fs.chmodSync(PAIR_TOKEN_FILE, 0o600); } catch (e) {}
+  }
+  return token;
+}
+const PAIR_TOKEN = loadPairToken();
+const PUBLIC_URL = String(
+  process.env.LIAM_PUBLIC_URL ||
+  process.env.RENDER_EXTERNAL_URL ||
+  (process.env.RENDER_EXTERNAL_HOSTNAME ? "https://" + process.env.RENDER_EXTERNAL_HOSTNAME : "") ||
+  ""
+).replace(/\/+$/, "");
+const BOT_PHONE = String(process.env.LIAM_BOT_PHONE || "447881161023").replace(/\D/g, "");
 
 function writeFileAtomic(file, value) {
   const temp = file + "." + process.pid + "." + Date.now() + ".tmp";
@@ -136,31 +193,113 @@ function writeFileAtomic(file, value) {
 // ---------------------------------------------------------------------------
 // WhatsApp client
 // ---------------------------------------------------------------------------
+function puppeteerArgs() {
+  const base = [
+    "--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage",
+    "--disable-gpu", "--no-first-run", "--no-zygote",
+  ];
+  if (process.env.LIAM_CHROME_SINGLE_PROCESS === "1") base.push("--single-process");
+  return base;
+}
+
+let waState = "starting";        // starting | restoring | needs_qr | linking | ready | disconnected | error
+let waStateDetail = "";
+let waLastQrAt = 0;
+let waInitPromise = null;
+let lastQr = null;
+let lastPairCode = null;
+let lastPairAt = 0;
+let pairingInFlight = null;
+
+function setWaState(state, detail = "") {
+  waState = state;
+  waStateDetail = detail || "";
+}
+
+function profileHasCredentials() {
+  const markers = [
+    path.join(SESSION_PROFILE_DIR, "Default", "Preferences"),
+    path.join(SESSION_PROFILE_DIR, "Default", "Local Storage", "leveldb"),
+    path.join(SESSION_PROFILE_DIR, "Default", "IndexedDB"),
+    path.join(SESSION_PROFILE_DIR, "Local State"),
+  ];
+  if (markers.some((p) => { try { return fs.existsSync(p); } catch (e) { return false; } })) return true;
+  // Older profiles may not have the exact markers; an empty LocalAuth profile
+  // (just the session directory) must not count as a linked session.
+  try {
+    if (!fs.existsSync(SESSION_PROFILE_DIR)) return false;
+    return fs.readdirSync(SESSION_PROFILE_DIR).some((name) => name !== "Default" && name !== "SingletonLock");
+  } catch (e) { return false; }
+}
+function hasSessionData() { return profileHasCredentials(); }
+
 const client = new Client({
   authStrategy: new LocalAuth({ dataPath: SESSION_DIR }),
-  puppeteer: { headless: true, args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"] }
-
+  puppeteer: {
+    headless: true,
+    args: puppeteerArgs(),
+    protocolTimeout: Number.parseInt(process.env.LIAM_PUPPETEER_TIMEOUT_MS || "180000", 10),
+  },
 });
 
-let dmOnlyOwner = false;          // default: DMs open. .disallowdm limits to owners + admins, .allowdm reopens
-const TEMP = {};                 // group permissions, wiped after 30 min
-const lastLiam = {};             // last message ID Liam sent per chat (reply-to detection)
-const TEMP_MIN = 30 * 60 * 1000;
+function loadDmOpen() {
+  if (process.env.LIAM_DM_OPEN != null) return String(process.env.LIAM_DM_OPEN || "0") === "1";
+  try { return fs.readFileSync(DM_OPEN_FILE, "utf8").trim() === "1"; } catch (e) { return false; }
+}
+let dmOpen = loadDmOpen();
+function saveDmOpen() {
+  try { writeFileAtomic(DM_OPEN_FILE, dmOpen ? "1" : "0"); } catch (e) {}
+}
+function setDmOpen(value) {
+  dmOpen = !!value;
+  saveDmOpen();
+}
+function dmAllowed(phone) {
+  const p = bareId(phone);
+  return OWNERS.includes(p) || (p in ADMINS) || (dmOpen && knownMembers.has(p));
+}
+const TEMP = {};                 // group permissions: TEMP[groupJid][phone] = +/-timestamp
+const lastLiam = {};             // recent message IDs Liam sent per chat (reply-to detection)
+const LAST_LIAM_MAX = 20;
+function rememberLiamMessage(jid, id) {
+  if (!jid || !id) return;
+  const list = lastLiam[jid] || (lastLiam[jid] = []);
+  list.push(id);
+  list.splice(0, Math.max(0, list.length - LAST_LIAM_MAX));
+}
+function isLiamMessage(jid, id) {
+  return !!(jid && id && lastLiam[jid] && lastLiam[jid].includes(id));
+}
+const pendingPerms = new Map();  // id -> { id, jid, phone, text, ts }
+const pendingTools = new Map();  // id -> { id, action, payload, actor, chat, isGroup, ts }
+const ASK_TIMEOUT_MS = Math.max(15000, Number.parseInt(process.env.LIAM_ASK_TIMEOUT_MS || "180000", 10));
 let agentProc = null;            // spawned python agent process
-let agentPending = null;         // { resolve, reject } for the one in-flight request
+let agentPending = null;         // { resolve, reject, timeout, id } for the one in-flight request
+let agentRequestId = 0;
 let agentQueue = Promise.resolve();
 
-function startAgent() {
-  if (agentProc) return agentProc;
+function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
+
 function pythonBin() {
-  if (process.env.LIAM_PYTHON) return process.env.LIAM_PYTHON;
-  try {
-    const r = spawnSync("python", ["-c", "import sys;print(sys.executable)"], { encoding: "utf8" });
-    if (r.status === 0 && r.stdout) return r.stdout.trim();
-  } catch (e) {}
-  return "python";
+  const candidates = [];
+  if (process.env.LIAM_PYTHON) candidates.push(process.env.LIAM_PYTHON);
+  candidates.push("python3", "python");
+  for (const bin of candidates) {
+    try {
+      const r = spawnSync(bin, ["-c", "import sys;print(sys.executable)"], { encoding: "utf8", timeout: 8000 });
+      if (r.status === 0 && String(r.stdout || "").trim()) return bin;
+    } catch (e) {}
+  }
+  return process.platform === "win32" ? "python" : "python3";
 }
-  agentProc = spawn(pythonBin(), ["-X", "utf8", "agent.py"], {
+
+function startAgent() {
+  if (agentProc && agentProc.exitCode === null && !agentProc.killed) return agentProc;
+  let bin;
+  try { bin = pythonBin(); }
+  catch (e) { console.log("💀 cannot find Python:", String(e)); return null; }
+  try {
+    agentProc = spawn(bin, ["-X", "utf8", "agent.py"], {
     cwd: BASE_DIR,
     env: {
       ...process.env,
@@ -170,13 +309,19 @@ function pythonBin() {
       LIAM_DATA_DIR: DATA_DIR,
     },
     stdio: ["pipe", "pipe", "inherit"]
-  });
+    });
+  } catch (e) {
+    agentProc = null;
+    console.log("💀 AGENT SPAWN ERROR:", String(e));
+    return null;
+  }
   const proc = agentProc;
   let buf = "";
 
   const failPending = (err) => {
     if (!agentPending) return;
     const p = agentPending; agentPending = null;
+    try { clearTimeout(p.timeout); } catch (e) {}
     p.reject(err);
   };
 
@@ -193,8 +338,9 @@ function pythonBin() {
       if (!msg || typeof msg !== "object") continue;
       if (msg.error) { console.log("\n💀 AGENT ERROR:", msg.error); failPending(new Error(msg.error)); continue; }
       if (Object.prototype.hasOwnProperty.call(msg, "reply")) {
-        if (!agentPending) { console.log("[agent] stray reply:", JSON.stringify(msg.reply)); continue; }
+        if (!agentPending) { console.log("[agent] stale reply ignored"); continue; }
         const p = agentPending; agentPending = null;
+        try { clearTimeout(p.timeout); } catch (e) {}
         p.resolve(msg.reply == null ? "" : String(msg.reply));
       }
     }
@@ -215,7 +361,7 @@ function pythonBin() {
 function stopAgent() {
   const proc = agentProc;
   agentProc = null;
-  if (agentPending) { const p = agentPending; agentPending = null; p.reject(new Error("agent stopped")); }
+  if (agentPending) { const p = agentPending; agentPending = null; try { clearTimeout(p.timeout); } catch (e) {} p.reject(new Error("agent stopped")); }
   if (!proc) return;
   try { proc.stdin.end(); } catch (e) {}
   if (process.platform === "win32" && proc.pid) {
@@ -255,7 +401,15 @@ function askLiam(user, phone, isGroup, groupJid, mentioned, replyTo) {
     if (!proc || proc.exitCode !== null || !proc.stdin || proc.stdin.destroyed) {
       return reject(new Error("agent is not running"));
     }
-    agentPending = { resolve, reject };
+    const id = ++agentRequestId;
+    const timeout = setTimeout(() => {
+      if (agentPending && agentPending.id === id) {
+        agentPending = null;
+        stopAgent(); // avoid late replies resolving future requests
+        reject(new Error("agent timed out"));
+      }
+    }, ASK_TIMEOUT_MS);
+    agentPending = { resolve, reject, timeout, id };
     const payload = JSON.stringify({
       u: String(user == null ? "" : user),
       s: String(phone == null ? "" : phone),
@@ -265,88 +419,389 @@ function askLiam(user, phone, isGroup, groupJid, mentioned, replyTo) {
       r: !!replyTo
     });
     try { proc.stdin.write(payload + "\n"); }
-    catch (e) { agentPending = null; reject(e); }
+    catch (e) { clearTimeout(timeout); agentPending = null; stopAgent(); reject(e); }
   });
   const run = agentQueue.then(job, job);
-  const timed = Promise.race([run, new Promise((_, rej) => setTimeout(() => rej(new Error("agent timed out")), 120000))]);
   agentQueue = run.catch(() => {});
-  return timed;
+  return run;
 }
 
-// sweep temp permissions that are 30 min old
-const sweepTimer = setInterval(() => { const now = Date.now();
-  for (const jid in TEMP) for (const n in TEMP[jid])
-    if (now - TEMP[jid][n] > TEMP_MIN) delete TEMP[jid][n];
-}, 60000);
+// ---------------------------------------------------------------------------
+// Group permissions (3 hours per member per group) and one-time tool approvals
+// ---------------------------------------------------------------------------
+function sweepTemp(now = Date.now()) {
+  for (const jid of Object.keys(TEMP)) {
+    for (const n of Object.keys(TEMP[jid] || {})) {
+      const stamp = TEMP[jid][n];
+      if (!stamp || now - Math.abs(stamp) > PERMISSION_TTL_MS) delete TEMP[jid][n];
+    }
+    if (TEMP[jid] && !Object.keys(TEMP[jid]).length) delete TEMP[jid];
+  }
+  for (const [id, p] of pendingPerms) if (!p || now - p.ts > PENDING_TTL_MS) pendingPerms.delete(id);
+  for (const [id, p] of pendingTools) if (!p || now - p.ts > TOOL_APPROVAL_TTL_MS) pendingTools.delete(id);
+}
+const sweepTimer = setInterval(() => sweepTemp(), 60000);
+if (typeof sweepTimer.unref === "function") sweepTimer.unref();
+
+function tempDecision(jid, phone) {
+  sweepTemp();
+  const p = bareId(phone);
+  const entry = jid && TEMP[jid] ? TEMP[jid][p] : null;
+  if (!entry) return null;
+  return entry > 0 ? "allow" : "deny";
+}
+
+function makeId(prefix) {
+  for (let i = 0; i < 20; i += 1) {
+    const id = prefix + crypto.randomBytes(3).toString("hex");
+    if (!pendingPerms.has(id) && !pendingTools.has(id)) return id;
+  }
+  return prefix + Date.now().toString(36);
+}
+
+function trimPending(map, max = MAX_PENDING) {
+  if (map.size <= max) return;
+  const entries = [...map.entries()].sort((a, b) => a[1].ts - b[1].ts);
+  for (let i = 0; i < entries.length - max; i += 1) map.delete(entries[i][0]);
+}
+
+function participantId(participant) {
+  if (!participant) return "";
+  const id = participant.id || participant;
+  if (typeof id === "string") return bareId(id);
+  return bareId(id._serialized || id.user || id.id || "");
+}
+
+async function ownerIdsInGroup(jid) {
+  try {
+    const chat = await client.getChatById(jid);
+    const parts = Array.isArray(chat && chat.participants) ? chat.participants : [];
+    return OWNERS.filter((owner) => parts.some((p) => participantId(p) === owner));
+  } catch (e) {
+    return [];
+  }
+}
+
+async function sendApprovalPrompt(text, groupJid) {
+  if (groupJid) {
+    const owners = await ownerIdsInGroup(groupJid);
+    if (owners.length) {
+      const tags = owners.map((o) => "@" + o).join(" ");
+      try {
+        await client.sendMessage(groupJid, `${tags} ${text}`.trim(), {
+          mentions: owners.map((o) => o + "@c.us"),
+        });
+        return true;
+      } catch (e) { console.log("warn: group approval prompt failed:", String(e)); }
+    }
+  }
+  let sent = 0;
+  for (const owner of OWNERS) {
+    try {
+      await client.sendMessage(owner + "@c.us", text);
+      sent += 1;
+    } catch (e) { console.log("warn: owner approval DM failed:", String(e)); }
+  }
+  return sent > 0;
+}
+
+function toolApprovalText(p) {
+  let args = "";
+  try { args = JSON.stringify(p.payload, Object.keys(p.payload || {}).sort()); } catch (e) { args = "{}"; }
+  if (args.length > 900) args = args.slice(0, 900) + "…";
+  return [
+    "Owner approval needed (one-time, valid 10 minutes).",
+    `From: ${p.actor || "unknown"}`,
+    `Tool: ${p.action}`,
+    `Args: ${args}`,
+    `Reply: yes ${p.id} / no ${p.id}`,
+  ].join("\n");
+}
+
+async function createToolApproval(action, payload, actor, ctx = {}) {
+  sweepTemp();
+  const id = makeId("t");
+  const p = {
+    id, action,
+    payload: { ...payload, action, sender: actor },
+    actor,
+    chat: String(ctx.chat || actor || ""),
+    isGroup: !!ctx.isGroup,
+    ts: Date.now(),
+  };
+  pendingTools.set(id, p);
+  trimPending(pendingTools);
+  const sent = await sendApprovalPrompt(toolApprovalText(p), ctx.isGroup ? ctx.chat : "");
+  if (!sent) {
+    pendingTools.delete(id);
+    throw new BadRequest("no owner is reachable for approval");
+  }
+  return p;
+}
+
+function permissionPromptText(p) {
+  return [
+    "Group permission needed (3 hours).",
+    `${p.phone} wants Liam to reply in this group.`,
+    `Request ${p.id}.`,
+    `Reply: yes ${p.id} / no ${p.id}`,
+  ].join("\n");
+}
+
+async function createPermissionRequest(jid, phone, text) {
+  sweepTemp();
+  const bare = bareId(phone);
+  for (const p of pendingPerms.values()) {
+    if (p.jid === jid && p.phone === bare) {
+      p.text = String(text || "").slice(0, 2000);
+      p.ts = Date.now();
+      return p;
+    }
+  }
+  const id = makeId("p");
+  const p = { id, jid, phone: bare, text: String(text || "").slice(0, 2000), ts: Date.now() };
+  pendingPerms.set(id, p);
+  trimPending(pendingPerms);
+  const sent = await sendApprovalPrompt(permissionPromptText(p), jid);
+  if (!sent) {
+    pendingPerms.delete(id);
+    return null;
+  }
+  return p;
+}
+
+async function executeToolApproval(id, ownerChat) {
+  const p = pendingTools.get(id);
+  if (!p) return "that approval request has expired or was already used";
+  pendingTools.delete(id);
+  if (Date.now() - p.ts > TOOL_APPROVAL_TTL_MS) return "that approval request has expired";
+  try {
+    const result = await handleAction({ ...p.payload, approved: true }, { approved: true });
+    const text = String(result || "done");
+    const target = chatTarget(p.chat || p.actor, p.isGroup);
+    await sendLong(target, `✅ Approved ${p.action} — result:\n${text.slice(0, 3500)}`);
+    if (ownerChat && ownerChat !== target) {
+      try { await client.sendMessage(ownerChat, `Done — ${p.action} ran.`); } catch (e) {}
+    }
+    return "approved and executed";
+  } catch (e) {
+    const message = e instanceof BadRequest ? e.message : "the approved action failed";
+    try { await client.sendMessage(chatTarget(p.chat || p.actor, p.isGroup), `❌ ${p.action} failed: ${message}`); } catch (e2) {}
+    return message;
+  }
+}
+
+async function handleApprovalCommand(text, phone, chat, isGroup) {
+  if (!OWNERS.includes(bareId(phone))) return false;
+  const match = /^(yes|allow|ok|approve|no|deny|ignore)\b(?:\s+([a-z0-9_-]+))?$/i.exec(String(text || "").trim());
+  if (!match) return false;
+  const allow = /^(yes|allow|ok|approve)$/i.test(match[1]);
+  const wanted = String(match[2] || "").toLowerCase();
+
+  // Tool approvals are always exact: the owner must include the request id.
+  // A bare "yes"/"ok" must never approve a shell command, even when only one
+  // request is pending.
+  let toolId = null;
+  if (wanted && pendingTools.has(wanted)) toolId = wanted;
+  if (toolId) {
+    const p = pendingTools.get(toolId);
+    if (allow) {
+      await executeToolApproval(toolId, chat);
+    } else {
+      pendingTools.delete(toolId);
+      try { await client.sendMessage(chat, `🚫 denied ${toolId} (${p ? p.action : "tool"}).`); } catch (e) {}
+    }
+    return true;
+  }
+
+  let permId = null;
+  if (wanted && pendingPerms.has(wanted)) permId = wanted;
+  else if (!wanted && !pendingTools.size) {
+    const list = [...pendingPerms.values()].filter((p) => p.ts && Date.now() - p.ts <= PENDING_TTL_MS);
+    // Inside a group only that group's request can be approved; in a DM an
+    // owner can approve any request (that's where prompts go when no owner is
+    // present in the group).
+    const inChat = isGroup ? list.filter((p) => p.jid === chat) : list;
+    const pool = inChat.length ? inChat : (isGroup ? [] : list);
+    pool.sort((a, b) => b.ts - a.ts);
+    if (pool.length === 1) permId = pool[0].id;
+    else if (pool.length > 1) {
+      try { await client.sendMessage(chat, "There is more than one request — reply with the id, e.g. `yes p123abc`."); } catch (e) {}
+      return true;
+    }
+  }
+  if (permId) {
+    const p = pendingPerms.get(permId);
+    pendingPerms.delete(permId);
+    if (!allow) {
+      TEMP[p.jid] = TEMP[p.jid] || {};
+      TEMP[p.jid][p.phone] = -Date.now();
+      try { await client.sendMessage(p.jid, `okay, I won't reply to ${p.phone} in this group.`); } catch (e) {}
+      if (chat !== p.jid) { try { await client.sendMessage(chat, `okay — denied ${p.id}.`); } catch (e) {} }
+      return true;
+    }
+    TEMP[p.jid] = TEMP[p.jid] || {};
+    TEMP[p.jid][p.phone] = Date.now();
+    try { await client.sendMessage(p.jid, `okay, I'll reply to ${p.phone} for the next 3 hours.`); } catch (e) {}
+    try {
+      const reply = await askLiam(p.text, p.phone, true, p.jid, true, false);
+      const sent = await client.sendMessage(p.jid, reply);
+      rememberLiamMessage(p.jid, sent && sent.id ? sent.id._serialized : null);
+    } catch (e) { console.log("warn: approved reply failed:", String(e)); }
+    if (chat !== p.jid) { try { await client.sendMessage(chat, `okay — allowed ${p.phone} for 3 hours.`); } catch (e) {} }
+    return true;
+  }
+
+  if (wanted) {
+    const prefix = wanted[0];
+    if (prefix === "t" || prefix === "p") {
+      try { await client.sendMessage(chat, `I don't see ${wanted} — it expired or was already used.`); } catch (e) {}
+      return true;
+    }
+  }
+  if (!wanted && pendingTools.size) {
+    try {
+      await client.sendMessage(chat, "Tool approvals need the request id — reply `yes t…` or `no t…`.");
+    } catch (e) {}
+    return true;
+  }
+  return false;
+}
 
 function removeQr() {
+  lastQr = null;
   try { fs.rmSync(QR_FILE, { force: true }); } catch (e) {}
 }
 
 client.on("qr", async (qr) => {
+  lastQr = String(qr || "");
+  waLastQrAt = Date.now();
+  setWaState("needs_qr", "scan the QR code or use the pairing page to link WhatsApp");
   try {
     await QRCode.toFile(QR_FILE, qr, { width: 520, margin: 2 });
     try { fs.chmodSync(QR_FILE, 0o600); } catch (e) {}
-    console.log("\n📱 SCAN THIS QR CODE TO LINK LIAM! SAVED AT: " + QR_FILE);
+    console.log("\n📱 QR READY — open the pairing page from the logs to scan it.");
   } catch (e) { console.log("\n❌ QR FAILED:", String(e)); }
 });
-client.on("authenticated", () => { removeQr(); console.log("\n✅ LIAM LINKED — ready!\n"); });
-client.on("auth_failure", (m) => { removeQr(); console.log("\n❌ AUTH FAILED:", m); stopAgent(); setTimeout(() => process.exit(1), 5000); });
+client.on("code", (code) => { lastPairCode = String(code || ""); lastPairAt = Date.now(); setWaState("linking", "pairing code generated"); });
+client.on("authenticated", () => { removeQr(); setWaState("linking", "authenticated, finishing startup"); console.log("\n✅ LIAM LINKED — finishing startup\n"); });
+client.on("auth_failure", (m) => { removeQr(); setWaState("error", "WhatsApp auth failed"); console.log("\n❌ AUTH FAILED:", String(m)); stopAgent(); setTimeout(() => process.exit(1), 5000); });
 client.on("ready", async () => {
   console.log("\n🚀 LIAM IS LIVE — waiting for messages...\n");
   removeQr();
+  setWaState("ready", "WhatsApp connected");
   startAgent();
+  // Archive immediately, so a free Render instance that spins down soon after
+  // pairing still leaves a restorable session in Supabase.
+  setTimeout(() => {
+    try {
+      Promise.resolve(sync.backupNow(DATA_DIR, SESSION_DIR, DATA_DIR))
+        .then((r) => { if (!r || !r.ok) console.log("warn: immediate backup did not complete"); })
+        .catch((e) => console.log("warn: immediate backup failed:", String(e)));
+    } catch (e) {}
+  }, 3000);
 });
-client.on("disconnected", (r) => { removeQr(); console.log("\n⚠️ Disconnected:", r && r.toString()); stopAgent(); setTimeout(() => process.exit(1), 5000); });
+client.on("disconnected", (r) => { removeQr(); setWaState("disconnected", "WhatsApp disconnected"); console.log("\n⚠️ Disconnected:", r && r.toString ? r.toString() : r); stopAgent(); setTimeout(() => process.exit(1), 5000); });
+client.on("change_state", (s) => { if (waState !== "ready" && waState !== "needs_qr") setWaState(waState, String(s || waStateDetail)); });
+
+// ---------------------------------------------------------------------------
+// Message routing
+// ---------------------------------------------------------------------------
+function isNameMention(text) {
+  const value = String(text || "");
+  // Only treat "Liam" as a trigger when the message actually addresses her.
+  // This deliberately avoids replying to every sentence that mentions a Liam.
+  return /^\s*@?liam\b/i.test(value) ||
+    /\b(?:hey|hi|hello|yo|ok|okay|please|pls|babe|baby)\s+liam\b/i.test(value) ||
+    /\bliam\s*[,:!?]/i.test(value);
+}
+
+function chatTarget(value, isGroup) {
+  const raw = String(value || "").trim();
+  if (!raw) return raw;
+  if (isGroup || raw.endsWith("@g.us") || raw.endsWith("@c.us")) return raw;
+  return raw + "@c.us";
+}
+
+function splitMessage(text, limit = 4000) {
+  const value = String(text == null ? "" : text);
+  if (value.length <= limit) return [value];
+  const chunks = [];
+  let rest = value;
+  while (rest.length > limit) {
+    let cut = rest.lastIndexOf("\n", limit);
+    if (cut < limit * 0.5) cut = rest.lastIndexOf(" ", limit);
+    if (cut < limit * 0.5) cut = limit;
+    chunks.push(rest.slice(0, cut));
+    rest = rest.slice(cut).replace(/^\n/, "");
+  }
+  if (rest) chunks.push(rest);
+  return chunks;
+}
+
+async function sendLong(to, text) {
+  let last = null;
+  for (const chunk of splitMessage(text)) {
+    if (!chunk.trim()) continue;
+    last = await client.sendMessage(to, chunk);
+  }
+  return last;
+}
+
+async function ownerPresentInGroup(jid) {
+  return (await ownerIdsInGroup(jid)).length > 0;
+}
 
 client.on("message", async (msg) => {
   try {
   const text = msg.body;
-  console.log(`\n📥 RAW MSG from=${msg.from} fromMe=${msg.fromMe} type=${msg.type} hasQuotedMsg=${!!msg.hasQuotedMsg} body=${JSON.stringify(text)}`);
   if (!text || msg.fromMe) return;
   const from = msg.from;
   if (from === "status@broadcast" || from.endsWith("@broadcast") || from.endsWith("@newsletter")) return;
 
   const isGroup = from.endsWith("@g.us");
-  // In groups msg.from is the GROUP id; msg.author is the real sender.
   const senderId = isGroup ? (msg.author || from) : from;
   const phone = await resolvePhone(senderId);
-  console.log(`\n🔍 RESOLVED chat=${from} sender=${senderId} phone=${phone} isGroup=${isGroup}`);
+  if (!phone) { console.log("warn: could not resolve sender", senderId); return; }
 
   let replyTo = null;
   if (msg.hasQuotedMsg) {
     try { const q = await msg.getQuotedMessage(); replyTo = q && q.id ? q.id._serialized : null; } catch (e) {}
   }
 
-  // .allowdm / .disallowdm — DM from the owner, works BEFORE any whitelist check
-  if (!isGroup && OWNERS.includes(phone) && (text === ".allowdm" || text === ".disallowdm")) {
-    dmOnlyOwner = (text === ".disallowdm");
-    const reply = dmOnlyOwner
-      ? "okay babe, DMs are closed again — only you, Precious and Temi can reach me now"
-      : "okay babe, DMs are wide open — anyone can talk to me now";
-    console.log(`\n📩 [toggle] ${phone}\n💬 Liam: ${reply}\n`);
-    await client.sendMessage(from, reply);
-    return;
-  }
+  // Owner approval/denial works in a DM or in the group, before any gate.
+  if (await handleApprovalCommand(text, phone, from, isGroup)) return;
 
   if (!isGroup) {
-    // DMs: open by default; .disallowdm limits them to owners + admins
-    if (dmOnlyOwner && !OWNERS.includes(phone) && !(phone in ADMINS)) return;
+    // .allowdm: owners + admins + known group members. .disallowdm: owners + admins.
+    if (!OWNERS.includes(phone) && (text === ".allowdm" || text === ".disallowdm")) return;
+    if (OWNERS.includes(phone) && (text === ".allowdm" || text === ".disallowdm")) {
+      setDmOpen(text === ".allowdm");
+      const reply = dmOpen
+        ? "okay babe, DMs are open to owners, admins and people I already know from groups"
+        : "okay babe, DMs are closed again — only you, Precious and Temi can reach me now";
+      console.log(`\n📩 [toggle] ${phone}\n💬 Liam: ${reply}\n`);
+      await sendLong(from, reply);
+      return;
+    }
+    const allowed = dmAllowed(phone);
+    if (!allowed) return;
     const reply = await askLiam(text, phone, false, "", false, false);
     console.log(`\n📩 ${phone}: ${text}\n💬 Liam: ${reply}\n`);
-    await client.sendMessage(from, reply);
+    await sendLong(from, reply);
     return;
   }
 
-  // GROUPS: activated by a tag (@Liam / @<bot number>) or by a reply to her last message
+  // Track people Liam has seen in a group; used only by .allowdm.
+  if (!OWNERS.includes(phone) && !(phone in ADMINS)) rememberKnownMember(phone);
+
   const selfId = client.info && client.info.wid ? client.info.wid._serialized : "";
   const selfBare = bareId(selfId);
   const mentioned =
     (Array.isArray(msg.mentionedIds) && msg.mentionedIds.some((id) => bareId(id) === selfBare)) ||
     (!!selfBare && text.includes("@" + selfBare)) ||
-    /@Liam\b/i.test(text) ||
-    /\bliam\b/i.test(text);
-  const replyingToLiam = !!replyTo && lastLiam[from] === replyTo;
+    isNameMention(text);
+  const replyingToLiam = !!replyTo && isLiamMessage(from, replyTo);
   if (!mentioned && !replyingToLiam) return;
 
   let who;
@@ -354,32 +809,81 @@ client.on("message", async (msg) => {
   else if (phone in ADMINS) who = "admin";
   else who = "member";
 
-  // Permission gate for non-owners/admins mentioning Liam
-  if (who === "member" && mentioned) {
-    if (!global.pendingPerm) global.pendingPerm = {};
-    const ownerTag = OWNERS[0] ? "@" + OWNERS[0] : "";
-    global.pendingPerm[from] = global.pendingPerm[from] || [];
-    global.pendingPerm[from].push({ id: Date.now(), text, phone, ts: Date.now() });
-    await client.sendMessage(from, `${ownerTag} Babe, can I reply to ${phone}?`);
-    return;
+  // Members need a 3-hour permission per group. Owners and admins do not.
+  if (who === "member") {
+    const decision = tempDecision(from, phone);
+    if (decision === "deny") return;
+    if (decision !== "allow") {
+      const p = await createPermissionRequest(from, phone, text);
+      if (!p) {
+        try { await client.sendMessage(from, "I couldn't reach an owner to approve that, so I didn't reply."); } catch (e) {}
+        return;
+      }
+      try {
+        await client.sendMessage(from, `I've asked the owner whether I can reply to ${phone}. (request ${p.id})`);
+      } catch (e) {}
+      return;
+    }
   }
 
-  // Owner approval of pending permission
-  if (who === "owner" && /^(yes|allow|ok|sure)$/i.test(text.trim()) && global.pendingPerm && global.pendingPerm[from] && global.pendingPerm[from].length) {
-    const list = global.pendingPerm[from];
-    const p = list[list.length - 1];
-    global.pendingPerm[from] = list.filter((x) => x !== p);
-    const reply = await askLiam(p.text, p.phone || bareId(p.phone), true, from, true, false);
-    const sent = await client.sendMessage(from, reply);
-    lastLiam[from] = sent && sent.id ? sent.id._serialized : null;
-    return;
-  }
   const reply = await askLiam(text, phone, true, from, mentioned, replyingToLiam);
   console.log(`\n📩 [${from}] ${who} ${phone}: ${text}\n💬 Liam: ${reply}\n`);
-  const sent = await client.sendMessage(from, reply);
-  lastLiam[from] = sent && sent.id ? sent.id._serialized : null;
+  const sent = await sendLong(from, reply);
+  rememberLiamMessage(from, sent && sent.id ? sent.id._serialized : null);
   } catch (e) { console.log(`\n💀 MSG HANDLER ERROR: ${String(e)}`); }
 });
+
+// ---------------------------------------------------------------------------
+// InstaBox pentest VM (members need one-time owner approval)
+// ---------------------------------------------------------------------------
+const INSTABOX_API_KEY = String(process.env.INSTABOX_API_KEY || "").trim();
+const INSTABOX_MACHINE_ID = String(process.env.INSTABOX_MACHINE_ID || "").trim();
+const INSTABOX_API_URL = String(process.env.INSTABOX_API_URL || "https://api.instabox.sh").replace(/\/+$/, "").replace(/\/v1$/, "");
+
+async function instaboxExec(command, timeoutSeconds = 120, cwd = "") {
+  if (!INSTABOX_API_KEY || !INSTABOX_MACHINE_ID) {
+    throw new BadRequest("InstaBox is not configured (set INSTABOX_API_KEY and INSTABOX_MACHINE_ID)");
+  }
+  const text = String(command || "").trim();
+  if (!text) throw new BadRequest("command is empty");
+  if (text.length > 8000) throw new BadRequest("command is too long");
+  const timeout = Math.min(600, Math.max(1, Number.parseInt(timeoutSeconds, 10) || 120));
+  const body = { cmd: text, timeoutSeconds: timeout };
+  if (cwd) body.cwd = String(cwd).slice(0, 500);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), (timeout + 20) * 1000);
+  try {
+    const res = await fetch(`${INSTABOX_API_URL}/v1/machines/${encodeURIComponent(INSTABOX_MACHINE_ID)}/exec`, {
+      method: "POST",
+      headers: {
+        "X-API-Key": INSTABOX_API_KEY,
+        "Authorization": "Bearer " + INSTABOX_API_KEY,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+    const raw = await res.text();
+    let data = {};
+    try { data = JSON.parse(raw); } catch (e) { data = { raw }; }
+    if (!res.ok) {
+      const detail = String(data.message || data.error || raw || "").slice(0, 400);
+      throw new BadRequest(`InstaBox HTTP ${res.status}${detail ? ": " + detail : ""}`);
+    }
+    const out = [data.stdout, data.stderr].filter((v) => v != null && String(v).length).join("\n");
+    const exit = data.exitCode != null ? data.exitCode : (data.exit_code != null ? data.exit_code : "?");
+    const textOut = `exit=${exit}\n${out || "(no output)"}`;
+    return textOut.length > 8000 ? textOut.slice(0, 8000) + "\n… [truncated]" : textOut;
+  } catch (e) {
+    if (e && e.name === "AbortError") throw new BadRequest("InstaBox command timed out");
+    if (e instanceof BadRequest) throw e;
+    throw new BadRequest(`InstaBox request failed: ${typeName(e)}`);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function typeName(e) { return e && e.constructor ? e.constructor.name : "Error"; }
 
 // ---------------------------------------------------------------------------
 // Authenticated local endpoint: lets the Python tools ACT on this linked client
@@ -442,11 +946,18 @@ function audioMime(provided, file) {
   throw new BadRequest("unsupported audio file");
 }
 
-async function handleAction(d) {
+function assertOwner(d) {
+  const actor = bareId(d && d.sender);
+  if (!/^\d{6,20}$/.test(actor)) throw new BadRequest("missing sender context");
+  if (!OWNERS.includes(actor)) throw new BadRequest("only the owner can do that");
+}
+
+async function handleAction(d, ctx = {}) {
   if (!d || typeof d.action !== "string") throw new BadRequest("invalid request");
   const action = d.action;
 
   if (action === "send") {
+    assertOwner(d);
     const to = normalizeRecipient(d.to);
     assertAllowed(to);
     assertRate();
@@ -458,6 +969,7 @@ async function handleAction(d) {
   }
 
   if (action === "image") {
+    assertOwner(d);
     const to = normalizeRecipient(d.to);
     assertAllowed(to);
     assertRate();
@@ -468,6 +980,7 @@ async function handleAction(d) {
   }
 
   if (action === "voice") {
+    assertOwner(d);
     const to = normalizeRecipient(d.to);
     assertAllowed(to);
     assertRate();
@@ -481,6 +994,7 @@ async function handleAction(d) {
   }
 
   if (action === "leave") {
+    assertOwner(d);
     const jid = normalizeGroup(d.jid);
     const chat = await client.getChatById(jid);
     if (!chat || typeof chat.leave !== "function") throw new BadRequest("I can't leave that group");
@@ -489,24 +1003,46 @@ async function handleAction(d) {
   }
 
   if (action === "permission") {
+    assertOwner(d);
     const jid = normalizeGroup(d.jid);
-    const who = String(d.who || "").trim();
+    const who = bareId(d.who);
     if (!/^\d{6,20}$/.test(who)) throw new BadRequest("invalid member");
     if (typeof d.allow !== "boolean") throw new BadRequest("allow must be true or false");
     TEMP[jid] = TEMP[jid] || {};
     if (d.allow) TEMP[jid][who] = Date.now();
-    else delete TEMP[jid][who];
+    else TEMP[jid][who] = -Date.now();
     return d.allow ? "okay, I'll reply " + who : "okay, I'll ignore " + who;
   }
 
   if (action === "stop") {
+    assertOwner(d);
     writeFileAtomic(STOP_FILE, "1");
+    if (ctx.hard || d.hard === true) setTimeout(() => stopAgent(), 100);
     return "stopping…";
+  }
+
+  if (action === "vps_exec") {
+    // Members and admins may *request* a pentest command, but an owner must
+    // approve each one. Owners run directly.
+    const actor = bareId(d.sender);
+    if (!/^\d{6,20}$/.test(actor)) throw new BadRequest("missing sender context");
+    if (!OWNERS.includes(actor) && !ctx.approved) {
+      const p = await createToolApproval("vps_exec", {
+        command: String(d.command || "").slice(0, 8000),
+        timeout: Number.parseInt(d.timeout, 10) || 120,
+        cwd: String(d.cwd || "").slice(0, 500),
+      }, actor, { chat: d.chat || actor, isGroup: !!d.group });
+      throw new BadRequest(`owner approval required (request ${p.id}) — I've asked the owner`);
+    }
+    return instaboxExec(d.command, d.timeout, d.cwd);
   }
 
   throw new BadRequest("unknown action");
 }
 
+// ---------------------------------------------------------------------------
+// HTTP server: health, readiness, pairing pages, local tool API
+// ---------------------------------------------------------------------------
 function sendJson(res, status, payload) {
   if (res.writableEnded) return;
   const body = JSON.stringify(payload);
@@ -519,12 +1055,36 @@ function sendJson(res, status, payload) {
   res.end(body);
 }
 
+function sendHtml(res, status, html) {
+  if (res.writableEnded) return;
+  res.writeHead(status, {
+    "Content-Type": "text/html; charset=utf-8",
+    "Cache-Control": "no-store",
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "no-referrer",
+    "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; img-src data:; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
+  });
+  res.end(html);
+}
+
+function escapeHtml(value) {
+  return String(value == null ? "" : value).replace(/[&<>"']/g, (c) => (
+    { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]
+  ));
+}
+
+function safeEqual(a, b) {
+  const given = Buffer.from(String(a || ""));
+  const expected = Buffer.from(String(b || ""));
+  return given.length === expected.length && crypto.timingSafeEqual(given, expected);
+}
+
+function pairTokenOk(value) { return !!value && safeEqual(value, PAIR_TOKEN); }
+
 function authorized(req) {
   const header = String(req.headers.authorization || "");
   if (!header.startsWith("Bearer ")) return false;
-  const given = Buffer.from(header.slice(7));
-  const expected = Buffer.from(TOOL_TOKEN);
-  return given.length === expected.length && crypto.timingSafeEqual(given, expected);
+  return safeEqual(header.slice(7), TOOL_TOKEN);
 }
 
 function allowedHost(host) {
@@ -535,15 +1095,193 @@ function allowedHost(host) {
     host === `[::1]:${port}`;
 }
 
-const server = http.createServer((req, res) => {
-  if (req.method === "GET" && (req.url === "/" || req.url === "/health" || req.url === "/health/")) {
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ ok: true, status: "alive" }));
+function isLoopback(address) {
+  const value = String(address || "").toLowerCase();
+  return value === "127.0.0.1" || value === "::1" || value === "::ffff:127.0.0.1";
+}
+
+function statusPayload() {
+  return {
+    ok: true,
+    status: waState,
+    whatsappReady: waState === "ready",
+    agentRunning: !!(agentProc && agentProc.exitCode === null && !agentProc.killed),
+    needsQr: waState === "needs_qr",
+    hasSessionData: hasSessionData(),
+    lastQrAt: waLastQrAt || null,
+    pairingEnabled: true,
+    pendingGroupPermissions: pendingPerms.size,
+    pendingToolApprovals: pendingTools.size,
+  };
+}
+
+function pageShell(title, body) {
+  return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">` +
+    `<title>${escapeHtml(title)}</title><style>` +
+    `body{font-family:system-ui,sans-serif;max-width:44rem;margin:3rem auto;padding:0 1rem;background:#111;color:#eee}` +
+    `code,pre{background:#222;padding:.2rem .4rem;border-radius:.3rem;word-break:break-all}` +
+    `input{font-size:1.2rem;padding:.6rem;width:100%;box-sizing:border-box;background:#222;color:#eee;border:1px solid #555;border-radius:.4rem}` +
+    `button{font-size:1.1rem;padding:.6rem 1rem;margin-top:.8rem;border:0;border-radius:.4rem;background:#25d366;color:#041}` +
+    `img{max-width:100%;background:#fff;padding:1rem;border-radius:.5rem}` +
+    `a{color:#7dd3fc}` +
+    `</style></head><body>${body}</body></html>`;
+}
+
+function pairPage(token, opts = {}) {
+  const action = `/pair?token=${encodeURIComponent(token)}`;
+  const value = opts.phone ? escapeHtml(opts.phone) : BOT_PHONE;
+  let result = "";
+  if (opts.error) result = `<p style="color:#fca5a5">${escapeHtml(opts.error)}</p>`;
+  if (opts.code) {
+    const formatted = opts.code.length === 8 ? `${opts.code.slice(0, 4)}-${opts.code.slice(4)}` : opts.code;
+    result = `<p>Enter this 8-character code in WhatsApp → Linked devices → Link with phone number:</p>` +
+      `<p><code id="code" style="font-size:1.7rem;letter-spacing:.15em">${escapeHtml(formatted)}</code></p>` +
+      `<p>This code expires quickly. Reload this page to generate a new one.</p>`;
+  }
+  return pageShell("Liam pairing", `<h1>Pair Liam</h1>${result}` +
+    `<form method="post" action="${action}">` +
+    `<label for="phone">WhatsApp number with country code (digits only)</label>` +
+    `<input id="phone" name="phone" inputmode="numeric" autocomplete="tel" value="${value}" required>` +
+    `<button type="submit">Get pairing code</button></form>` +
+    `<p style="opacity:.7">Or use the QR page: <a href="/qr?token=${encodeURIComponent(token)}">/qr</a></p>`);
+}
+
+function qrPage(token, opts = {}) {
+  if (opts.error) return pageShell("Liam QR", `<h1>QR unavailable</h1><p>${escapeHtml(opts.error)}</p>`);
+  if (opts.dataUrl) {
+    return pageShell("Liam QR", `<h1>Scan to link Liam</h1><img alt="WhatsApp QR code" src="${opts.dataUrl}">` +
+      `<p>WhatsApp → Linked devices → Link a device. This page refreshes every 20 seconds.</p>` +
+      `<meta http-equiv="refresh" content="20;url=/qr?token=${encodeURIComponent(token)}">`);
+  }
+  return pageShell("Liam QR", `<h1>Waiting for a QR code…</h1><p>WhatsApp is still starting. This page refreshes automatically.</p>` +
+    `<p>Status: <code>${escapeHtml(waState)}</code></p>` +
+    `<meta http-equiv="refresh" content="3;url=/qr?token=${encodeURIComponent(token)}">`);
+}
+
+function readBody(req, limit) {
+  return new Promise((resolve, reject) => {
+    let body = "";
+    let done = false;
+    req.on("data", (chunk) => {
+      if (done) return;
+      body += chunk;
+      if (Buffer.byteLength(body, "utf8") > limit) {
+        done = true;
+        reject(new BadRequest("request too large"));
+      }
+    });
+    req.on("end", () => { if (!done) resolve(body); });
+    req.on("error", reject);
+  });
+}
+
+async function requestPairing(phone) {
+  const normalized = String(phone || "").replace(/\D/g, "");
+  if (!/^\d{7,15}$/.test(normalized)) {
+    throw new BadRequest("phone must be the full international number, digits only (e.g. 447881161023)");
+  }
+  if (waState === "ready") throw new BadRequest("this WhatsApp account is already linked");
+  if (pairingInFlight) return pairingInFlight;
+  if (Date.now() - lastPairAt < 15000 && lastPairCode) return lastPairCode;
+  pairingInFlight = (async () => {
+    const deadline = Date.now() + 60000;
+    while (Date.now() < deadline) {
+      if (client.pupPage) break;
+      await sleep(500);
+    }
+    if (!client.pupPage) throw new BadRequest("WhatsApp is still starting — try again in a few seconds");
+    try {
+      const code = await client.requestPairingCode(normalized, true);
+      lastPairCode = String(code || "");
+      lastPairAt = Date.now();
+      setWaState("linking", "pairing code generated");
+      return lastPairCode;
+    } catch (e) {
+      throw new BadRequest("could not generate a pairing code yet — wait a few seconds and try again");
+    }
+  })();
+  try { return await pairingInFlight; }
+  finally { pairingInFlight = null; }
+}
+
+const server = http.createServer(async (req, res) => {
+  const url = new URL(req.url || "/", "http://localhost");
+  const pathname = url.pathname;
+  const publicGet = req.method === "GET" && ["/health", "/ready", "/status", "/qr", "/pair"].includes(pathname);
+
+  if (publicGet) {
+    if (pathname === "/health") {
+      res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+      res.end(JSON.stringify({ ok: true, status: "alive" }));
+      return;
+    }
+    if (pathname === "/ready") {
+      const ready = waState === "ready" && !!(agentProc && agentProc.exitCode === null && !agentProc.killed);
+      sendJson(res, ready ? 200 : 503, { ...statusPayload(), ok: ready });
+      return;
+    }
+    if (pathname === "/status") {
+      sendJson(res, 200, statusPayload());
+      return;
+    }
+    if (pathname === "/qr") {
+      const token = url.searchParams.get("token") || "";
+      if (!pairTokenOk(token)) return sendHtml(res, 403, pageShell("Forbidden", "<h1>Forbidden</h1>"));
+      if (waState === "ready") return sendHtml(res, 200, pageShell("Liam QR", "<h1>Liam is already linked.</h1>"));
+      if (!lastQr) return sendHtml(res, 200, qrPage(token));
+      QRCode.toDataURL(lastQr, { width: 520, margin: 2 }).then((dataUrl) => {
+        sendHtml(res, 200, qrPage(token, { dataUrl }));
+      }).catch(() => sendHtml(res, 500, qrPage(token, { error: "QR rendering failed" })));
+      return;
+    }
+    if (pathname === "/pair") {
+      const token = url.searchParams.get("token") || "";
+      if (!pairTokenOk(token)) return sendHtml(res, 403, pageShell("Forbidden", "<h1>Forbidden</h1>"));
+      const phone = url.searchParams.get("phone") || "";
+      if (!phone) return sendHtml(res, 200, pairPage(token));
+      try {
+        const code = await requestPairing(phone);
+        sendHtml(res, 200, pairPage(token, { phone, code }));
+      } catch (e) {
+        sendHtml(res, 400, pairPage(token, { phone, error: e instanceof BadRequest ? e.message : "pairing failed" }));
+      }
+      return;
+    }
+  }
+
+  if (req.method === "POST" && pathname === "/pair") {
+    (async () => {
+      try {
+        const raw = await readBody(req, 8 * 1024);
+        let data = {};
+        const type = String(req.headers["content-type"] || "");
+        if (/application\/json/i.test(type)) data = JSON.parse(raw || "{}");
+        else data = Object.fromEntries(new URLSearchParams(raw || ""));
+        const token = String(data.token || url.searchParams.get("token") || "");
+        if (!pairTokenOk(token)) return sendHtml(res, 403, pageShell("Forbidden", "<h1>Forbidden</h1>"));
+        const phone = String(data.phone || "");
+        const code = await requestPairing(phone);
+        sendHtml(res, 200, pairPage(token, { phone, code }));
+      } catch (e) {
+        const token = String(url.searchParams.get("token") || "");
+        if (!pairTokenOk(token)) return sendHtml(res, 403, pageShell("Forbidden", "<h1>Forbidden</h1>"));
+        sendHtml(res, 400, pairPage(token, { error: e instanceof BadRequest ? e.message : "pairing failed" }));
+      }
+    })();
     return;
   }
+
+  // Any other GET (including "/") is not a tool call.
   if (req.method !== "POST") {
     req.resume();
     return sendJson(res, 405, { ok: false, msg: "method not allowed" });
+  }
+
+  // The tool endpoint is loopback-only and token-authenticated. Host/Origin
+  // checks add defence in depth against DNS rebinding and browser CSRF.
+  if (!isLoopback(req.socket.remoteAddress)) {
+    req.resume();
+    return sendJson(res, 403, { ok: false, msg: "forbidden" });
   }
   if (!allowedHost(String(req.headers.host || ""))) {
     req.resume();
@@ -605,30 +1343,119 @@ server.on("clientError", (err, socket) => {
 
 const HOST = process.env.HOST || "0.0.0.0";
 server.listen(PORT, HOST, () => {
-
   const address = server.address();
   const port = address && typeof address === "object" ? address.port : PORT;
-  console.log(`⚙️ Liam's tool endpoint is live on :${port}`);
+  console.log(`⚙️ Liam's tool endpoint is live on :${port} (HOST=${HOST})`);
+  const base = PUBLIC_URL || `http://127.0.0.1:${port}`;
+  console.log(`🔗 Pairing page: ${base}/pair?token=${PAIR_TOKEN}`);
+  if (PUBLIC_URL) console.log(`🔗 QR page: ${base}/qr?token=${PAIR_TOKEN}`);
 });
 
-const sync = require("./supabase_sync");
-sync.restoreDb(DATA_DIR).then(() => sync.restoreSession(DATA_DIR, SESSION_DIR)).then(() => {
-  sync.startPeriodicBackup(DATA_DIR);
-  // periodic db backup
-  setInterval(() => { sync.backupDb(); }, 10 * 60 * 1000);
-  client.initialize();
-}).catch(() => client.initialize());
+async function initializeWhatsApp(reason) {
+  if (waInitPromise) return waInitPromise;
+  waInitPromise = (async () => {
+    try {
+      setWaState(waState === "ready" ? "ready" : "starting", reason || "initializing WhatsApp");
+      const timeoutMs = Math.max(60000, Number.parseInt(process.env.LIAM_INIT_TIMEOUT_MS || "300000", 10));
+      await Promise.race([
+        client.initialize(),
+        new Promise((_, reject) => setTimeout(() => reject(new Error("WhatsApp init timed out")), timeoutMs)),
+      ]);
+    } catch (e) {
+      const msg = String(e && e.stack ? e.stack : e);
+      console.log("\n💀 WHATSAPP INIT FAILED:", msg);
+      if (/singleton|profile appears to be in use|ProcessSingleton|Code: 21/i.test(msg)) {
+        const removed = sync.sanitizeChromeLocks(SESSION_DIR);
+        console.log(`🔧 Removed ${removed} stale Chrome lock file(s); retrying WhatsApp init once...`);
+        setWaState("starting", "retrying after stale Chrome lock cleanup");
+        try {
+          await client.initialize();
+          return;
+        } catch (e2) {
+          console.log("\n💀 WHATSAPP INIT RETRY FAILED:", String(e2 && e2.stack ? e2.stack : e2));
+          setWaState("error", "WhatsApp init failed after lock cleanup");
+          return;
+        }
+      }
+      setWaState("error", "WhatsApp init failed");
+    } finally {
+      waInitPromise = null;
+    }
+  })();
+  return waInitPromise;
+}
+
+async function boot() {
+  setWaState("restoring", "restoring state from Supabase (if configured)");
+  // Restore to completion before Chromium starts. Abandoning a restore on a
+  // timer would let it swap the profile underneath a running browser, so the
+  // internal fetch and tar timeouts are the only limits.
+  try {
+    const dbRes = await sync.restoreDb(DATA_DIR);
+    if (dbRes && (dbRes.timeout || dbRes.error)) {
+      console.log("warn: db restore did not complete; continuing");
+    }
+    const sessRes = await sync.restoreSession(DATA_DIR, SESSION_DIR);
+    if (sessRes && (sessRes.timeout || sessRes.error)) {
+      console.log("warn: session restore did not complete; continuing");
+    }
+    const removed = sync.sanitizeChromeLocks(SESSION_DIR);
+    if (removed) console.log(`🔧 Sanitized ${removed} stale Chrome lock file(s) before init`);
+  } catch (e) {
+    console.log("warn: restore phase failed:", String(e));
+  }
+  if (!hasSessionData()) {
+    // An empty LocalAuth profile makes Chrome look "linked" to the library but
+    // has no credentials. Remove it so WhatsApp shows a real QR/pairing state.
+    try { fs.rmSync(SESSION_PROFILE_DIR, { recursive: true, force: true }); } catch (e) {}
+    setWaState("needs_qr", "no saved WhatsApp session; waiting for QR or pairing code");
+  }
+  sync.startPeriodicBackup(DATA_DIR, SESSION_DIR, DATA_DIR);
+  await initializeWhatsApp("startup");
+}
+
+// Render sends SIGTERM before stopping a free instance. Save the profile and
+// memory first so the next boot does not depend on the last periodic backup.
+let shuttingDown = false;
+async function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`\n⏹️ ${signal} received — saving state before shutdown`);
+  try { stopAgent(); } catch (e) {}
+  try { sync.stopPeriodicBackup(); } catch (e) {}
+  const deadline = setTimeout(() => {
+    console.log("warn: shutdown backup timed out");
+    process.exit(0);
+  }, 25000);
+  if (typeof deadline.unref === "function") deadline.unref();
+  try {
+    if (client && typeof client.destroy === "function") {
+      await Promise.race([client.destroy(), sleep(5000)]);
+    }
+  } catch (e) { console.log("warn: WhatsApp shutdown failed:", String(e)); }
+  try { await sync.backupNow(DATA_DIR, SESSION_DIR, DATA_DIR); }
+  catch (e) { console.log("warn: shutdown backup failed:", String(e)); }
+  clearTimeout(deadline);
+  process.exit(0);
+}
+for (const signal of ["SIGTERM", "SIGINT"]) {
+  process.on(signal, () => { shutdown(signal).catch(() => process.exit(0)); });
+}
+
+if (require.main === module) {
+  boot().catch((e) => {
+    console.log("💀 boot failed:", String(e));
+    setWaState("error", "boot failed");
+  });
+}
 
 module.exports = {
-  server,
-  client,
-  sweepTimer,
-  outboundLog,
-  handleAction,
-  normalizeRecipient,
-  normalizeGroup,
-  assertAllowed,
-  assertOutbox,
-  audioMime,
-  authorized,
+  server, client, sweepTimer, outboundLog, handleAction,
+  normalizeRecipient, normalizeGroup, assertAllowed, assertOutbox, audioMime, authorized,
+  sync, pythonBin, sanitizeChromeLocks: sync.sanitizeChromeLocks,
+  statusPayload, TEMP, tempDecision, sweepTemp, _setState: setWaState,
+  stopAgent, initializeWhatsApp, hasSessionData, requestPairing, instaboxExec,
+  pendingPerms, pendingTools, PAIR_TOKEN, ownerIdsInGroup, sendApprovalPrompt,
+  createToolApproval, executeToolApproval, handleApprovalCommand, createPermissionRequest,
+  dmAllowed, setDmOpen, rememberKnownMember, knownMembers,
 };

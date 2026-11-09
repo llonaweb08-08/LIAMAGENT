@@ -2,7 +2,7 @@
 
 Usage:
     python debug_probe.py                 # probe every configured brain
-    python debug_probe.py agnes hermes    # probe selected brains
+    python debug_probe.py agnes hcn       # probe selected brains
     python debug_probe.py --json          # machine-readable output
 
 This script reuses the production probe (``agent._probe``) so it cannot drift

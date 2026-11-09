@@ -6,6 +6,14 @@ then from the local (git-ignored) liam_secrets.py file.
 
 import os
 
+# Many free providers sit behind Cloudflare and reject Python's default
+# User-Agent. One shared browser UA keeps every provider probe and call equal.
+BROWSER_UA = os.environ.get(
+    "LIAM_USER_AGENT",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+)
+
 
 def _secret(name, default):
     value = os.environ.get(name)
@@ -47,16 +55,25 @@ AGNES_BASE = os.environ.get("AGNES_BASE", "https://apihub.agnes-ai.com/v1")
 AGNES_MODEL = os.environ.get("AGNES_MODEL", "agnes-3.0-flash")
 AGNES_KEY = str(_secret("AGNES_KEY", "")).strip()
 
-# --- Hugging Face (uncensored, for "bad" things) ---
+# --- Hugging Face ---
+# The public router's Qwen models returned HTTP 400 during verification, so
+# Hugging Face is no longer used as a brain. The constants stay for backwards
+# compatibility with old local secret files.
 HF_BASE = os.environ.get("HF_BASE", "https://router.huggingface.co/v1")
-HF_MODEL = os.environ.get("HF_MODEL", "nicoboss/Qwen3-32B-Uncensored")
-HF_MODEL_8B = os.environ.get("HF_MODEL_8B", "Qwen/Qwen3-8B")
+HF_MODEL = os.environ.get("HF_MODEL", "")
+HF_MODEL_8B = os.environ.get("HF_MODEL_8B", "")
 HF_KEY = str(_secret("HF_KEY", "")).strip()
 
-# --- HCNSec (secondary brain, replaces Unorouter) ---
+# --- HCNSec (tool-capable fallback after Agnes) ---
 HCN_BASE = os.environ.get("HCN_BASE", "https://api.hcnsec.cn/v1")
 HCN_MODEL = os.environ.get("HCN_MODEL", "DeepSeek-V4-Flash")
 HCN_KEY = str(_secret("HCN_KEY", "")).strip()
+
+# --- Search providers (first configured one wins) ---
+TAVILY_API_KEY = str(_secret("TAVILY_API_KEY", "")).strip()
+BRAVE_API_KEY = str(_secret("BRAVE_API_KEY", "")).strip()
+SERPER_API_KEY = str(_secret("SERPER_API_KEY", "")).strip()
+
 GOOGLE_API_KEY = str(_secret("GOOGLE_API_KEY", "")).strip()
 GOOGLE_IMAGE_MODEL = os.environ.get("LIAM_IMAGE_MODEL", "gemini-2.5-flash-image-preview")
 GOOGLE_TTS_MODEL = os.environ.get("LIAM_TTS_MODEL", "gemini-2.5-flash-preview-tts")

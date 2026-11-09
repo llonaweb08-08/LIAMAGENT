@@ -1,0 +1,44 @@
+# Version control / editor / agent metadata
+.git
+.gitignore
+.github
+.kilo
+.vscode
+.idea
+
+# Local secrets and runtime state
+.env
+.env.*
+liam_secrets.py
+liam_session/
+liam_memory.db
+liam_memory.db-*
+brain_state
+stop_flag
+tool_token
+pair_token
+qr.png
+liam_qr.png
+whatsapp_qr.png
+scan_liam.png
+outbox/
+tokens/
+
+# Build and test artifacts
+node_modules/
+.wwebjs_cache/
+__pycache__/
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+tests/
+requirements-dev.txt
+
+# Logs and OS noise
+*.log
+.DS_Store
+Thumbs.db

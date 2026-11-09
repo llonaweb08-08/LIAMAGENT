@@ -19,6 +19,7 @@ const OUTBOX = path.join(DATA, 'outbox');
 fs.mkdirSync(OUTBOX, { recursive: true });
 
 fs.copyFileSync(path.join(ROOT, 'whatsapp_bridge.js'), path.join(APP, 'whatsapp_bridge.js'));
+fs.copyFileSync(path.join(ROOT, 'supabase_sync.js'), path.join(APP, 'supabase_sync.js'));
 fs.copyFileSync(path.join(ROOT, 'liam_config.json'), path.join(APP, 'liam_config.json'));
 
 const whatsappStubDir = path.join(APP, 'node_modules', 'whatsapp-web.js');
@@ -30,12 +31,17 @@ fs.writeFileSync(path.join(whatsappStubDir, 'index.js'), [
   '  constructor(options) {',
   '    super();',
   '    this.options = options;',
-  "    this.info = { wid: { _serialized: '2340000000000@c.us' } };",
+  '    this.info = { wid: { _serialized: "2340000000000@c.us" } };',
+  '    this.pupPage = {};',
   '    this.sent = [];',
   '    this.chats = new Map();',
   '    global.__liamFakeClient = this;',
   '  }',
   '  initialize() {}',
+  '  async requestPairingCode(phone) {',
+  "    if (!/^\\d{7,15}$/.test(String(phone))) throw new Error('bad phone');",
+  "    return 'ABCD1234';",
+  '  }',
   '  async sendMessage(to, content, options) {',
   '    this.sent.push({ to, content, options });',
   "    return { id: { _serialized: 'MSG-' + this.sent.length } };",
@@ -63,13 +69,16 @@ const bridge = require(path.join(APP, 'whatsapp_bridge.js'));
 const client = bridge.client || global.__liamFakeClient;
 const CONFIG = require(path.join(APP, 'liam_config.json'));
 const OWNER = CONFIG.owners[0];
+const ADMIN = Object.keys(CONFIG.admins)[0];
 const GROUP = '120363000000000000@g.us';
 
 after(() => {
-  clearInterval(bridge.sweepTimer);
-  bridge.server.close();
+  try { if (bridge.sync && bridge.sync.stopPeriodicBackup) bridge.sync.stopPeriodicBackup(); } catch (e) {}
+  try { clearInterval(bridge.sweepTimer); } catch (e) {}
+  try { if (bridge.stopAgent) bridge.stopAgent(); } catch (e) {}
+  try { bridge.server.close(); } catch (e) {}
   if (typeof bridge.server.closeAllConnections === 'function') {
-    bridge.server.closeAllConnections();
+    try { bridge.server.closeAllConnections(); } catch (e) {}
   }
   try { fs.rmSync(APP, { recursive: true, force: true }); } catch (e) {}
 });
@@ -93,7 +102,7 @@ function request(port, options = {}) {
       fn(value);
     };
     const req = http.request({
-      host: '127.0.0.1', port, path: '/', method, headers, agent: false,
+      host: '127.0.0.1', port, path: options.path || '/', method, headers, agent: false,
     }, (res) => {
       let data = '';
       res.setEncoding('utf8');
@@ -118,12 +127,26 @@ test('bridge endpoint security and actions', async (t) => {
   const post = (body, extra = {}) => request(port, { body, token, ...extra });
 
   await t.test('accepts an authenticated message to an owner', async () => {
-    const response = await post({ action: 'send', to: OWNER, text: 'hello' });
+    const response = await post({ action: 'send', to: OWNER, text: 'hello', sender: OWNER });
     assert.equal(response.status, 200);
     assert.equal(response.json.ok, true);
     const sent = client.sent.at(-1);
     assert.equal(sent.to, `${OWNER}@c.us`);
     assert.equal(sent.content, 'hello');
+  });
+
+  await t.test('rejects owner-only actions from non-owners', async () => {
+    const response = await post({
+      action: 'send', to: OWNER, text: 'hello', sender: '2348000000000',
+    });
+    assert.equal(response.status, 400);
+    assert.match(response.json.msg, /only the owner/);
+  });
+
+  await t.test('rejects owner-only actions without sender context', async () => {
+    const response = await post({ action: 'send', to: OWNER, text: 'hello' });
+    assert.equal(response.status, 400);
+    assert.match(response.json.msg, /missing sender/);
   });
 
   await t.test('rejects missing and wrong tokens', async () => {
@@ -188,19 +211,19 @@ test('bridge endpoint security and actions', async (t) => {
   });
 
   await t.test('rejects recipients outside the allowlist', async () => {
-    const response = await post({ action: 'send', to: '2347999999999', text: 'hi' });
+    const response = await post({ action: 'send', to: '2347999999999', text: 'hi', sender: OWNER });
     assert.equal(response.status, 400);
     assert.match(response.json.msg, /allowlist/);
   });
 
   await t.test('accepts LIAM_DM_ALLOWLIST recipients', async () => {
-    const response = await post({ action: 'send', to: '2347000000009', text: 'hi' });
+    const response = await post({ action: 'send', to: '2347000000009', text: 'hi', sender: OWNER });
     assert.equal(response.status, 200);
     assert.equal(client.sent.at(-1).to, '2347000000009@c.us');
   });
 
   await t.test('rejects invalid recipient formats', async () => {
-    const response = await post({ action: 'send', to: 'not-a-number', text: 'hi' });
+    const response = await post({ action: 'send', to: 'not-a-number', text: 'hi', sender: OWNER });
     assert.equal(response.status, 400);
     assert.match(response.json.msg, /recipient/);
   });
@@ -208,13 +231,13 @@ test('bridge endpoint security and actions', async (t) => {
   await t.test('sends an image only from the outbox', async () => {
     const outside = path.join(APP, 'secret.txt');
     fs.writeFileSync(outside, 'secret');
-    const blocked = await post({ action: 'image', to: OWNER, path: outside });
+    const blocked = await post({ action: 'image', to: OWNER, path: outside, sender: OWNER });
     assert.equal(blocked.status, 400);
     assert.match(blocked.json.msg, /outside the outbox/);
 
     const image = path.join(OUTBOX, 'test.png');
     fs.writeFileSync(image, Buffer.from('PNGDATA'));
-    const allowed = await post({ action: 'image', to: OWNER, path: image, text: 'caption' });
+    const allowed = await post({ action: 'image', to: OWNER, path: image, text: 'caption', sender: OWNER });
     assert.equal(allowed.status, 200);
     const sent = client.sent.at(-1);
     assert.equal(sent.content.file, fs.realpathSync(image));
@@ -223,7 +246,7 @@ test('bridge endpoint security and actions', async (t) => {
 
   await t.test('rejects missing outbox files', async () => {
     const response = await post({
-      action: 'image', to: OWNER, path: path.join(OUTBOX, 'missing.png'),
+      action: 'image', to: OWNER, path: path.join(OUTBOX, 'missing.png'), sender: OWNER,
     });
     assert.equal(response.status, 400);
     assert.match(response.json.msg, /not found/);
@@ -233,14 +256,14 @@ test('bridge endpoint security and actions', async (t) => {
     const voice = path.join(OUTBOX, 'voice.wav');
     fs.writeFileSync(voice, Buffer.from('RIFF'));
     const response = await post({
-      action: 'voice', to: OWNER, path: voice, mimetype: 'audio/wav',
+      action: 'voice', to: OWNER, path: voice, mimetype: 'audio/wav', sender: OWNER,
     });
     assert.equal(response.status, 200);
     const sent = client.sent.at(-1);
     assert.equal(sent.options.sendAudioAsVoice, true);
     assert.equal(sent.options.mimetype, 'audio/wav');
 
-    const inferred = await post({ action: 'voice', to: OWNER, path: voice });
+    const inferred = await post({ action: 'voice', to: OWNER, path: voice, sender: OWNER });
     assert.equal(inferred.status, 200);
     assert.equal(client.sent.at(-1).options.mimetype, 'audio/wav');
   });
@@ -249,7 +272,7 @@ test('bridge endpoint security and actions', async (t) => {
     const voice = path.join(OUTBOX, 'voice2.wav');
     fs.writeFileSync(voice, Buffer.from('RIFF'));
     const response = await post({
-      action: 'voice', to: OWNER, path: voice, mimetype: 'text/plain',
+      action: 'voice', to: OWNER, path: voice, mimetype: 'text/plain', sender: OWNER,
     });
     assert.equal(response.status, 400);
   });
@@ -257,7 +280,7 @@ test('bridge endpoint security and actions', async (t) => {
   await t.test('leaves a group through the real chat API', async () => {
     let left = false;
     client.chats.set(GROUP, { leave: async () => { left = true; } });
-    const response = await post({ action: 'leave', jid: GROUP });
+    const response = await post({ action: 'leave', jid: GROUP, sender: OWNER });
     assert.equal(response.status, 200);
     assert.equal(left, true);
   });
@@ -265,42 +288,140 @@ test('bridge endpoint security and actions', async (t) => {
   await t.test('refuses chats that cannot be left', async () => {
     const noLeave = '120363000000000001@g.us';
     client.chats.set(noLeave, {});
-    const response = await post({ action: 'leave', jid: noLeave });
+    const response = await post({ action: 'leave', jid: noLeave, sender: OWNER });
     assert.equal(response.status, 400);
   });
 
   await t.test('validates permission changes', async () => {
     const allowed = await post({
-      action: 'permission', jid: GROUP, who: OWNER, allow: true,
+      action: 'permission', jid: GROUP, who: OWNER, allow: true, sender: OWNER,
     });
     assert.equal(allowed.status, 200);
     const denied = await post({
-      action: 'permission', jid: GROUP, who: OWNER, allow: false,
+      action: 'permission', jid: GROUP, who: OWNER, allow: false, sender: OWNER,
     });
     assert.equal(denied.status, 200);
     const badWho = await post({
-      action: 'permission', jid: GROUP, who: 'x', allow: true,
+      action: 'permission', jid: GROUP, who: 'x', allow: true, sender: OWNER,
     });
     assert.equal(badWho.status, 400);
     const badAllow = await post({
-      action: 'permission', jid: GROUP, who: OWNER, allow: 'yes',
+      action: 'permission', jid: GROUP, who: OWNER, allow: 'yes', sender: OWNER,
     });
     assert.equal(badAllow.status, 400);
   });
 
   await t.test('writes the stop flag atomically', async () => {
-    const response = await post({ action: 'stop' });
+    const response = await post({ action: 'stop', sender: OWNER });
     assert.equal(response.status, 200);
     assert.equal(fs.readFileSync(path.join(DATA, 'stop_flag'), 'utf8'), '1');
+  });
+
+  await t.test('exposes health, readiness and status separately', async () => {
+    const health = await request(port, { method: 'GET', path: '/health' });
+    assert.equal(health.status, 200);
+    assert.equal(health.json.status, 'alive');
+    const ready = await request(port, { method: 'GET', path: '/ready' });
+    assert.equal(ready.status, 503);
+    assert.equal(ready.json.whatsappReady, false);
+    assert.equal(ready.json.ok, false);
+    const status = await request(port, { method: 'GET', path: '/status' });
+    assert.equal(status.status, 200);
+    assert.equal(typeof status.json.status, 'string');
+    assert.equal(typeof status.json.hasSessionData, 'boolean');
+  });
+
+  await t.test('protects pairing pages with the pairing token', async () => {
+    const qrForbidden = await request(port, { method: 'GET', path: '/qr' });
+    assert.equal(qrForbidden.status, 403);
+    const qrOk = await request(port, { method: 'GET', path: `/qr?token=${bridge.PAIR_TOKEN}` });
+    assert.equal(qrOk.status, 200);
+    assert.match(qrOk.text, /Waiting for a QR/);
+    const pairForbidden = await request(port, { method: 'GET', path: '/pair' });
+    assert.equal(pairForbidden.status, 403);
+  });
+
+  await t.test('generates an 8-character pairing code', async () => {
+    const response = await request(port, {
+      method: 'GET',
+      path: `/pair?token=${bridge.PAIR_TOKEN}&phone=${OWNER}`,
+    });
+    assert.equal(response.status, 200);
+    assert.match(response.text, /ABCD-1234/);
+  });
+
+  await t.test('tool approvals require an exact one-time request id', async () => {
+    bridge.pendingTools.clear();
+    bridge.pendingPerms.clear();
+    const member = '2348000000000';
+    const p = await bridge.createToolApproval(
+      'vps_exec', { command: 'id', timeout: 30, cwd: '' }, member,
+      { chat: member, isGroup: false },
+    );
+    assert.match(p.id, /^t[0-9a-f]+$/);
+    assert.equal(bridge.pendingTools.has(p.id), true);
+
+    const bareYes = await bridge.handleApprovalCommand('yes', OWNER, `${OWNER}@c.us`, false);
+    assert.equal(bareYes, true);
+    assert.equal(bridge.pendingTools.has(p.id), true, 'bare yes must not approve a tool');
+
+    const denied = await bridge.handleApprovalCommand(`no ${p.id}`, OWNER, `${OWNER}@c.us`, false);
+    assert.equal(denied, true);
+    assert.equal(bridge.pendingTools.has(p.id), false);
+
+    const second = await bridge.createToolApproval(
+      'vps_exec', { command: 'id', timeout: 30, cwd: '' }, member,
+      { chat: member, isGroup: false },
+    );
+    const confirmed = await bridge.handleApprovalCommand(
+      `yes ${second.id}`, OWNER, `${OWNER}@c.us`, false,
+    );
+    assert.equal(confirmed, true);
+    assert.equal(bridge.pendingTools.has(second.id), false, 'approval is one-time');
+    assert.match(String(client.sent.at(-1).content), /vps_exec failed|InstaBox/);
+  });
+
+  await t.test('applies .allowdm semantics', async () => {
+    const member = '2348111111111';
+    assert.equal(bridge.dmAllowed(OWNER), true);
+    assert.equal(bridge.dmAllowed(ADMIN), true);
+    bridge.setDmOpen(false);
+    assert.equal(bridge.dmAllowed(member), false);
+    bridge.rememberKnownMember(member);
+    assert.equal(bridge.dmAllowed(member), false, 'known members still need .allowdm');
+    bridge.setDmOpen(true);
+    assert.equal(bridge.dmAllowed(member), true);
+    assert.equal(fs.readFileSync(path.join(DATA, 'dm_open'), 'utf8'), '1');
+    bridge.setDmOpen(false);
+    assert.equal(bridge.dmAllowed(member), false);
+  });
+
+  await t.test('members need owner approval for vps_exec', async () => {
+    bridge.pendingTools.clear();
+    const member = '2348000000000';
+    const response = await post({
+      action: 'vps_exec', command: 'id', timeout: 30, sender: member,
+      chat: member, group: false,
+    });
+    assert.equal(response.status, 400);
+    assert.match(response.json.msg, /owner approval required/);
+    assert.equal(bridge.pendingTools.size, 1);
+    bridge.pendingTools.clear();
+  });
+
+  await t.test('owners reach InstaBox directly but see a clear config error', async () => {
+    const response = await post({ action: 'vps_exec', command: 'id', sender: OWNER });
+    assert.equal(response.status, 400);
+    assert.match(response.json.msg, /not configured/);
   });
 
   await t.test('rate-limits outbound messages', async () => {
     bridge.outboundLog.length = 0;
     for (let i = 0; i < 20; i += 1) {
-      const response = await post({ action: 'send', to: OWNER, text: `burst ${i}` });
+      const response = await post({ action: 'send', to: OWNER, text: `burst ${i}`, sender: OWNER });
       assert.equal(response.status, 200);
     }
-    const response = await post({ action: 'send', to: OWNER, text: 'too many' });
+    const response = await post({ action: 'send', to: OWNER, text: 'too many', sender: OWNER });
     assert.equal(response.status, 400);
     assert.match(response.json.msg, /too many/);
   });

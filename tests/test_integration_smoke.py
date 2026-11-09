@@ -7,6 +7,7 @@ class SmokeTest(unittest.TestCase):
         env = dict(os.environ)
         env["LIAM_DATA_DIR"] = tempfile.mkdtemp()
         env["LIAM_DB"] = os.path.join(env["LIAM_DATA_DIR"], "t.db")
+        env["LIAM_OFFLINE"] = "1"          # never call a real provider in tests
         proc = subprocess.Popen(
             [sys.executable, "-X", "utf8", "agent.py"],
             cwd=BASE, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -22,8 +23,18 @@ class SmokeTest(unittest.TestCase):
             self.assertIn("reply", msg)
             self.assertTrue(isinstance(msg["reply"], str))
         finally:
+            try:
+                if proc.stdin: proc.stdin.close()
+            except Exception: pass
             proc.terminate()
-            proc.wait(timeout=10)
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
+            try:
+                if proc.stdout: proc.stdout.close()
+            except Exception: pass
 
 if __name__ == "__main__":
     unittest.main()
