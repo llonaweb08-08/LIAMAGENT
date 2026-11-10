@@ -57,7 +57,10 @@ must remain reachable during a cold boot.
 
 ## 3. Seed an existing local profile (recommended)
 
-If Liam is already linked on your PC, upload that profile before pairing again:
+If Liam is already linked on your PC, upload that profile before pairing again.
+
+On Windows, double-click **`seed_cloud.bat`** and paste the Supabase URL and
+secret key when asked. Or run:
 
 ```powershell
 $env:LIAM_DATA_DIR="$env:LOCALAPPDATA\LiamWhatsApp"
@@ -66,13 +69,16 @@ $env:SUPABASE_SECRET_KEY="sb_secret_..."
 npm run seed:supabase
 ```
 
-The script archives `liam_session/` without Chromium caches, snapshots the
-memory DB safely, and uploads both objects. It prints a JSON result and exits
-non-zero on failure. The local profile is not modified.
+The script archives `liam_session/` without Chromium caches, turns link files
+into normal files, validates the archive before uploading, snapshots the memory
+DB safely, and uploads both objects. It exits non-zero unless the WhatsApp login
+itself uploaded. The local profile is not modified.
 
 Then restart (or redeploy) the Render service. The logs should say
-`session restored from Supabase`. If they say `no remote session archive`,
-the seed upload did not reach the configured bucket.
+`session restored from Supabase`. Older archives that contain harmless Chromium
+links log `contained N link entries; skipped them safely` and still restore.
+If the logs say `no remote session archive`, the seed upload did not reach the
+configured bucket.
 
 ## 4. Pair on Render
 
@@ -132,11 +138,13 @@ unless you are comfortable with "down" alerts during pairing and restarts.
 | Log line | Meaning |
 | --- | --- |
 | `session restored from Supabase (N entries)` | profile restored |
+| `contained N link entries; skipped them safely` | old archive restored without its disposable links |
 | `db restored from Supabase` | memory restored |
 | `no remote session archive` | bucket empty or wrong credentials |
-| `QR READY` / `Pairing page` | waiting for a link |
+| `QR READY` / `Pairing page` | waiting for a link (the log repeats at most every 5 minutes) |
 | `LIAM IS LIVE` | WhatsApp connected, agent started |
 | `session backed up to Supabase` | persistence working |
+| `refusing to upload an archive with N link entries` | bad local archive; the previous cloud copy was kept |
 | `warn: session backup failed: status 401` | wrong/expired Supabase secret key |
 | `warn: session backup failed: status 413` | archive over the bucket limit |
 
@@ -153,6 +161,10 @@ unless you are comfortable with "down" alerts during pairing and restarts.
 5. If memory is empty but the session works, the DB object is missing or was
    rejected as non-SQLite. The bridge logs the reason; a fresh DB is created so
    Liam keeps working.
+6. If an old deploy logged `archive contains a link entry`, update to a version
+   that restores links safely, then re-run `seed_cloud.bat` from the linked PC.
+   Earlier versions could also overwrite the good upload with an unpaired
+   profile; current versions refuse to upload before `LIAM IS LIVE`.
 
 ### Rotating the Supabase secret
 

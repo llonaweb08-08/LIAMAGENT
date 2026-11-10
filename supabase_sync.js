@@ -305,10 +305,81 @@ async function validateArchive(archiveFile, sessionName) {
   const verbose = await execFileAsync("tar", ["-tvzf", archiveFile], { timeout: 60000 });
   // The first column is the tar type flag: `l` is a symlink and `h` a hard
   // link. Do not inspect names for "->": a legitimate file could contain it.
+  // Links are counted rather than rejected: older Linux-made archives contain
+  // harmless Chromium lock links, and we can extract everything else safely.
+  let links = 0;
   for (const line of String(verbose.stdout || "").split(/\r?\n/)) {
-    if (/^[lh]/i.test(line)) throw new Error("archive contains a link entry");
+    if (/^[lh]/i.test(line)) links += 1;
   }
-  return entries.length;
+  return { entries: entries.length, links };
+}
+
+// Extract a profile without ever creating a symlink or hard link. This is used
+// for older archives that contain Chromium lock links; links are skipped and
+// every regular file is still restored safely inside the staging directory.
+const EXTRACT_LINKS_SCRIPT = String.raw`
+import json, os, sys, tarfile
+
+archive = sys.argv[1]
+dest = os.path.abspath(sys.argv[2])
+root = os.path.realpath(dest)
+files = dirs = skipped = 0
+
+def safe_target(name):
+    normalized = name.replace("\\", "/")
+    parts = [part for part in normalized.split("/") if part not in ("", ".")]
+    if normalized.startswith(("/", "\\")) or (len(normalized) > 1 and normalized[1] == ":"):
+        raise SystemExit("unsafe archive entry: " + name)
+    if ".." in parts:
+        raise SystemExit("unsafe archive entry: " + name)
+    target = os.path.realpath(os.path.join(root, *parts))
+    if target != root and not target.startswith(root + os.sep):
+        raise SystemExit("archive entry escapes destination: " + name)
+    return target
+
+with tarfile.open(archive, "r:gz") as tf:
+    for member in tf:
+        target = safe_target(member.name)
+        if member.issym() or member.islnk() or member.isdev() or member.isfifo():
+            skipped += 1
+            continue
+        if member.isdir():
+            os.makedirs(target, exist_ok=True)
+            try:
+                os.chmod(target, 0o700)
+            except OSError:
+                pass
+            dirs += 1
+            continue
+        if not member.isfile():
+            skipped += 1
+            continue
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        source = tf.extractfile(member)
+        if source is None:
+            skipped += 1
+            continue
+        with open(target, "wb") as handle:
+            while True:
+                chunk = source.read(1024 * 1024)
+                if not chunk:
+                    break
+                handle.write(chunk)
+        try:
+            os.chmod(target, 0o600)
+        except OSError:
+            pass
+        files += 1
+
+print(json.dumps({"files": files, "dirs": dirs, "skipped": skipped}))
+`;
+
+async function extractArchiveWithoutLinks(archiveFile, destination) {
+  const python = process.env.LIAM_PYTHON || (process.platform === "win32" ? "python" : "python3");
+  const result = await execFileAsync(
+    python, ["-c", EXTRACT_LINKS_SCRIPT, archiveFile, destination], { timeout: 180000 });
+  const line = String(result.stdout || "").trim().split(/\r?\n/).pop() || "{}";
+  return JSON.parse(line);
 }
 
 async function restoreSession(dataDir, sessionDir) {
@@ -326,10 +397,17 @@ async function restoreSession(dataDir, sessionDir) {
     }
     fs.mkdirSync(base, { recursive: true });
     await downloadToFile(res, tmp, MAX_ARCHIVE_BYTES);
-    const entryCount = await validateArchive(tmp, sessionName);
+    const archiveInfo = await validateArchive(tmp, sessionName);
 
     staging = fs.mkdtempSync(path.join(base, ".restore-"));
-    await execFileAsync("tar", ["-xzf", tmp, "-C", staging], { timeout: 180000 });
+    if (archiveInfo.links > 0) {
+      const detail = await extractArchiveWithoutLinks(tmp, staging);
+      console.log(
+        `session archive contained ${archiveInfo.links} link entries; ` +
+        `skipped them safely (${detail.files || 0} files restored)`);
+    } else {
+      await execFileAsync("tar", ["-xzf", tmp, "-C", staging], { timeout: 180000 });
+    }
     const extracted = path.join(staging, sessionName);
     if (!fs.existsSync(extracted) || !fs.statSync(extracted).isDirectory()) {
       throw new Error("archive did not contain the session directory");
@@ -348,8 +426,8 @@ async function restoreSession(dataDir, sessionDir) {
     if (hadOld) { try { fs.rmSync(old, { recursive: true, force: true }); } catch (e) {} }
     try { fs.chmodSync(targetSession, 0o700); } catch (e) {}
 
-    console.log(`session restored from Supabase (${entryCount} entries)`);
-    return { restored: true, entries: entryCount };
+    console.log(`session restored from Supabase (${archiveInfo.entries} entries)`);
+    return { restored: true, entries: archiveInfo.entries, skippedLinks: archiveInfo.links };
   } catch (e) {
     console.log("warn: session restore failed:", String(e && e.message ? e.message : e));
     return { restored: false, error: String(e && e.message ? e.message : e) };
@@ -367,15 +445,26 @@ async function backupSession(dataDir, sessionDir) {
   const sessionName = path.basename(targetSession);
   const tmp = path.join(base, SESSION_ARCHIVE + ".backup.tmp");
   try {
-    await execFileAsync("tar", [
-      "-czf", tmp,
-      ...archiveExcludes(sessionName),
-      "-C", base, sessionName,
-    ], { timeout: 240000 });
+    // Dereference links so the archive contains only normal files. On Linux
+    // GNU tar also needs --hard-dereference to turn hard links into files.
+    const args = ["-czf", tmp, "--dereference"];
+    if (process.platform === "linux") args.push("--hard-dereference");
+    args.push(...archiveExcludes(sessionName), "-C", base, sessionName);
+    await execFileAsync("tar", args, { timeout: 240000 });
     const size = fs.statSync(tmp).size;
     if (size > MAX_ARCHIVE_BYTES) return { ok: false, reason: "archive too large" };
+    // Never replace a good cloud copy with an archive we cannot restore.
+    const info = await validateArchive(tmp, sessionName);
+    if (info.links) {
+      throw new Error(
+        `refusing to upload an archive with ${info.links} link entries; ` +
+        "the previous cloud copy was kept");
+    }
     const result = await uploadPath(SESSION_ARCHIVE, tmp, "application/gzip");
-    if (result.ok) { console.log(`session backed up to Supabase (${Math.round(size / 1024 / 1024)} MiB)`); return { ok: true, bytes: size }; }
+    if (result.ok) {
+      console.log(`session backed up to Supabase (${Math.round(size / 1024 / 1024)} MiB)`);
+      return { ok: true, bytes: size, entries: info.entries };
+    }
     console.log("warn: session backup failed:", result.reason);
     return result;
   } catch (e) {
@@ -389,12 +478,16 @@ async function backupSession(dataDir, sessionDir) {
 let backupTimer = null;
 let backupRunning = false;
 
-async function backupNow(dataDir, sessionDir, dbDir) {
+async function backupNow(dataDir, sessionDir, dbDir, options = {}) {
   if (!configured()) return { ok: false, reason: "not configured" };
   if (backupRunning) return { ok: false, reason: "backup already running" };
   backupRunning = true;
   try {
-    const session = await backupSession(dataDir, sessionDir);
+    // Before WhatsApp is linked the profile is disposable. Uploading it would
+    // overwrite the last good session in Supabase with an empty one.
+    const session = options.session === false
+      ? { ok: false, skipped: true, reason: "session not ready" }
+      : await backupSession(dataDir, sessionDir);
     const db = await backupDb(dbDir || dataDir);
     return { ok: !!(session.ok || db.ok), session, db };
   } finally {

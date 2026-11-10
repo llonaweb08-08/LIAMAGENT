@@ -114,6 +114,28 @@ function writeTar(file, entries) {
   execFileSync(PYTHON, ['-c', script, file]);
 }
 
+function writeLinkArchive(file) {
+  // A realistic old archive: useful profile files plus one Chromium-style link.
+  const script = [
+    'import io, sys, tarfile',
+    'path = sys.argv[1]',
+    'with tarfile.open(path, "w:gz") as t:',
+    '    files = {',
+    '        "liam_session/session/Default/Preferences": b"{}",',
+    '        "liam_session/session/Default/IndexedDB/CURRENT": b"indexeddb",',
+    '    }',
+    '    for name, data in files.items():',
+    '        info = tarfile.TarInfo(name)',
+    '        info.size = len(data)',
+    '        t.addfile(info, io.BytesIO(data))',
+    '    link = tarfile.TarInfo("liam_session/session/SingletonLock")',
+    '    link.type = tarfile.SYMTYPE',
+    '    link.linkname = "hostname-1234"',
+    '    t.addfile(link)',
+  ].join('\n');
+  execFileSync(PYTHON, ['-c', script, file]);
+}
+
 function sqliteRows(file) {
   const script = 'import sqlite3,sys; print(sqlite3.connect(sys.argv[1]).execute("select count(*) from t").fetchone()[0])';
   return execFileSync(PYTHON, ['-c', script, file], { encoding: 'utf8' }).trim();
@@ -178,6 +200,33 @@ test('supabase session and database persistence', async (t) => {
     assert.equal(fs.existsSync(path.join(session, 'Default', 'Preferences')), true);
     assert.equal(fs.existsSync(path.join(session, 'Default', 'IndexedDB')), true);
     assert.equal(fs.existsSync(path.join(session, 'Default', 'Cache')), false);
+    assert.equal(fs.existsSync(path.join(session, 'SingletonLock')), false);
+  });
+
+  await t.test('does not overwrite the cloud session before WhatsApp is ready', async () => {
+    const keep = Buffer.from('keep this good copy');
+    objects.set('session.tar.gz', keep);
+    const result = await sync.backupNow(
+      path.join(TMP, 'source'), undefined, path.join(TMP, 'source'), { session: false });
+    assert.equal(result.session.skipped, true);
+    assert.deepEqual(objects.get('session.tar.gz'), keep);
+  });
+
+  await t.test('restores normal files from an archive that also contains a link', async () => {
+    const archive = path.join(TMP, 'links.tar.gz');
+    writeLinkArchive(archive);
+    const info = await sync.validateArchive(archive, 'liam_session');
+    assert.equal(info.links, 1);
+    assert.ok(info.entries >= 3);
+
+    objects.set('session.tar.gz', fs.readFileSync(archive));
+    const target = path.join(TMP, 'links-restore');
+    const result = await sync.restoreSession(target);
+    assert.equal(result.restored, true);
+    assert.equal(result.skippedLinks, 1);
+    const session = path.join(target, 'liam_session', 'session');
+    assert.equal(fs.existsSync(path.join(session, 'Default', 'Preferences')), true);
+    assert.equal(fs.existsSync(path.join(session, 'Default', 'IndexedDB', 'CURRENT')), true);
     assert.equal(fs.existsSync(path.join(session, 'SingletonLock')), false);
   });
 

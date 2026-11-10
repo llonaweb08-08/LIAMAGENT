@@ -47,8 +47,14 @@ async function main() {
 
   console.log(`Uploading ${session} and the memory DB to Supabase...`);
   const result = await sync.backupNow(base, session, dbDir);
-  console.log(JSON.stringify(result, null, 2));
-  if (!result || !result.ok) process.exitCode = 1;
+  console.log('');
+  console.log('WhatsApp login uploaded:', result && result.session && result.session.ok ? 'yes' : 'NO');
+  console.log('Memory database uploaded:', result && result.db && result.db.ok ? 'yes' : 'no (memory starts empty)');
+  if (result && result.session && result.session.entries) {
+    console.log('Login files saved:', result.session.entries);
+  }
+  if (!result || !result.ok) console.log(JSON.stringify(result, null, 2));
+  if (!result || !result.session || !result.session.ok) process.exitCode = 1;
 }
 
 main().catch((error) => {

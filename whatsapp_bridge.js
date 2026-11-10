@@ -209,6 +209,7 @@ let waInitPromise = null;
 let lastQr = null;
 let lastPairCode = null;
 let lastPairAt = 0;
+let lastQrLogAt = 0;
 let pairingInFlight = null;
 
 function setWaState(state, detail = "") {
@@ -680,7 +681,12 @@ client.on("qr", async (qr) => {
   try {
     await QRCode.toFile(QR_FILE, qr, { width: 520, margin: 2 });
     try { fs.chmodSync(QR_FILE, 0o600); } catch (e) {}
-    console.log("\n📱 QR READY — open the pairing page from the logs to scan it.");
+    // WhatsApp rotates the QR every ~20 seconds. Writing the file every time is
+    // required, but logging every rotation only floods Render's log viewer.
+    if (!lastQrLogAt || Date.now() - lastQrLogAt >= 5 * 60 * 1000) {
+      lastQrLogAt = Date.now();
+      console.log("\n📱 QR READY — open the pairing page from the logs to scan it.");
+    }
   } catch (e) { console.log("\n❌ QR FAILED:", String(e)); }
 });
 client.on("code", (code) => { lastPairCode = String(code || ""); lastPairAt = Date.now(); setWaState("linking", "pairing code generated"); });
@@ -691,6 +697,9 @@ client.on("ready", async () => {
   removeQr();
   setWaState("ready", "WhatsApp connected");
   startAgent();
+  // Start backups only after WhatsApp is actually linked. Before this point
+  // the profile is disposable and must never replace a good cloud copy.
+  sync.startPeriodicBackup(DATA_DIR, SESSION_DIR, DATA_DIR);
   // Archive immediately, so a free Render instance that spins down soon after
   // pairing still leaves a restorable session in Supabase.
   setTimeout(() => {
@@ -1410,7 +1419,6 @@ async function boot() {
     try { fs.rmSync(SESSION_PROFILE_DIR, { recursive: true, force: true }); } catch (e) {}
     setWaState("needs_qr", "no saved WhatsApp session; waiting for QR or pairing code");
   }
-  sync.startPeriodicBackup(DATA_DIR, SESSION_DIR, DATA_DIR);
   await initializeWhatsApp("startup");
 }
 
@@ -1420,6 +1428,9 @@ let shuttingDown = false;
 async function shutdown(signal) {
   if (shuttingDown) return;
   shuttingDown = true;
+  // Capture readiness before destroying the client. An unlinked profile must
+  // not overwrite the last good session in Supabase.
+  const sessionReady = waState === "ready";
   console.log(`\n⏹️ ${signal} received — saving state before shutdown`);
   try { stopAgent(); } catch (e) {}
   try { sync.stopPeriodicBackup(); } catch (e) {}
@@ -1433,7 +1444,7 @@ async function shutdown(signal) {
       await Promise.race([client.destroy(), sleep(5000)]);
     }
   } catch (e) { console.log("warn: WhatsApp shutdown failed:", String(e)); }
-  try { await sync.backupNow(DATA_DIR, SESSION_DIR, DATA_DIR); }
+  try { await sync.backupNow(DATA_DIR, SESSION_DIR, DATA_DIR, { session: sessionReady }); }
   catch (e) { console.log("warn: shutdown backup failed:", String(e)); }
   clearTimeout(deadline);
   process.exit(0);

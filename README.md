@@ -130,13 +130,19 @@ When `SUPABASE_URL` and `SUPABASE_SECRET_KEY` are set:
 - The DB backup uses SQLite `VACUUM INTO`, so it is consistent while the agent
   is writing (a raw file copy is not WAL-safe).
 - Archives are listed and validated before extraction; absolute paths, `..`,
-  links, and entries outside `liam_session/` are rejected. Restore happens in a
-  staging directory and is swapped into place atomically.
+  and entries outside `liam_session/` are rejected. Link entries are restored by
+  extracting every normal file and safely skipping the links, so an older
+  Linux-made profile still restores.
+- New archives are built with links dereferenced and are validated **before**
+  upload. A bad archive can never replace the last good cloud copy.
 - A backup runs three seconds after WhatsApp becomes ready, every
   `LIAM_BACKUP_INTERVAL_MS` (10 minutes by default), and on graceful shutdown.
+  Nothing is uploaded before `ready`, so an unpaired QR-only profile cannot
+  overwrite a linked session.
 
-Run `npm run seed:supabase` on a machine that already has a linked profile to
-upload the first archive (see the runbook).
+Run `npm run seed:supabase` (or double-click `seed_cloud.bat` on Windows) on a
+machine that already has a linked profile to upload the first archive (see the
+runbook).
 
 ## Security model
 
