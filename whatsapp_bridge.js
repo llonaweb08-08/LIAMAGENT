@@ -10,16 +10,42 @@ const { spawn, spawnSync } = require("child_process");
 // "Cannot read properties of null (reading 'Socket')" and the QR flow restarts
 // forever, so a scan is accepted by the phone but never by the server.
 //
-// Wait for the Store to exist before running the library's inject step, and
-// reload the page once if it still never appears.
+// Wait for the Store to exist before running the library's inject step, retry
+// when the call still races a page reload, and report what the page actually
+// shows when it never becomes ready.
 const _originalInject = Client.prototype.inject;
+let waInjectDiag = "";
+
+async function describeWaPage(page) {
+  if (!page) return { page: null };
+  try {
+    return await page.evaluate(() => {
+      const safe = (fn) => { try { return fn(); } catch (e) { return null; } };
+      const text = safe(() => (document.body ? document.body.innerText : "")) || "";
+      return {
+        href: safe(() => location.href) || "",
+        title: safe(() => document.title) || "",
+        readyState: safe(() => document.readyState) || "",
+        hasRequire: safe(() => typeof window.require === "function") === true,
+        hasSocket: safe(() => !!(window.require && window.require("WAWebSocketModel") &&
+          window.require("WAWebSocketModel").Socket)) === true,
+        hasAuthStore: safe(() => !!window.AuthStore) === true,
+        text: String(text).replace(/\s+/g, " ").trim().slice(0, 200),
+      };
+    });
+  } catch (e) {
+    return { page: "unreachable", error: String(e) };
+  }
+}
+
 Client.prototype.inject = async function patchedInject(...args) {
   const storeReady = async () => {
     if (!this.pupPage) return false;
     try {
       return await this.pupPage.evaluate(() => {
         try {
-          return !!(window.require && window.require("WAWebSocketModel"));
+          const model = window.require && window.require("WAWebSocketModel");
+          return !!(model && model.Socket);
         } catch (e) {
           return false;
         }
@@ -37,16 +63,46 @@ Client.prototype.inject = async function patchedInject(...args) {
     return false;
   };
 
-  if (!(await waitForStore(60))) {
-    console.log("warn: WhatsApp Web was slow to load; reloading the page once");
+  // A first boot on a cold free instance can need well over a minute. Loop
+  // instead of giving up after a single reload. Only one caller may reload the
+  // page, otherwise every navigation would start another reload and the page
+  // would never finish loading.
+  for (let attempt = 1; attempt <= 5; attempt += 1) {
+    if (!(await waitForStore(attempt === 1 ? 45 : 20))) {
+      if (this._liamReloading) {
+        try { await this._liamReloading; } catch (e) {}
+        continue;
+      }
+      console.log(`warn: WhatsApp Web not ready yet (attempt ${attempt}); reloading the page`);
+      this._liamReloading = (async () => {
+        try {
+          await this.pupPage.reload({ waitUntil: "load", timeout: 90000 });
+        } catch (e) {}
+      })();
+      try {
+        await this._liamReloading;
+      } finally {
+        this._liamReloading = null;
+      }
+      continue;
+    }
     try {
-      await this.pupPage.reload({ waitUntil: "load", timeout: 90000 });
-    } catch (e) {}
-    if (!(await waitForStore(60))) {
-      console.log("warn: WhatsApp Web Store is still not ready");
+      return await _originalInject.apply(this, args);
+    } catch (e) {
+      const msg = String(e && e.stack ? e.stack : e);
+      if (!/reading 'Socket'|Cannot read properties of null|AuthStore/i.test(msg)) throw e;
+      waInjectDiag = msg;
+      console.log(`warn: WhatsApp inject raced the page load (attempt ${attempt}): ${msg}`);
+      const info = await describeWaPage(this.pupPage);
+      console.log("warn: page state:", JSON.stringify(info));
+      if (/unsupported|update whatsapp|update your browser/i.test(String(info.text || ""))) {
+        waInjectDiag = "WhatsApp Web says this browser is unsupported: " + String(info.text || "");
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 3000));
     }
   }
-  return _originalInject.apply(this, args);
+  throw new Error("WhatsApp Web never finished loading. " + (waInjectDiag || "page stayed empty"));
 };
 const QRCode = require("qrcode");
 const path = require("path");
@@ -252,12 +308,14 @@ function puppeteerArgs() {
 
 let waState = "starting";        // starting | restoring | needs_qr | linking | ready | disconnected | error
 let waStateDetail = "";
+let waInitError = "";
 let waLastQrAt = 0;
 let waInitPromise = null;
 let lastQr = null;
 let lastPairCode = null;
 let lastPairAt = 0;
 let lastQrLogAt = 0;
+let authAt = 0;
 let pairingInFlight = null;
 
 function setWaState(state, detail = "") {
@@ -723,9 +781,15 @@ function removeQr() {
 }
 
 client.on("qr", async (qr) => {
-  lastQr = String(qr || "");
-  waLastQrAt = Date.now();
+  // After a scan WhatsApp reloads the web app and can emit one last QR from the
+  // old page. Ignoring it keeps the phone-side "linked" state from flipping
+  // back to "scan me" while authentication finishes.
+  if (waState === "ready" || (waState === "linking" && Date.now() - authAt < 120000)) {
+    return;
+  }
   setWaState("needs_qr", "scan the QR code or use the pairing page to link WhatsApp");
+  waLastQrAt = Date.now();
+  lastQr = String(qr || "");
   try {
     await QRCode.toFile(QR_FILE, qr, { width: 520, margin: 2 });
     try { fs.chmodSync(QR_FILE, 0o600); } catch (e) {}
@@ -762,30 +826,71 @@ function handleReady() {
 }
 
 client.on("authenticated", () => {
+  authAt = Date.now();
   removeQr();
   setWaState("linking", "authenticated, finishing startup");
   console.log("\n✅ LIAM LINKED — finishing startup\n");
-  // Some WhatsApp Web builds authenticate but never emit "ready". If the
-  // connection is already CONNECTED shortly after linking, start the agent
-  // anyway instead of dropping the new login and showing another QR.
-  setTimeout(async () => {
-    if (readyHandled || waState === "ready") return;
+  // Some WhatsApp Web builds authenticate but never emit "ready". Poll the
+  // connection for a few minutes and start the agent as soon as it is
+  // CONNECTED, instead of dropping the new login and showing another QR.
+  let checks = 0;
+  const poll = setInterval(async () => {
+    checks += 1;
+    if (readyHandled || waState === "ready") { clearInterval(poll); return; }
+    if (checks > 18) { clearInterval(poll); return; }
     try {
       const state = await Promise.race([
         client.getState(),
-        new Promise((_, reject) => setTimeout(() => reject(new Error("state timeout")), 15000)),
+        new Promise((_, reject) => setTimeout(() => reject(new Error("state timeout")), 10000)),
       ]);
       if (String(state) === "CONNECTED") {
         console.log("note: ready event was delayed; WhatsApp state is CONNECTED");
+        clearInterval(poll);
         handleReady();
       }
     } catch (e) {}
-  }, 20000);
+  }, 10000);
 });
 client.on("auth_failure", (m) => { removeQr(); setWaState("error", "WhatsApp auth failed"); console.log("\n❌ AUTH FAILED:", String(m)); stopAgent(); setTimeout(() => process.exit(1), 5000); });
 client.on("loading_screen", (percent) => { if (Number(percent) >= 100) console.log("info: WhatsApp Web loaded 100%"); });
 client.on("ready", handleReady);
-client.on("disconnected", (r) => { removeQr(); setWaState("disconnected", "WhatsApp disconnected"); console.log("\n⚠️ Disconnected:", r && r.toString ? r.toString() : r); stopAgent(); setTimeout(() => process.exit(1), 5000); });
+let disconnectCount = 0;
+let disconnectWindowStart = 0;
+client.on("disconnected", (r) => {
+  removeQr();
+  const reason = String(r && r.toString ? r.toString() : r);
+  console.log("\n⚠️ Disconnected:", reason);
+  stopAgent();
+  if (/LOGOUT/i.test(reason)) {
+    // The phone removed this device. The stored profile is dead; restart with
+    // a clean QR instead of restoring it.
+    setWaState("error", "WhatsApp logged out");
+    setTimeout(() => process.exit(1), 5000);
+    return;
+  }
+  const now = Date.now();
+  if (!disconnectWindowStart || now - disconnectWindowStart > 5 * 60 * 1000) {
+    disconnectWindowStart = now;
+    disconnectCount = 0;
+  }
+  disconnectCount += 1;
+  if (disconnectCount > 2) {
+    setWaState("error", "WhatsApp keeps disconnecting");
+    setTimeout(() => process.exit(1), 5000);
+    return;
+  }
+  // Keep the freshly-linked profile alive: close the broken browser and start
+  // again from the same session instead of exiting and losing the pairing.
+  setWaState("disconnected", "connection dropped; reconnecting");
+  setTimeout(async () => {
+    try {
+      readyHandled = false;
+      try { if (client.pupBrowser) await client.destroy(); } catch (e) {}
+      await sleep(3000);
+      await initializeWhatsApp("reconnect after disconnect");
+    } catch (e) { console.log("warn: reconnect failed:", String(e)); }
+  }, 5000);
+});
 client.on("change_state", (s) => { if (waState !== "ready" && waState !== "needs_qr") setWaState(waState, String(s || waStateDetail)); });
 
 // ---------------------------------------------------------------------------
@@ -1188,11 +1293,13 @@ function statusPayload() {
   return {
     ok: true,
     status: waState,
+    detail: waStateDetail,
     whatsappReady: waState === "ready",
     agentRunning: !!(agentProc && agentProc.exitCode === null && !agentProc.killed),
     needsQr: waState === "needs_qr",
     hasSessionData: hasSessionData(),
     lastQrAt: waLastQrAt || null,
+    lastError: waInitError ? waInitError.split("\n")[0].slice(0, 300) : "",
     pairingEnabled: true,
     pendingGroupPermissions: pendingPerms.size,
     pendingToolApprovals: pendingTools.size,
@@ -1291,7 +1398,7 @@ async function requestPairing(phone) {
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url || "/", "http://localhost");
   const pathname = url.pathname;
-  const publicGet = req.method === "GET" && ["/health", "/ready", "/status", "/qr", "/pair"].includes(pathname);
+  const publicGet = req.method === "GET" && ["/health", "/ready", "/status", "/qr", "/pair", "/diag"].includes(pathname);
 
   if (publicGet) {
     if (pathname === "/health") {
@@ -1306,6 +1413,23 @@ const server = http.createServer(async (req, res) => {
     }
     if (pathname === "/status") {
       sendJson(res, 200, statusPayload());
+      return;
+    }
+    if (pathname === "/diag") {
+      // Unlinked-startup diagnostics only. Once WhatsApp is linked this page
+      // could expose message text, so it stays closed.
+      const token = url.searchParams.get("token") || "";
+      if (!pairTokenOk(token)) return sendHtml(res, 403, pageShell("Forbidden", "<h1>Forbidden</h1>"));
+      if (waState === "ready") return sendJson(res, 200, { ok: true, status: waState, note: "linked; diagnostics hidden" });
+      const page = await describeWaPage(client.pupPage);
+      sendJson(res, 200, {
+        ok: true,
+        status: waState,
+        detail: waStateDetail,
+        lastError: waInitError,
+        injectError: waInjectDiag,
+        page,
+      });
       return;
     }
     if (pathname === "/qr") {
@@ -1447,6 +1571,7 @@ async function initializeWhatsApp(reason) {
       ]);
     } catch (e) {
       const msg = String(e && e.stack ? e.stack : e);
+      waInitError = msg;
       console.log("\n💀 WHATSAPP INIT FAILED:", msg);
       if (/singleton|profile appears to be in use|ProcessSingleton|Code: 21/i.test(msg)) {
         const removed = sync.sanitizeChromeLocks(SESSION_DIR);
@@ -1454,12 +1579,26 @@ async function initializeWhatsApp(reason) {
         setWaState("starting", "retrying after stale Chrome lock cleanup");
         try {
           await client.initialize();
+          waInitError = "";
           return;
         } catch (e2) {
-          console.log("\n💀 WHATSAPP INIT RETRY FAILED:", String(e2 && e2.stack ? e2.stack : e2));
-          setWaState("error", "WhatsApp init failed after lock cleanup");
-          return;
+          waInitError = String(e2 && e2.stack ? e2.stack : e2);
+          console.log("\n💀 WHATSAPP INIT RETRY FAILED:", waInitError);
         }
+      }
+      // A half-started browser cannot recover on its own. Close it and give the
+      // free instance one clean attempt instead of sitting in "error" forever.
+      try {
+        console.log("🔁 Restarting the browser for a clean WhatsApp Web load...");
+        try { if (client && client.pupBrowser) await client.destroy(); } catch (e2) {}
+        await sleep(3000);
+        setWaState("starting", "retrying WhatsApp init with a fresh browser");
+        await client.initialize();
+        waInitError = "";
+        return;
+      } catch (e3) {
+        waInitError = String(e3 && e3.stack ? e3.stack : e3);
+        console.log("\n💀 WHATSAPP CLEAN RETRY FAILED:", waInitError);
       }
       setWaState("error", "WhatsApp init failed");
     } finally {
