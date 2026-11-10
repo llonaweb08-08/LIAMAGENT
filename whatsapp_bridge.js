@@ -30,6 +30,8 @@ async function describeWaPage(page) {
         hasSocket: safe(() => !!(window.require && window.require("WAWebSocketModel") &&
           window.require("WAWebSocketModel").Socket)) === true,
         hasAuthStore: safe(() => !!window.AuthStore) === true,
+        hasPairingUtils: safe(() => !!(window.AuthStore && window.AuthStore.PairingCodeLinkUtils)) === true,
+        authStoreKeys: safe(() => (window.AuthStore ? Object.keys(window.AuthStore).slice(0, 30) : [])) || [],
         text: String(text).replace(/\s+/g, " ").trim().slice(0, 200),
       };
     });
@@ -329,6 +331,7 @@ let waInitPromise = null;
 let lastQr = null;
 let lastPairCode = null;
 let lastPairAt = 0;
+let pairingError = "";
 let lastQrLogAt = 0;
 let authAt = 0;
 let pairingInFlight = null;
@@ -1408,13 +1411,21 @@ async function requestPairing(phone) {
     }
     if (!client.pupPage) throw new BadRequest("WhatsApp is still starting — try again in a few seconds");
     try {
-      const code = await client.requestPairingCode(normalized, true);
+      const code = await Promise.race([
+        client.requestPairingCode(normalized, true),
+        sleep(90000).then(() => { throw new Error("the phone-code screen did not appear within 90 seconds"); }),
+      ]);
       lastPairCode = String(code || "");
       lastPairAt = Date.now();
+      pairingError = "";
       setWaState("linking", "pairing code generated");
       return lastPairCode;
     } catch (e) {
-      throw new BadRequest("could not generate a pairing code yet — wait a few seconds and try again");
+      const msg = String(e && e.message ? e.message : e).split("\n")[0].slice(0, 200);
+      pairingError = msg;
+      noteWaEvent("pairing_failed", msg);
+      console.log("warn: pairing code failed:", msg);
+      throw new BadRequest("could not generate a pairing code: " + msg);
     }
   })();
   try { return await pairingInFlight; }
@@ -1454,6 +1465,7 @@ const server = http.createServer(async (req, res) => {
         detail: waStateDetail,
         lastError: waInitError,
         injectError: waInjectDiag,
+        pairingError,
         pairingRequestedAt: lastPairAt || null,
         authenticatedAt: authAt || null,
         events: waEvents.slice(-15),
