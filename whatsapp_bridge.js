@@ -1,5 +1,53 @@
 const { Client, LocalAuth, MessageMedia } = require("whatsapp-web.js");
 const { spawn, spawnSync } = require("child_process");
+
+// ---------------------------------------------------------------------------
+// WhatsApp Web load guard
+// ---------------------------------------------------------------------------
+// On Render's free tier the browser can take a long time to start WhatsApp Web.
+// whatsapp-web.js injects its helpers immediately after the page loads; if the
+// web app's internal Store is not ready yet, that throws
+// "Cannot read properties of null (reading 'Socket')" and the QR flow restarts
+// forever, so a scan is accepted by the phone but never by the server.
+//
+// Wait for the Store to exist before running the library's inject step, and
+// reload the page once if it still never appears.
+const _originalInject = Client.prototype.inject;
+Client.prototype.inject = async function patchedInject(...args) {
+  const storeReady = async () => {
+    if (!this.pupPage) return false;
+    try {
+      return await this.pupPage.evaluate(() => {
+        try {
+          return !!(window.require && window.require("WAWebSocketModel"));
+        } catch (e) {
+          return false;
+        }
+      });
+    } catch (e) {
+      return false;
+    }
+  };
+  const waitForStore = async (seconds) => {
+    const deadline = Date.now() + seconds * 1000;
+    while (Date.now() < deadline) {
+      if (await storeReady()) return true;
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+    }
+    return false;
+  };
+
+  if (!(await waitForStore(60))) {
+    console.log("warn: WhatsApp Web was slow to load; reloading the page once");
+    try {
+      await this.pupPage.reload({ waitUntil: "load", timeout: 90000 });
+    } catch (e) {}
+    if (!(await waitForStore(60))) {
+      console.log("warn: WhatsApp Web Store is still not ready");
+    }
+  }
+  return _originalInject.apply(this, args);
+};
 const QRCode = require("qrcode");
 const path = require("path");
 const fs = require("fs");
@@ -690,9 +738,11 @@ client.on("qr", async (qr) => {
   } catch (e) { console.log("\n❌ QR FAILED:", String(e)); }
 });
 client.on("code", (code) => { lastPairCode = String(code || ""); lastPairAt = Date.now(); setWaState("linking", "pairing code generated"); });
-client.on("authenticated", () => { removeQr(); setWaState("linking", "authenticated, finishing startup"); console.log("\n✅ LIAM LINKED — finishing startup\n"); });
-client.on("auth_failure", (m) => { removeQr(); setWaState("error", "WhatsApp auth failed"); console.log("\n❌ AUTH FAILED:", String(m)); stopAgent(); setTimeout(() => process.exit(1), 5000); });
-client.on("ready", async () => {
+
+let readyHandled = false;
+function handleReady() {
+  if (readyHandled) return;
+  readyHandled = true;
   console.log("\n🚀 LIAM IS LIVE — waiting for messages...\n");
   removeQr();
   setWaState("ready", "WhatsApp connected");
@@ -709,7 +759,32 @@ client.on("ready", async () => {
         .catch((e) => console.log("warn: immediate backup failed:", String(e)));
     } catch (e) {}
   }, 3000);
+}
+
+client.on("authenticated", () => {
+  removeQr();
+  setWaState("linking", "authenticated, finishing startup");
+  console.log("\n✅ LIAM LINKED — finishing startup\n");
+  // Some WhatsApp Web builds authenticate but never emit "ready". If the
+  // connection is already CONNECTED shortly after linking, start the agent
+  // anyway instead of dropping the new login and showing another QR.
+  setTimeout(async () => {
+    if (readyHandled || waState === "ready") return;
+    try {
+      const state = await Promise.race([
+        client.getState(),
+        new Promise((_, reject) => setTimeout(() => reject(new Error("state timeout")), 15000)),
+      ]);
+      if (String(state) === "CONNECTED") {
+        console.log("note: ready event was delayed; WhatsApp state is CONNECTED");
+        handleReady();
+      }
+    } catch (e) {}
+  }, 20000);
 });
+client.on("auth_failure", (m) => { removeQr(); setWaState("error", "WhatsApp auth failed"); console.log("\n❌ AUTH FAILED:", String(m)); stopAgent(); setTimeout(() => process.exit(1), 5000); });
+client.on("loading_screen", (percent) => { if (Number(percent) >= 100) console.log("info: WhatsApp Web loaded 100%"); });
+client.on("ready", handleReady);
 client.on("disconnected", (r) => { removeQr(); setWaState("disconnected", "WhatsApp disconnected"); console.log("\n⚠️ Disconnected:", r && r.toString ? r.toString() : r); stopAgent(); setTimeout(() => process.exit(1), 5000); });
 client.on("change_state", (s) => { if (waState !== "ready" && waState !== "needs_qr") setWaState(waState, String(s || waStateDetail)); });
 
