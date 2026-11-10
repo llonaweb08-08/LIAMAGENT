@@ -67,39 +67,54 @@ Client.prototype.inject = async function patchedInject(...args) {
   // instead of giving up after a single reload. Only one caller may reload the
   // page, otherwise every navigation would start another reload and the page
   // would never finish loading.
+  const authInFlight = () =>
+    waState === "linking" ||
+    (authAt && Date.now() - authAt < 5 * 60 * 1000) ||
+    (lastPairAt && Date.now() - lastPairAt < 5 * 60 * 1000);
+
   for (let attempt = 1; attempt <= 5; attempt += 1) {
-    if (!(await waitForStore(attempt === 1 ? 45 : 20))) {
-      if (this._liamReloading) {
-        try { await this._liamReloading; } catch (e) {}
+    if (await waitForStore(attempt === 1 ? 45 : 20)) {
+      this._liamStoreSeen = true;
+      try {
+        return await _originalInject.apply(this, args);
+      } catch (e) {
+        const msg = String(e && e.stack ? e.stack : e);
+        if (!/reading 'Socket'|Cannot read properties of null|AuthStore/i.test(msg)) throw e;
+        waInjectDiag = msg;
+        console.log(`warn: WhatsApp inject raced the page load (attempt ${attempt}): ${msg}`);
+        const info = await describeWaPage(this.pupPage);
+        console.log("warn: page state:", JSON.stringify(info));
+        if (/unsupported|update whatsapp|update your browser/i.test(String(info.text || ""))) {
+          waInjectDiag = "WhatsApp Web says this browser is unsupported: " + String(info.text || "");
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 3000));
         continue;
       }
-      console.log(`warn: WhatsApp Web not ready yet (attempt ${attempt}); reloading the page`);
-      this._liamReloading = (async () => {
-        try {
-          await this.pupPage.reload({ waitUntil: "load", timeout: 90000 });
-        } catch (e) {}
-      })();
-      try {
-        await this._liamReloading;
-      } finally {
-        this._liamReloading = null;
-      }
+    }
+
+    // Never reload a page that has already loaded or while a QR/pairing-code
+    // login is being completed: a reload cancels the handshake, so the phone
+    // shows the device as linked while the server falls back to a new QR.
+    if (this._liamStoreSeen || authInFlight()) {
+      console.log(`warn: WhatsApp Web is reloading itself (attempt ${attempt}); waiting instead of forcing a reload`);
+      await new Promise((resolve) => setTimeout(resolve, 5000));
       continue;
     }
+    if (this._liamReloading) {
+      try { await this._liamReloading; } catch (e) {}
+      continue;
+    }
+    console.log(`warn: WhatsApp Web not ready yet (attempt ${attempt}); reloading the page`);
+    this._liamReloading = (async () => {
+      try {
+        await this.pupPage.reload({ waitUntil: "load", timeout: 90000 });
+      } catch (e) {}
+    })();
     try {
-      return await _originalInject.apply(this, args);
-    } catch (e) {
-      const msg = String(e && e.stack ? e.stack : e);
-      if (!/reading 'Socket'|Cannot read properties of null|AuthStore/i.test(msg)) throw e;
-      waInjectDiag = msg;
-      console.log(`warn: WhatsApp inject raced the page load (attempt ${attempt}): ${msg}`);
-      const info = await describeWaPage(this.pupPage);
-      console.log("warn: page state:", JSON.stringify(info));
-      if (/unsupported|update whatsapp|update your browser/i.test(String(info.text || ""))) {
-        waInjectDiag = "WhatsApp Web says this browser is unsupported: " + String(info.text || "");
-        break;
-      }
-      await new Promise((resolve) => setTimeout(resolve, 3000));
+      await this._liamReloading;
+    } finally {
+      this._liamReloading = null;
     }
   }
   throw new Error("WhatsApp Web never finished loading. " + (waInjectDiag || "page stayed empty"));
@@ -317,6 +332,14 @@ let lastPairAt = 0;
 let lastQrLogAt = 0;
 let authAt = 0;
 let pairingInFlight = null;
+
+// Small ring buffer of connection events. Render's free logs are painful to
+// read from a phone, so /diag exposes the last few events instead.
+const waEvents = [];
+function noteWaEvent(name, extra) {
+  waEvents.push({ at: Date.now(), name, detail: extra ? String(extra).slice(0, 200) : "" });
+  if (waEvents.length > 30) waEvents.shift();
+}
 
 function setWaState(state, detail = "") {
   waState = state;
@@ -790,6 +813,7 @@ client.on("qr", async (qr) => {
   setWaState("needs_qr", "scan the QR code or use the pairing page to link WhatsApp");
   waLastQrAt = Date.now();
   lastQr = String(qr || "");
+  noteWaEvent("qr");
   try {
     await QRCode.toFile(QR_FILE, qr, { width: 520, margin: 2 });
     try { fs.chmodSync(QR_FILE, 0o600); } catch (e) {}
@@ -801,12 +825,12 @@ client.on("qr", async (qr) => {
     }
   } catch (e) { console.log("\n❌ QR FAILED:", String(e)); }
 });
-client.on("code", (code) => { lastPairCode = String(code || ""); lastPairAt = Date.now(); setWaState("linking", "pairing code generated"); });
-
+client.on("code", (code) => { lastPairCode = String(code || ""); lastPairAt = Date.now(); setWaState("linking", "pairing code generated"); noteWaEvent("code"); });
 let readyHandled = false;
 function handleReady() {
   if (readyHandled) return;
   readyHandled = true;
+  noteWaEvent("ready");
   console.log("\n🚀 LIAM IS LIVE — waiting for messages...\n");
   removeQr();
   setWaState("ready", "WhatsApp connected");
@@ -827,6 +851,7 @@ function handleReady() {
 
 client.on("authenticated", () => {
   authAt = Date.now();
+  noteWaEvent("authenticated");
   removeQr();
   setWaState("linking", "authenticated, finishing startup");
   console.log("\n✅ LIAM LINKED — finishing startup\n");
@@ -851,7 +876,7 @@ client.on("authenticated", () => {
     } catch (e) {}
   }, 10000);
 });
-client.on("auth_failure", (m) => { removeQr(); setWaState("error", "WhatsApp auth failed"); console.log("\n❌ AUTH FAILED:", String(m)); stopAgent(); setTimeout(() => process.exit(1), 5000); });
+client.on("auth_failure", (m) => { removeQr(); setWaState("error", "WhatsApp auth failed"); noteWaEvent("auth_failure", m); console.log("\n❌ AUTH FAILED:", String(m)); stopAgent(); setTimeout(() => process.exit(1), 5000); });
 client.on("loading_screen", (percent) => { if (Number(percent) >= 100) console.log("info: WhatsApp Web loaded 100%"); });
 client.on("ready", handleReady);
 let disconnectCount = 0;
@@ -859,6 +884,7 @@ let disconnectWindowStart = 0;
 client.on("disconnected", (r) => {
   removeQr();
   const reason = String(r && r.toString ? r.toString() : r);
+  noteWaEvent("disconnected", reason);
   console.log("\n⚠️ Disconnected:", reason);
   stopAgent();
   if (/LOGOUT/i.test(reason)) {
@@ -1428,6 +1454,9 @@ const server = http.createServer(async (req, res) => {
         detail: waStateDetail,
         lastError: waInitError,
         injectError: waInjectDiag,
+        pairingRequestedAt: lastPairAt || null,
+        authenticatedAt: authAt || null,
+        events: waEvents.slice(-15),
         page,
       });
       return;
