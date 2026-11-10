@@ -792,8 +792,9 @@ BRAINS = {
     "hcn":       {"base": liam_keys.HCN_BASE,   "model": liam_keys.HCN_MODEL,     "keys": [liam_keys.HCN_KEY],       "label": "HCNSec DeepSeek"},
 }
 # Only models that actually support tool calls are used for the tool-calling loop.
-UNO_TOOL_MODELS = ["gpt-4o:free", "llama-4-scout:free", "mistral-small-4-119b-2603:free",
-                    "qwen3.6-35b-a3b:free", "deepseek-r1-distill-llama-70b:free"]
+UNO_TOOL_MODELS = ["claude-haiku-4-5-20251001:free", "bielik-11b-v3.0-instruct:free",
+                    "qwen3.6-35b-a3b:free", "gpt-4o:free",
+                    "deepseek-r1-distill-llama-70b:free"]
 _BRAIN_ALIASES = {
     "moonmath": "moonmath", "moon": "moonmath", "deepseek": "moonmath", "deepseek v4": "moonmath",
     "glm": "glm", "glm 5 3": "glm", "agnes": "agnes", "ag": "agnes", "agnes 3": "agnes",

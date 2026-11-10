@@ -45,9 +45,13 @@ MOON_FALLBACK = os.environ.get("MOON_FALLBACK", "glm-5.3-flash")
 # --- Unorouter API keys (rotated per request) ---
 UNO_KEYS = _keys("UNO_KEYS")
 UNO_BASE = os.environ.get("UNO_BASE", "https://api.unorouter.com/v1")
+# Free models are rate limited to one request per minute each. Models that
+# need a one-time provider consent (gpt-4o:free, qwen3.6-35b-a3b:free) still
+# work after visiting https://unorouter.com/consents?model=<model>.
 UNO_MODELS = [
-    "gpt-4o:free", "llama-4-scout:free", "mistral-small-4-119b-2603:free",
-    "qwen3.6-35b-a3b:free", "deepseek-r1-distill-llama-70b:free",
+    "claude-haiku-4-5-20251001:free", "bielik-11b-v3.0-instruct:free",
+    "agnes-3.0-flash:free", "qwen3.6-35b-a3b:free",
+    "deepseek-r1-distill-llama-70b:free", "gpt-4o:free",
 ]
 
 # --- Agnes 3 Flash (free, always available) ---
@@ -66,7 +70,7 @@ HF_KEY = str(_secret("HF_KEY", "")).strip()
 
 # --- HCNSec (tool-capable fallback after Agnes) ---
 HCN_BASE = os.environ.get("HCN_BASE", "https://api.hcnsec.cn/v1")
-HCN_MODEL = os.environ.get("HCN_MODEL", "DeepSeek-V4-Flash")
+HCN_MODEL = os.environ.get("HCN_MODEL", "auto")
 HCN_KEY = str(_secret("HCN_KEY", "")).strip()
 
 # --- Search providers (first configured one wins) ---
