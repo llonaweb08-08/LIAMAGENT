@@ -336,13 +336,6 @@ function puppeteerArgs() {
   const base = [
     "--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage",
     "--disable-gpu", "--no-first-run", "--no-zygote",
-    // Memory trims for Render's 512 MiB free instance. WhatsApp Web alone is
-    // heavy and the container is killed as soon as it goes over the limit,
-    // which also kills an in-progress link.
-    "--disable-extensions", "--disable-background-networking", "--disable-default-apps",
-    "--disable-sync", "--disable-breakpad", "--metrics-recording-only", "--mute-audio",
-    "--disable-component-update", "--no-default-browser-check", "--renderer-process-limit=2",
-    "--disable-features=Translate,BackForwardCache,MediaRouter,OptimizationHints,AcceptCHFrame",
   ];
   if (process.env.LIAM_CHROME_SINGLE_PROCESS === "1") base.push("--single-process");
   return base;
@@ -1603,7 +1596,11 @@ function autoReset(reason) {
 let memoryGuardTimer = null;
 function startMemoryGuard() {
   if (memoryGuardTimer) return;
-  const limit = Math.max(300, Number.parseInt(process.env.LIAM_MEM_LIMIT_MB || "460", 10));
+  // Opt-in only: the boot peak is inherent to loading WhatsApp Web, and
+  // recycling during a login would cancel the link. Set LIAM_MEM_LIMIT_MB to a
+  // value below the plan limit to enable an early browser recycle.
+  const limit = Number.parseInt(process.env.LIAM_MEM_LIMIT_MB || "0", 10);
+  if (!Number.isFinite(limit) || limit < 300) return;
   memoryGuardTimer = setInterval(() => {
     const used = containerMemoryMiB();
     if (!used || used < limit) return;
