@@ -90,14 +90,34 @@ Open the deploy logs and find:
 
 Open that URL and either:
 
-- enter the bot's phone number (default `447881161023`) to get an
-  **8-character pairing code**, then use WhatsApp on that phone ->
-  **Linked devices -> Link with phone number**, or
+- enter the bot's phone number (default `447881161023`) and press
+  **Get pairing code**. Prepare the phone first: WhatsApp on that phone ->
+  **Linked devices -> Link with phone number**, so it is already waiting.
+  Then type the 8-character code immediately, or
 - open `/qr?token=<LIAM_PAIR_TOKEN>` and scan the QR.
 
-The code/QR expires quickly. Reload the page for a new one. Once linked, the
-logs show `LIAM IS LIVE`, the bridge backs up the session after three seconds,
-and `/ready` starts returning 200.
+Opening or reloading `/pair` never creates a code; only the button does, so a
+refresh cannot burn one of WhatsApp's few allowed attempts. A code is reused for
+60 seconds and a new request is refused for 120 seconds
+(`LIAM_PAIRING_COOLDOWN_MS`). Never reload the page while typing the code: a
+reload kills the link handshake and leaves a zombie device on the phone.
+
+The code/QR expires quickly. Once linked, the logs show `LIAM IS LIVE`, the
+bridge backs up the session after three seconds, and `/ready` starts returning
+200.
+
+A session is only kept when the profile contains `wa_linked.json`, which is
+written after WhatsApp confirms the login. On boot, a profile without that
+marker is deleted and the browser starts empty, so a half-finished link or a
+corrupt restore can never poison the next attempt.
+
+If a link attempt gets stuck, two token-protected helpers exist:
+
+- `/cancelpair?token=<LIAM_PAIR_TOKEN>` — leave pairing-code mode and return to
+  QR mode (clears the page-side retry timer that keeps hitting WhatsApp's rate
+  limit).
+- `/reset?token=<LIAM_PAIR_TOKEN>` — close the browser, delete the local
+  profile, and load a fresh WhatsApp Web page without restarting Render.
 
 If the session is restored successfully, pairing is not needed at all.
 

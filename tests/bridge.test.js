@@ -341,10 +341,17 @@ test('bridge endpoint security and actions', async (t) => {
     assert.equal(pairForbidden.status, 403);
   });
 
-  await t.test('generates an 8-character pairing code', async () => {
-    const response = await request(port, {
+  await t.test('generates an 8-character pairing code only on submit', async () => {
+    const page = await request(port, {
       method: 'GET',
       path: `/pair?token=${bridge.PAIR_TOKEN}&phone=${OWNER}`,
+    });
+    assert.equal(page.status, 200);
+    assert.doesNotMatch(page.text, /ABCD-1234/);
+    const response = await request(port, {
+      method: 'POST',
+      path: `/pair?token=${bridge.PAIR_TOKEN}`,
+      body: { phone: OWNER },
     });
     assert.equal(response.status, 200);
     assert.match(response.text, /ABCD-1234/);

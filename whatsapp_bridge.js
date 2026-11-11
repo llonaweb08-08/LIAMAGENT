@@ -19,7 +19,9 @@ let waInjectDiag = "";
 async function describeWaPage(page) {
   if (!page) return { page: null };
   try {
-    return await page.evaluate(() => {
+    // A page stuck in a retry loop stops answering evaluate() at all, which made
+    // /diag hang. Never wait longer than a few seconds for page details.
+    const answered = page.evaluate(() => {
       const safe = (fn) => { try { return fn(); } catch (e) { return null; } };
       const text = safe(() => (document.body ? document.body.innerText : "")) || "";
       return {
@@ -35,6 +37,9 @@ async function describeWaPage(page) {
         text: String(text).replace(/\s+/g, " ").trim().slice(0, 200),
       };
     });
+    const timeout = new Promise((resolve) => setTimeout(
+      () => resolve({ page: "busy", note: "the WhatsApp page did not answer within 8 seconds" }), 8000));
+    return await Promise.race([answered, timeout]);
   } catch (e) {
     return { page: "unreachable", error: String(e) };
   }
@@ -158,6 +163,9 @@ const OUTBOUND_MAX = 20;
 const PERMISSION_TTL_MS = Math.max(60_000, Number.parseInt(process.env.LIAM_GROUP_PERMISSION_MS || String(3 * 60 * 60 * 1000), 10));
 const PENDING_TTL_MS = Math.max(60_000, Number.parseInt(process.env.LIAM_PENDING_TTL_MS || String(30 * 60 * 1000), 10));
 const TOOL_APPROVAL_TTL_MS = Math.max(60_000, Number.parseInt(process.env.LIAM_TOOL_APPROVAL_MS || String(10 * 60 * 1000), 10));
+// Minimum gap between two pairing-code requests. WhatsApp blocks a number that
+// asks repeatedly, and each request restarts that block.
+const PAIRING_COOLDOWN_MS = Math.max(60_000, Number.parseInt(process.env.LIAM_PAIRING_COOLDOWN_MS || "120000", 10));
 const MAX_PENDING = 40;
 
 function resolvePort() {
@@ -365,6 +373,29 @@ function profileHasCredentials() {
   } catch (e) { return false; }
 }
 function hasSessionData() { return profileHasCredentials(); }
+
+// A marker written only after WhatsApp confirms the login. It lives next to the
+// Chromium profile (inside SESSION_DIR, so it travels with the Supabase
+// archive). Boot uses it to tell a real linked session from a dead profile:
+// Chromium always writes files like "Local State" into an empty profile, so the
+// file listing alone cannot prove that WhatsApp is linked.
+const LINK_MARKER = path.join(SESSION_DIR, "wa_linked.json");
+function hasLinkMarker() {
+  try { return fs.existsSync(LINK_MARKER); } catch (e) { return false; }
+}
+function readLinkMarker() {
+  try { return JSON.parse(fs.readFileSync(LINK_MARKER, "utf8")); } catch (e) { return null; }
+}
+function markLinked(extra) {
+  try {
+    fs.mkdirSync(SESSION_DIR, { recursive: true });
+    fs.writeFileSync(LINK_MARKER,
+      JSON.stringify({ at: Date.now(), ...(extra || {}) }), { mode: 0o600 });
+  } catch (e) { console.log("warn: could not write the linked marker:", String(e)); }
+}
+function clearLinkMarker() {
+  try { fs.rmSync(LINK_MARKER, { force: true }); } catch (e) {}
+}
 
 const client = new Client({
   authStrategy: new LocalAuth({ dataPath: SESSION_DIR }),
@@ -809,8 +840,12 @@ function removeQr() {
 client.on("qr", async (qr) => {
   // After a scan WhatsApp reloads the web app and can emit one last QR from the
   // old page. Ignoring it keeps the phone-side "linked" state from flipping
-  // back to "scan me" while authentication finishes.
-  if (waState === "ready" || (waState === "linking" && Date.now() - authAt < 120000)) {
+  // back to "scan me" while authentication finishes. The same applies to a
+  // phone-code login: WhatsApp Web keeps emitting QRs behind the code screen,
+  // and showing them would hide that a link is in progress.
+  const pairingWindow = waState === "linking" &&
+    Date.now() - Math.max(lastPairAt || 0, authAt || 0) < 5 * 60 * 1000;
+  if (waState === "ready" || pairingWindow) {
     return;
   }
   setWaState("needs_qr", "scan the QR code or use the pairing page to link WhatsApp");
@@ -837,6 +872,17 @@ function handleReady() {
   console.log("\n🚀 LIAM IS LIVE — waiting for messages...\n");
   removeQr();
   setWaState("ready", "WhatsApp connected");
+  // Remember that this profile is a real, completed login. Boot wipes any
+  // profile without this marker so a half-finished link cannot poison the next
+  // attempt.
+  try {
+    const wid = client.info && client.info.wid
+      ? String(client.info.wid._serialized || client.info.wid)
+      : "linked";
+    markLinked({ wid });
+  } catch (e) {
+    markLinked({ wid: "linked" });
+  }
   startAgent();
   // Start backups only after WhatsApp is actually linked. Before this point
   // the profile is disposable and must never replace a good cloud copy.
@@ -879,7 +925,7 @@ client.on("authenticated", () => {
     } catch (e) {}
   }, 10000);
 });
-client.on("auth_failure", (m) => { removeQr(); setWaState("error", "WhatsApp auth failed"); noteWaEvent("auth_failure", m); console.log("\n❌ AUTH FAILED:", String(m)); stopAgent(); setTimeout(() => process.exit(1), 5000); });
+client.on("auth_failure", (m) => { removeQr(); clearLinkMarker(); setWaState("error", "WhatsApp auth failed"); noteWaEvent("auth_failure", m); console.log("\n❌ AUTH FAILED:", String(m)); stopAgent(); setTimeout(() => process.exit(1), 5000); });
 client.on("loading_screen", (percent) => { if (Number(percent) >= 100) console.log("info: WhatsApp Web loaded 100%"); });
 client.on("ready", handleReady);
 let disconnectCount = 0;
@@ -893,6 +939,7 @@ client.on("disconnected", (r) => {
   if (/LOGOUT/i.test(reason)) {
     // The phone removed this device. The stored profile is dead; restart with
     // a clean QR instead of restoring it.
+    clearLinkMarker();
     setWaState("error", "WhatsApp logged out");
     setTimeout(() => process.exit(1), 5000);
     return;
@@ -913,6 +960,16 @@ client.on("disconnected", (r) => {
   setWaState("disconnected", "connection dropped; reconnecting");
   setTimeout(async () => {
     try {
+      if (waState === "ready") return;
+      // Never tear the browser down in the middle of a scan or phone-code
+      // handshake: WhatsApp Web reconnects on its own, and a restart here is
+      // exactly what leaves a zombie device on the phone.
+      if (waState === "linking" &&
+        Date.now() - Math.max(lastPairAt || 0, authAt || 0) < 5 * 60 * 1000) {
+        noteWaEvent("reconnect_deferred", "link in progress");
+        console.log("info: not restarting the browser while a link is being completed");
+        return;
+      }
       readyHandled = false;
       try { if (client.pupBrowser) await client.destroy(); } catch (e) {}
       await sleep(3000);
@@ -1327,6 +1384,7 @@ function statusPayload() {
     agentRunning: !!(agentProc && agentProc.exitCode === null && !agentProc.killed),
     needsQr: waState === "needs_qr",
     hasSessionData: hasSessionData(),
+    linkedMarker: hasLinkMarker(),
     lastQrAt: waLastQrAt || null,
     lastError: waInitError ? waInitError.split("\n")[0].slice(0, 300) : "",
     pairingEnabled: true,
@@ -1354,15 +1412,24 @@ function pairPage(token, opts = {}) {
   if (opts.error) result = `<p style="color:#fca5a5">${escapeHtml(opts.error)}</p>`;
   if (opts.code) {
     const formatted = opts.code.length === 8 ? `${opts.code.slice(0, 4)}-${opts.code.slice(4)}` : opts.code;
+    const asked = opts.requestedAt ? new Date(opts.requestedAt).toLocaleTimeString() : "";
     result = `<p>Enter this 8-character code in WhatsApp → Linked devices → Link with phone number:</p>` +
       `<p><code id="code" style="font-size:1.7rem;letter-spacing:.15em">${escapeHtml(formatted)}</code></p>` +
-      `<p>This code expires quickly. Reload this page to generate a new one.</p>`;
+      `<p style="opacity:.8">Requested at ${escapeHtml(asked)}. <strong>Do not close or reload this page.</strong> ` +
+      `If the code is older than about a minute, get a new one below.</p>` +
+      `<p id="age" style="color:#fca5a5;font-weight:600"></p>` +
+      `<script>(function(){var t0=Date.now();setInterval(function(){` +
+      `var s=Math.round((Date.now()-t0)/1000);var e=document.getElementById('age');if(!e)return;` +
+      `e.textContent = s>75 ? 'This code has almost certainly expired — get a new one below.' : '';` +
+      `},1000);})();</script>`;
   }
   return pageShell("Liam pairing", `<h1>Pair Liam</h1>${result}` +
+    `<p style="opacity:.8">First open the phone: <strong>WhatsApp → Linked devices → Link with phone number</strong>, ` +
+    `so it is waiting for a code. Then press the button here and type the code straight away.</p>` +
     `<form method="post" action="${action}">` +
     `<label for="phone">WhatsApp number with country code (digits only)</label>` +
     `<input id="phone" name="phone" inputmode="numeric" autocomplete="tel" value="${value}" required>` +
-    `<button type="submit">Get pairing code</button></form>` +
+    `<button type="submit">${opts.code ? "Get a new code" : "Get pairing code"}</button></form>` +
     `<p style="opacity:.7">Or use the QR page: <a href="/qr?token=${encodeURIComponent(token)}">/qr</a></p>`);
 }
 
@@ -1420,6 +1487,44 @@ async function cancelPairing() {
   return cleared;
 }
 
+// Wipe the local WhatsApp profile and load a brand-new WhatsApp Web page.
+// A Chromium profile left behind by an interrupted link can keep WhatsApp in a
+// half-linked state; this returns the browser to a clean first-run profile
+// without needing a Render restart.
+let resetInFlight = null;
+async function resetWhatsApp(reason) {
+  if (resetInFlight) return resetInFlight;
+  resetInFlight = (async () => {
+    noteWaEvent("reset", reason || "manual reset");
+    console.log("\n♻️ Resetting WhatsApp:", reason || "manual reset");
+    setWaState("starting", "resetting WhatsApp (clean profile)");
+    stopAgent();
+    readyHandled = false;
+    lastPairCode = null;
+    lastPairAt = 0;
+    pairingError = "";
+    pairingInFlight = null;
+    waInjectDiag = "";
+    waInitError = "";
+    removeQr();
+    clearLinkMarker();
+    try {
+      if (client && typeof client.destroy === "function") {
+        await Promise.race([client.destroy(), sleep(15000)]);
+      }
+    } catch (e) { console.log("warn: reset could not close the browser:", String(e).split("\n")[0]); }
+    try { client.pupPage = null; client.pupBrowser = null; } catch (e) {}
+    try { fs.rmSync(SESSION_PROFILE_DIR, { recursive: true, force: true }); } catch (e) {}
+    setWaState("needs_qr", "clean profile; waiting for a QR code");
+    await initializeWhatsApp("reset");
+  })();
+  try {
+    return await resetInFlight;
+  } finally {
+    resetInFlight = null;
+  }
+}
+
 async function requestPairing(phone) {
   const normalized = String(phone || "").replace(/\D/g, "");
   if (!/^\d{7,15}$/.test(normalized)) {
@@ -1427,7 +1532,16 @@ async function requestPairing(phone) {
   }
   if (waState === "ready") throw new BadRequest("this WhatsApp account is already linked");
   if (pairingInFlight) return pairingInFlight;
-  if (Date.now() - lastPairAt < 15000 && lastPairCode) return lastPairCode;
+  // WhatsApp rate-limits code requests hard and every request restarts the
+  // block. Give the same code back while it is fresh, then enforce a cooldown.
+  const sinceLast = lastPairAt ? Date.now() - lastPairAt : Infinity;
+  if (sinceLast < 60 * 1000 && lastPairCode) return lastPairCode;
+  if (sinceLast < PAIRING_COOLDOWN_MS) {
+    const wait = Math.ceil((PAIRING_COOLDOWN_MS - sinceLast) / 1000);
+    throw new BadRequest(
+      `a code was requested ${Math.round(sinceLast / 1000)} seconds ago; wait ${wait} seconds before asking again — ` +
+      "every request restarts WhatsApp's own rate limit");
+  }
   pairingInFlight = (async () => {
     const deadline = Date.now() + 60000;
     while (Date.now() < deadline) {
@@ -1464,7 +1578,7 @@ async function requestPairing(phone) {
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url || "/", "http://localhost");
   const pathname = url.pathname;
-  const publicGet = req.method === "GET" && ["/health", "/ready", "/status", "/qr", "/pair", "/diag", "/cancelpair"].includes(pathname);
+  const publicGet = req.method === "GET" && ["/health", "/ready", "/status", "/qr", "/pair", "/diag", "/cancelpair", "/reset"].includes(pathname);
 
   if (publicGet) {
     if (pathname === "/health") {
@@ -1495,6 +1609,21 @@ const server = http.createServer(async (req, res) => {
       }
       return;
     }
+    if (pathname === "/reset") {
+      const token = url.searchParams.get("token") || "";
+      if (!pairTokenOk(token)) return sendJson(res, 403, { ok: false, msg: "forbidden" });
+      if (waState === "ready") return sendJson(res, 409, { ok: false, msg: "already linked; a reset is not needed" });
+      try {
+        await Promise.race([
+          resetWhatsApp("manual reset"),
+          sleep(180000).then(() => { throw new Error("reset timed out"); }),
+        ]);
+        sendJson(res, 200, { ok: true, ...statusPayload() });
+      } catch (e) {
+        sendJson(res, 500, { ok: false, msg: String(e && e.message ? e.message : e) });
+      }
+      return;
+    }
     if (pathname === "/diag") {
       // Unlinked-startup diagnostics only. Once WhatsApp is linked this page
       // could expose message text, so it stays closed.
@@ -1511,6 +1640,12 @@ const server = http.createServer(async (req, res) => {
         pairingError,
         pairingRequestedAt: lastPairAt || null,
         authenticatedAt: authAt || null,
+        codeAgeSeconds: lastPairCode && lastPairAt ? Math.round((Date.now() - lastPairAt) / 1000) : null,
+        linkedMarker: hasLinkMarker(),
+        marker: readLinkMarker(),
+        profileFiles: (() => {
+          try { return fs.readdirSync(SESSION_PROFILE_DIR).length; } catch (e) { return 0; }
+        })(),
         events: waEvents.slice(-15),
         page,
       });
@@ -1530,14 +1665,10 @@ const server = http.createServer(async (req, res) => {
       const token = url.searchParams.get("token") || "";
       if (!pairTokenOk(token)) return sendHtml(res, 403, pageShell("Forbidden", "<h1>Forbidden</h1>"));
       const phone = url.searchParams.get("phone") || "";
-      if (!phone) return sendHtml(res, 200, pairPage(token));
-      try {
-        const code = await requestPairing(phone);
-        sendHtml(res, 200, pairPage(token, { phone, code }));
-      } catch (e) {
-        sendHtml(res, 400, pairPage(token, { phone, error: e instanceof BadRequest ? e.message : "pairing failed" }));
-      }
-      return;
+      // Never create a code just because the page was opened or reloaded. That
+      // silently burned another request against WhatsApp's rate limit and handed
+      // out codes nobody typed. Only the button (POST /pair) asks for a code.
+      return sendHtml(res, 200, pairPage(token, { phone }));
     }
   }
 
@@ -1553,7 +1684,7 @@ const server = http.createServer(async (req, res) => {
         if (!pairTokenOk(token)) return sendHtml(res, 403, pageShell("Forbidden", "<h1>Forbidden</h1>"));
         const phone = String(data.phone || "");
         const code = await requestPairing(phone);
-        sendHtml(res, 200, pairPage(token, { phone, code }));
+        sendHtml(res, 200, pairPage(token, { phone, code, requestedAt: lastPairAt }));
       } catch (e) {
         const token = String(url.searchParams.get("token") || "");
         if (!pairTokenOk(token)) return sendHtml(res, 403, pageShell("Forbidden", "<h1>Forbidden</h1>"));
@@ -1711,11 +1842,24 @@ async function boot() {
   } catch (e) {
     console.log("warn: restore phase failed:", String(e));
   }
-  if (!hasSessionData()) {
-    // An empty LocalAuth profile makes Chrome look "linked" to the library but
-    // has no credentials. Remove it so WhatsApp shows a real QR/pairing state.
-    try { fs.rmSync(SESSION_PROFILE_DIR, { recursive: true, force: true }); } catch (e) {}
+  if (!hasLinkMarker()) {
+    // No completed WhatsApp login on this profile. Chromium always writes files
+    // like "Local State" into an empty profile, so the file listing cannot prove
+    // that WhatsApp is linked. A leftover or half-restored profile makes the web
+    // app start with a dead identity: the phone accepts a scan or code, then the
+    // link never completes. Throw it away so every attempt starts clean.
+    let removed = false;
+    if (fs.existsSync(SESSION_PROFILE_DIR)) {
+      try { fs.rmSync(SESSION_PROFILE_DIR, { recursive: true, force: true }); removed = true; } catch (e) {}
+    }
+    removeQr();
+    console.log(removed
+      ? "info: discarded the unlinked WhatsApp profile — starting from a clean browser profile"
+      : "info: no linked WhatsApp profile yet — starting from a clean browser profile");
     setWaState("needs_qr", "no saved WhatsApp session; waiting for QR or pairing code");
+  } else {
+    const marker = readLinkMarker();
+    if (marker && marker.wid) console.log(`info: restoring linked WhatsApp session (${marker.wid})`);
   }
   await initializeWhatsApp("startup");
 }
