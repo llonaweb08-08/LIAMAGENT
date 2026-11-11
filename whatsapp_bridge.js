@@ -1395,6 +1395,31 @@ function readBody(req, limit) {
   });
 }
 
+// Stop WhatsApp Web's pairing-code mode and go back to QR mode.
+// requestPairingCode() installs a repeating timer inside the page that retries
+// the alt-device-link request every few minutes. When WhatsApp rate-limits the
+// account, that timer keeps hitting the limit in the background and the QR
+// stops rotating, so a failed code attempt must always be cancelled.
+async function cancelPairing() {
+  let cleared = false;
+  try {
+    if (client.pupPage) {
+      cleared = await client.pupPage.evaluate(() => {
+        let had = false;
+        try {
+          if (window.codeInterval) { clearInterval(window.codeInterval); window.codeInterval = null; had = true; }
+        } catch (e) {}
+        return had;
+      });
+    }
+  } catch (e) {}
+  try {
+    if (typeof client.cancelPairingCode === "function") await client.cancelPairingCode();
+  } catch (e) { console.log("warn: cancelPairingCode failed:", String(e).split("\n")[0]); }
+  if (waState !== "ready") setWaState("needs_qr", "pairing cancelled; scan the QR code");
+  return cleared;
+}
+
 async function requestPairing(phone) {
   const normalized = String(phone || "").replace(/\D/g, "");
   if (!/^\d{7,15}$/.test(normalized)) {
@@ -1412,7 +1437,10 @@ async function requestPairing(phone) {
     if (!client.pupPage) throw new BadRequest("WhatsApp is still starting — try again in a few seconds");
     try {
       const code = await Promise.race([
-        client.requestPairingCode(normalized, true),
+        // The third argument is the page-side retry interval. Using the largest
+        // allowed delay stops WhatsApp Web from re-requesting a code in the
+        // background after a rate limit.
+        client.requestPairingCode(normalized, true, 2147483647),
         sleep(90000).then(() => { throw new Error("the phone-code screen did not appear within 90 seconds"); }),
       ]);
       lastPairCode = String(code || "");
@@ -1425,6 +1453,7 @@ async function requestPairing(phone) {
       pairingError = msg;
       noteWaEvent("pairing_failed", msg);
       console.log("warn: pairing code failed:", msg);
+      await cancelPairing();
       throw new BadRequest("could not generate a pairing code: " + msg);
     }
   })();
@@ -1435,7 +1464,7 @@ async function requestPairing(phone) {
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url || "/", "http://localhost");
   const pathname = url.pathname;
-  const publicGet = req.method === "GET" && ["/health", "/ready", "/status", "/qr", "/pair", "/diag"].includes(pathname);
+  const publicGet = req.method === "GET" && ["/health", "/ready", "/status", "/qr", "/pair", "/diag", "/cancelpair"].includes(pathname);
 
   if (publicGet) {
     if (pathname === "/health") {
@@ -1450,6 +1479,20 @@ const server = http.createServer(async (req, res) => {
     }
     if (pathname === "/status") {
       sendJson(res, 200, statusPayload());
+      return;
+    }
+    if (pathname === "/cancelpair") {
+      const token = url.searchParams.get("token") || "";
+      if (!pairTokenOk(token)) return sendJson(res, 403, { ok: false, msg: "forbidden" });
+      try {
+        const cleared = await Promise.race([
+          cancelPairing(),
+          sleep(20000).then(() => { throw new Error("cancel timed out"); }),
+        ]);
+        sendJson(res, 200, { ok: true, clearedPageTimer: cleared, ...statusPayload() });
+      } catch (e) {
+        sendJson(res, 500, { ok: false, msg: String(e && e.message ? e.message : e) });
+      }
       return;
     }
     if (pathname === "/diag") {
