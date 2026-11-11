@@ -1,6 +1,10 @@
 const { Client, LocalAuth, MessageMedia } = require("whatsapp-web.js");
 const { spawn, spawnSync } = require("child_process");
 
+// Timestamp of this process. /status exposes it so an OOM kill or crash shows up
+// as a fresh start instead of silently looking like a normal reconnect.
+const STARTED_AT = Date.now();
+
 // ---------------------------------------------------------------------------
 // WhatsApp Web load guard
 // ---------------------------------------------------------------------------
@@ -136,8 +140,14 @@ let sync;
 try { sync = require("./supabase_sync"); }
 catch (e) { sync = { restoreSession: async()=>({restored:false}), restoreDb: async()=>({restored:false}), backupSession: async()=>({ok:false}), backupDb: async()=>({ok:false}), backupNow: async()=>({ok:false}), sanitizeChromeLocks: ()=>0, startPeriodicBackup: ()=>null, stopPeriodicBackup: ()=>{}, configured: ()=>false }; }
 
-process.on("unhandledRejection", (r) => { console.log("\n💀 UNHANDLED REJECTION:", String(r && r.stack ? r.stack : r)); });
-process.on("uncaughtException", (e) => { console.log("\n💀 UNCAUGHT EXCEPTION:", String(e && e.stack ? e.stack : e)); });
+process.on("unhandledRejection", (r) => {
+  noteWaEvent("unhandledRejection", String(r && r.message ? r.message : r).slice(0, 180));
+  console.log("\n💀 UNHANDLED REJECTION:", String(r && r.stack ? r.stack : r));
+});
+process.on("uncaughtException", (e) => {
+  noteWaEvent("uncaughtException", String(e && e.message ? e.message : e).slice(0, 180));
+  console.log("\n💀 UNCAUGHT EXCEPTION:", String(e && e.stack ? e.stack : e));
+});
 
 // ---------------------------------------------------------------------------
 // Paths and shared config
@@ -326,6 +336,13 @@ function puppeteerArgs() {
   const base = [
     "--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage",
     "--disable-gpu", "--no-first-run", "--no-zygote",
+    // Memory trims for Render's 512 MiB free instance. WhatsApp Web alone is
+    // heavy and the container is killed as soon as it goes over the limit,
+    // which also kills an in-progress link.
+    "--disable-extensions", "--disable-background-networking", "--disable-default-apps",
+    "--disable-sync", "--disable-breakpad", "--metrics-recording-only", "--mute-audio",
+    "--disable-component-update", "--no-default-browser-check", "--renderer-process-limit=2",
+    "--disable-features=Translate,BackForwardCache,MediaRouter,OptimizationHints,AcceptCHFrame",
   ];
   if (process.env.LIAM_CHROME_SINGLE_PROCESS === "1") base.push("--single-process");
   return base;
@@ -348,13 +365,36 @@ let pairingInFlight = null;
 // read from a phone, so /diag exposes the last few events instead.
 const waEvents = [];
 function noteWaEvent(name, extra) {
-  waEvents.push({ at: Date.now(), name, detail: extra ? String(extra).slice(0, 200) : "" });
-  if (waEvents.length > 30) waEvents.shift();
+  try {
+    waEvents.push({ at: Date.now(), name, detail: extra ? String(extra).slice(0, 200) : "" });
+    if (waEvents.length > 30) waEvents.shift();
+  } catch (e) {}
 }
 
 function setWaState(state, detail = "") {
   waState = state;
   waStateDetail = detail || "";
+}
+
+// True while the phone is completing a QR scan or a phone-code login. Nothing
+// may reload or restart the browser in this window: doing so cancels the
+// handshake and leaves a "zombie" device on the phone while the server falls
+// back to a new QR.
+function linkHandshakeActive() {
+  return waState === "linking" &&
+    Date.now() - Math.max(lastPairAt || 0, authAt || 0) < 5 * 60 * 1000;
+}
+
+// Real container memory (includes Chromium). Render kills the instance when the
+// free plan's limit is exceeded, so this is the number that matters.
+function containerMemoryMiB() {
+  for (const file of ["/sys/fs/cgroup/memory.current", "/sys/fs/cgroup/memory/memory.usage_in_bytes"]) {
+    try {
+      const raw = Number(fs.readFileSync(file, "utf8").trim());
+      if (Number.isFinite(raw) && raw > 0) return Math.round(raw / 1048576);
+    } catch (e) {}
+  }
+  return null;
 }
 
 function profileHasCredentials() {
@@ -843,8 +883,7 @@ client.on("qr", async (qr) => {
   // back to "scan me" while authentication finishes. The same applies to a
   // phone-code login: WhatsApp Web keeps emitting QRs behind the code screen,
   // and showing them would hide that a link is in progress.
-  const pairingWindow = waState === "linking" &&
-    Date.now() - Math.max(lastPairAt || 0, authAt || 0) < 5 * 60 * 1000;
+  const pairingWindow = linkHandshakeActive();
   if (waState === "ready" || pairingWindow) {
     return;
   }
@@ -925,7 +964,15 @@ client.on("authenticated", () => {
     } catch (e) {}
   }, 10000);
 });
-client.on("auth_failure", (m) => { removeQr(); clearLinkMarker(); setWaState("error", "WhatsApp auth failed"); noteWaEvent("auth_failure", m); console.log("\n❌ AUTH FAILED:", String(m)); stopAgent(); setTimeout(() => process.exit(1), 5000); });
+client.on("auth_failure", (m) => {
+  removeQr();
+  clearLinkMarker();
+  setWaState("error", "WhatsApp auth failed");
+  noteWaEvent("auth_failure", m);
+  console.log("\n❌ AUTH FAILED:", String(m));
+  stopAgent();
+  autoReset("WhatsApp rejected the login");
+});
 client.on("loading_screen", (percent) => { if (Number(percent) >= 100) console.log("info: WhatsApp Web loaded 100%"); });
 client.on("ready", handleReady);
 let disconnectCount = 0;
@@ -941,7 +988,7 @@ client.on("disconnected", (r) => {
     // a clean QR instead of restoring it.
     clearLinkMarker();
     setWaState("error", "WhatsApp logged out");
-    setTimeout(() => process.exit(1), 5000);
+    autoReset("the phone removed this device");
     return;
   }
   const now = Date.now();
@@ -952,7 +999,7 @@ client.on("disconnected", (r) => {
   disconnectCount += 1;
   if (disconnectCount > 2) {
     setWaState("error", "WhatsApp keeps disconnecting");
-    setTimeout(() => process.exit(1), 5000);
+    autoReset("WhatsApp keeps disconnecting");
     return;
   }
   // Keep the freshly-linked profile alive: close the broken browser and start
@@ -964,8 +1011,7 @@ client.on("disconnected", (r) => {
       // Never tear the browser down in the middle of a scan or phone-code
       // handshake: WhatsApp Web reconnects on its own, and a restart here is
       // exactly what leaves a zombie device on the phone.
-      if (waState === "linking" &&
-        Date.now() - Math.max(lastPairAt || 0, authAt || 0) < 5 * 60 * 1000) {
+      if (linkHandshakeActive()) {
         noteWaEvent("reconnect_deferred", "link in progress");
         console.log("info: not restarting the browser while a link is being completed");
         return;
@@ -1385,6 +1431,9 @@ function statusPayload() {
     needsQr: waState === "needs_qr",
     hasSessionData: hasSessionData(),
     linkedMarker: hasLinkMarker(),
+    startedAt: STARTED_AT,
+    uptimeSeconds: Math.round((Date.now() - STARTED_AT) / 1000),
+    memoryMiB: containerMemoryMiB(),
     lastQrAt: waLastQrAt || null,
     lastError: waInitError ? waInitError.split("\n")[0].slice(0, 300) : "",
     pairingEnabled: true,
@@ -1492,12 +1541,13 @@ async function cancelPairing() {
 // half-linked state; this returns the browser to a clean first-run profile
 // without needing a Render restart.
 let resetInFlight = null;
-async function resetWhatsApp(reason) {
+async function resetWhatsApp(reason, opts = {}) {
   if (resetInFlight) return resetInFlight;
+  const wipe = opts.wipe !== false;
   resetInFlight = (async () => {
-    noteWaEvent("reset", reason || "manual reset");
-    console.log("\n♻️ Resetting WhatsApp:", reason || "manual reset");
-    setWaState("starting", "resetting WhatsApp (clean profile)");
+    noteWaEvent("reset", `${reason || "manual reset"}${wipe ? "" : " (profile kept)"}`);
+    console.log(`\n♻️ Resetting WhatsApp: ${reason || "manual reset"}${wipe ? " (clean profile)" : " (profile kept)"}`);
+    setWaState("starting", wipe ? "resetting WhatsApp (clean profile)" : "recycling the browser (profile kept)");
     stopAgent();
     readyHandled = false;
     lastPairCode = null;
@@ -1507,22 +1557,66 @@ async function resetWhatsApp(reason) {
     waInjectDiag = "";
     waInitError = "";
     removeQr();
-    clearLinkMarker();
+    if (wipe) clearLinkMarker();
     try {
       if (client && typeof client.destroy === "function") {
         await Promise.race([client.destroy(), sleep(15000)]);
       }
     } catch (e) { console.log("warn: reset could not close the browser:", String(e).split("\n")[0]); }
     try { client.pupPage = null; client.pupBrowser = null; } catch (e) {}
-    try { fs.rmSync(SESSION_PROFILE_DIR, { recursive: true, force: true }); } catch (e) {}
-    setWaState("needs_qr", "clean profile; waiting for a QR code");
-    await initializeWhatsApp("reset");
+    if (wipe) {
+      try { fs.rmSync(SESSION_PROFILE_DIR, { recursive: true, force: true }); } catch (e) {}
+    }
+    setWaState("needs_qr", wipe ? "clean profile; waiting for a QR code" : "browser recycled; waiting for a QR code");
+    await initializeWhatsApp(wipe ? "reset" : "browser recycle");
   })();
   try {
     return await resetInFlight;
   } finally {
     resetInFlight = null;
   }
+}
+
+// Recover in place instead of exiting. Exiting kills the HTTP server, so the
+// pairing page shows Render's "service unavailable" page exactly when the phone
+// is mid-link. Only a repeated failure loop falls back to a container restart.
+let autoResetTimes = [];
+let lastMemoryReset = 0;
+function autoReset(reason) {
+  const now = Date.now();
+  autoResetTimes = autoResetTimes.filter((t) => now - t < 10 * 60 * 1000);
+  if (autoResetTimes.length >= 3) {
+    noteWaEvent("exit", reason);
+    console.log("warn: automatic recovery keeps failing; exiting so Render restarts the container");
+    setTimeout(() => process.exit(1), 3000);
+    return;
+  }
+  autoResetTimes.push(now);
+  setTimeout(() => {
+    resetWhatsApp(reason).catch((e) => console.log("warn: auto reset failed:", String(e)));
+  }, 3000);
+}
+
+// Render kills the whole container (and any in-progress link) when the free
+// plan's memory limit is exceeded. Recycle just the browser before that happens.
+// The profile is kept, so a linked account reconnects without re-pairing.
+let memoryGuardTimer = null;
+function startMemoryGuard() {
+  if (memoryGuardTimer) return;
+  const limit = Math.max(300, Number.parseInt(process.env.LIAM_MEM_LIMIT_MB || "460", 10));
+  memoryGuardTimer = setInterval(() => {
+    const used = containerMemoryMiB();
+    if (!used || used < limit) return;
+    if (resetInFlight || linkHandshakeActive()) return;
+    if (waState === "starting" || waState === "restoring") return;
+    if (Date.now() - lastMemoryReset < 5 * 60 * 1000) return;
+    lastMemoryReset = Date.now();
+    console.log(`warn: memory at ${used} MiB (limit ${limit} MiB); recycling the browser to avoid an out-of-memory kill`);
+    noteWaEvent("memory_reset", `${used} MiB`);
+    resetWhatsApp(`memory guard (${used} MiB)`, { wipe: false })
+      .catch((e) => console.log("warn: memory recycle failed:", String(e)));
+  }, 20000);
+  if (typeof memoryGuardTimer.unref === "function") memoryGuardTimer.unref();
 }
 
 async function requestPairing(phone) {
@@ -1641,6 +1735,10 @@ const server = http.createServer(async (req, res) => {
         pairingRequestedAt: lastPairAt || null,
         authenticatedAt: authAt || null,
         codeAgeSeconds: lastPairCode && lastPairAt ? Math.round((Date.now() - lastPairAt) / 1000) : null,
+        linkHandshakeActive: linkHandshakeActive(),
+        startedAt: STARTED_AT,
+        uptimeSeconds: Math.round((Date.now() - STARTED_AT) / 1000),
+        memoryMiB: containerMemoryMiB(),
         linkedMarker: hasLinkMarker(),
         marker: readLinkMarker(),
         profileFiles: (() => {
@@ -1862,6 +1960,7 @@ async function boot() {
     if (marker && marker.wid) console.log(`info: restoring linked WhatsApp session (${marker.wid})`);
   }
   await initializeWhatsApp("startup");
+  startMemoryGuard();
 }
 
 // Render sends SIGTERM before stopping a free instance. Save the profile and
