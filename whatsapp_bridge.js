@@ -380,14 +380,30 @@ function linkHandshakeActive() {
 
 // Real container memory (includes Chromium). Render kills the instance when the
 // free plan's limit is exceeded, so this is the number that matters.
-function containerMemoryMiB() {
-  for (const file of ["/sys/fs/cgroup/memory.current", "/sys/fs/cgroup/memory/memory.usage_in_bytes"]) {
+function containerMemoryInfo() {
+  const readNum = (file) => {
     try {
       const raw = Number(fs.readFileSync(file, "utf8").trim());
-      if (Number.isFinite(raw) && raw > 0) return Math.round(raw / 1048576);
-    } catch (e) {}
-  }
-  return null;
+      return Number.isFinite(raw) && raw > 0 ? raw : null;
+    } catch (e) { return null; }
+  };
+  const used = readNum("/sys/fs/cgroup/memory.current") ?? readNum("/sys/fs/cgroup/memory/memory.usage_in_bytes");
+  const limit = readNum("/sys/fs/cgroup/memory.max") ?? readNum("/sys/fs/cgroup/memory/memory.limit_in_bytes");
+  let anon = null, file = null;
+  try {
+    for (const line of fs.readFileSync("/sys/fs/cgroup/memory.stat", "utf8").split("\n")) {
+      const parts = line.trim().split(/\s+/);
+      if (parts.length !== 2) continue;
+      if (parts[0] === "anon" || parts[0] === "total_rss") anon = anon ?? Number(parts[1]);
+      if (parts[0] === "file" || parts[0] === "total_cache") file = file ?? Number(parts[1]);
+    }
+  } catch (e) {}
+  const mib = (n) => (Number.isFinite(n) && n > 0 ? Math.round(n / 1048576) : null);
+  return { usedMiB: mib(used), limitMiB: mib(limit), anonMiB: mib(anon), fileMiB: mib(file) };
+}
+
+function containerMemoryMiB() {
+  return containerMemoryInfo().usedMiB;
 }
 
 function profileHasCredentials() {
@@ -1427,6 +1443,7 @@ function statusPayload() {
     startedAt: STARTED_AT,
     uptimeSeconds: Math.round((Date.now() - STARTED_AT) / 1000),
     memoryMiB: containerMemoryMiB(),
+    memory: containerMemoryInfo(),
     lastQrAt: waLastQrAt || null,
     lastError: waInitError ? waInitError.split("\n")[0].slice(0, 300) : "",
     pairingEnabled: true,
@@ -1736,6 +1753,7 @@ const server = http.createServer(async (req, res) => {
         startedAt: STARTED_AT,
         uptimeSeconds: Math.round((Date.now() - STARTED_AT) / 1000),
         memoryMiB: containerMemoryMiB(),
+        memory: containerMemoryInfo(),
         linkedMarker: hasLinkMarker(),
         marker: readLinkMarker(),
         profileFiles: (() => {
