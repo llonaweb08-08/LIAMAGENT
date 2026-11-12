@@ -754,16 +754,21 @@ async function ownerIdsInGroup(jid) {
 }
 
 async function sendApprovalPrompt(text, groupJid) {
+  // Group asks stay in the group. Never DM the owners for something that
+  // happened in a group: the owner replies in the group and everyone there can
+  // see that Liam is waiting for a yes/no.
   if (groupJid) {
     const owners = await ownerIdsInGroup(groupJid);
-    if (owners.length) {
-      const tags = owners.map((o) => "@" + o).join(" ");
-      try {
-        await wa.sendMessage(groupJid, `${tags} ${text}`.trim(), {
-          mentions: owners.map((o) => o + "@s.whatsapp.net"),
-        });
-        return true;
-      } catch (e) { console.log("warn: group approval prompt failed:", String(e)); }
+    const tags = owners.map((o) => "@" + o).join(" ");
+    const body = tags ? `${tags} ${text}`.trim() : text;
+    try {
+      await wa.sendMessage(groupJid, body, owners.length
+        ? { mentions: owners.map((o) => o + "@s.whatsapp.net") }
+        : undefined);
+      return true;
+    } catch (e) {
+      console.log("warn: group approval prompt failed:", String(e));
+      return false;
     }
   }
   let sent = 0;
@@ -819,18 +824,24 @@ function permissionPromptText(p) {
   ].join("\n");
 }
 
-async function createPermissionRequest(jid, phone, text) {
+async function createPermissionRequest(jid, phone, text, quoted) {
   sweepTemp();
   const bare = bareId(phone);
   for (const p of pendingPerms.values()) {
     if (p.jid === jid && p.phone === bare) {
       p.text = String(text || "").slice(0, 2000);
+      p.quoted = quoted || p.quoted;
       p.ts = Date.now();
       return p;
     }
   }
   const id = makeId("p");
-  const p = { id, jid, phone: bare, text: String(text || "").slice(0, 2000), ts: Date.now() };
+  const p = {
+    id, jid, phone: bare,
+    text: String(text || "").slice(0, 2000),
+    quoted: quoted || null,
+    ts: Date.now(),
+  };
   pendingPerms.set(id, p);
   trimPending(pendingPerms);
   const sent = await sendApprovalPrompt(permissionPromptText(p), jid);
@@ -916,7 +927,7 @@ async function handleApprovalCommand(text, phone, chat, isGroup) {
     try { await wa.sendMessage(p.jid, `okay, I'll reply to ${p.phone} for the next 3 hours.`); } catch (e) {}
     try {
       const reply = await askLiam(p.text, p.phone, true, p.jid, true, false);
-      const sent = await wa.sendMessage(p.jid, reply);
+      const sent = await sendLong(p.jid, reply, p.quoted ? { quoted: p.quoted } : undefined);
       rememberLiamMessage(p.jid, messageId(sent));
     } catch (e) { console.log("warn: approved reply failed:", String(e)); }
     if (chat !== p.jid) { try { await wa.sendMessage(chat, `okay — allowed ${p.phone} for 3 hours.`); } catch (e) {} }
@@ -1216,11 +1227,13 @@ function splitMessage(text, limit = 4000) {
   return chunks;
 }
 
-async function sendLong(to, text) {
+async function sendLong(to, text, options) {
   let last = null;
+  let first = true;
   for (const chunk of splitMessage(text)) {
     if (!chunk.trim()) continue;
-    last = await wa.sendMessage(to, chunk);
+    last = await wa.sendMessage(to, chunk, first ? options : undefined);
+    first = false;
   }
   return last;
 }
@@ -1352,7 +1365,7 @@ async function handleIncomingMessage(msg) {
       const decision = tempDecision(from, phone);
       if (decision === "deny") return;
       if (decision !== "allow") {
-        const p = await createPermissionRequest(from, phone, text);
+        const p = await createPermissionRequest(from, phone, text, msg);
         if (!p) {
           try { await wa.sendMessage(from, "I couldn't reach an owner to approve that, so I didn't reply."); } catch (e) {}
           return;
@@ -1366,7 +1379,9 @@ async function handleIncomingMessage(msg) {
 
     const reply = await askLiam(text, phone, true, from, mentioned, replyingToLiam);
     console.log(`\n📩 [${from}] ${who} ${phone}: ${text}\n💬 Liam: ${reply}\n`);
-    const sent = await sendLong(from, reply);
+    // In a group, answer the exact message that triggered her with a WhatsApp
+    // quoted reply instead of dropping a bare line into the chat.
+    const sent = await sendLong(from, reply, { quoted: msg });
     rememberLiamMessage(from, messageId(sent));
   } catch (e) {
     lastInboundError = String(e && e.message ? e.message : e).slice(0, 400);

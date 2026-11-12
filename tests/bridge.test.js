@@ -428,6 +428,21 @@ test('bridge endpoint security and actions', async (t) => {
     bridge.pendingTools.clear();
   });
 
+  await t.test('group permission prompts stay in the group, never a DM', async () => {
+    bridge.pendingPerms.clear();
+    const group = '2348000000000-123@g.us';
+    const member = '2348999999999';
+    fake.sent.length = 0;
+    const p = await bridge.createPermissionRequest(group, member, 'hello there', { key: { id: 'TRIGGER' } });
+    assert.ok(p, 'request should be created');
+    const sent = fake.sent.at(-1);
+    assert.equal(sent.to, group, 'prompt must go to the group');
+    assert.match(sent.content.text, /Group permission needed/);
+    const dm = fake.sent.some((m) => String(m.to).endsWith('@s.whatsapp.net'));
+    assert.equal(dm, false, 'no owner DM may be sent for a group request');
+    bridge.pendingPerms.clear();
+  });
+
   await t.test('owners reach InstaBox directly but see a clear config error', async () => {
     const response = await post({ action: 'vps_exec', command: 'id', sender: OWNER });
     assert.equal(response.status, 400);
