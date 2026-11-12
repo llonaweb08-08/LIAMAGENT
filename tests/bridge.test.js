@@ -45,6 +45,7 @@ fs.writeFileSync(path.join(baileysStubDir, 'index.js'), [
   "    return 'ABCD1234';",
   '  }',
   '  async sendMessage(to, content, options) {',
+  '    if (typeof content === "string") throw new TypeError("Cannot use \'in\' operator to search for \'text\' in " + content);',
   '    this.sent.push({ to, content, options });',
   "    return { key: { id: 'MSG-' + this.sent.length } };",
   '  }',
@@ -150,7 +151,7 @@ test('bridge endpoint security and actions', async (t) => {
     assert.equal(response.json.ok, true);
     const sent = fake.sent.at(-1);
     assert.equal(sent.to, `${OWNER}@s.whatsapp.net`);
-    assert.equal(sent.content, 'hello');
+    assert.deepEqual(sent.content, { text: 'hello' });
   });
 
   await t.test('rejects owner-only actions from non-owners', async () => {
@@ -396,7 +397,7 @@ test('bridge endpoint security and actions', async (t) => {
     );
     assert.equal(confirmed, true);
     assert.equal(bridge.pendingTools.has(second.id), false, 'approval is one-time');
-    assert.match(String(fake.sent.at(-1).content), /vps_exec failed|InstaBox/);
+    assert.match(String(fake.sent.at(-1).content.text), /vps_exec failed|InstaBox/);
   });
 
   await t.test('applies .allowdm semantics', async () => {

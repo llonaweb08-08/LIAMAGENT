@@ -645,7 +645,10 @@ const wa = {
   get connected() { return !!(sock && registered); },
   async sendMessage(jid, content, options) {
     if (!sock) throw new Error("WhatsApp is not connected");
-    const sent = await sock.sendMessage(jidForSend(jid), content, options);
+    // Baileys requires an object with `text`; unlike whatsapp-web.js it throws
+    // "Cannot use 'in' operator to search for 'text'" when given a plain string.
+    const payload = typeof content === "string" ? { text: content } : content;
+    const sent = await sock.sendMessage(jidForSend(jid), payload, options);
     lastOutboundAt = Date.now();
     return sent;
   },
