@@ -355,6 +355,24 @@ let agentPending = null;         // { resolve, reject, timeout, id } for the one
 let agentRequestId = 0;
 let agentQueue = Promise.resolve();
 
+// Safe diagnostics for /diag. Never store message text: only counts, timestamps,
+// a masked last-4 phone, and the last error. This is how we tell a routing
+// problem from a model/provider problem without access to Render's log stream.
+let inboundCount = 0;
+let lastInboundAt = 0;
+let lastInboundKind = "";
+let lastInboundPhone = "";
+let lastInboundError = "";
+let lastOutboundAt = 0;
+let lastAgentRequestAt = 0;
+let lastAgentReplyAt = 0;
+let lastAgentError = "";
+let agentStderrTail = "";
+function maskPhone(value) {
+  const p = barePhone(value);
+  return p ? "***" + p.slice(-4) : "";
+}
+
 function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
 
 // A plain Promise.race leaves the losing timer running, which keeps a Node test
@@ -404,7 +422,7 @@ function startAgent() {
       PYTHONUNBUFFERED: "1",
       LIAM_DATA_DIR: DATA_DIR,
     },
-    stdio: ["pipe", "pipe", "inherit"]
+    stdio: ["pipe", "pipe", "pipe"]
     });
   } catch (e) {
     agentProc = null;
@@ -432,14 +450,27 @@ function startAgent() {
       let msg;
       try { msg = JSON.parse(line); } catch { console.log("[agent]", line); continue; }
       if (!msg || typeof msg !== "object") continue;
-      if (msg.error) { console.log("\n💀 AGENT ERROR:", msg.error); failPending(new Error(msg.error)); continue; }
+      if (msg.error) {
+        lastAgentError = String(msg.error).slice(0, 400);
+        console.log("\n💀 AGENT ERROR:", msg.error);
+        failPending(new Error(msg.error));
+        continue;
+      }
       if (Object.prototype.hasOwnProperty.call(msg, "reply")) {
         if (!agentPending) { console.log("[agent] stale reply ignored"); continue; }
         const p = agentPending; agentPending = null;
         try { clearTimeout(p.timeout); } catch (e) {}
+        lastAgentReplyAt = Date.now();
         p.resolve(msg.reply == null ? "" : String(msg.reply));
       }
     }
+  });
+  proc.stderr.setEncoding("utf8");
+  proc.stderr.on("data", (chunk) => {
+    const text = String(chunk);
+    // Keep the tail for /diag and still forward it to Render's log stream.
+    agentStderrTail = (agentStderrTail + text).slice(-4000);
+    try { process.stderr.write(text); } catch (e) {}
   });
   proc.stdin.on("error", failPending);
   proc.on("exit", (code, signal) => {
@@ -614,7 +645,9 @@ const wa = {
   get connected() { return !!(sock && registered); },
   async sendMessage(jid, content, options) {
     if (!sock) throw new Error("WhatsApp is not connected");
-    return sock.sendMessage(jidForSend(jid), content, options);
+    const sent = await sock.sendMessage(jidForSend(jid), content, options);
+    lastOutboundAt = Date.now();
+    return sent;
   },
   async groupMetadata(jid) {
     if (!sock) throw new Error("WhatsApp is not connected");
@@ -627,6 +660,8 @@ const wa = {
 };
 
 function askLiam(user, phone, isGroup, groupJid, mentioned, replyTo) {
+  lastAgentRequestAt = Date.now();
+  lastAgentError = "";
   const job = () => new Promise((resolve, reject) => {
     const proc = startAgent();
     if (!proc || proc.exitCode !== null || !proc.stdin || proc.stdin.destroyed) {
@@ -1234,6 +1269,10 @@ async function handleIncomingMessage(msg) {
     const from = String(key.remoteJid || "");
     if (!from || from === "status@broadcast" || from.endsWith("@broadcast") || from.endsWith("@newsletter")) return;
     if (seenMessage(key.id)) return;
+    inboundCount += 1;
+    lastInboundAt = Date.now();
+    lastInboundKind = from.endsWith("@g.us") ? "group" : "dm";
+    lastInboundError = "";
 
     const content = normalizeMessageContent(msg.message);
     if (!content) return;
@@ -1248,7 +1287,12 @@ async function handleIncomingMessage(msg) {
       ? (key.participant || key.participantPn || key.senderPn || from)
       : (key.remoteJidAlt || from);
     const phone = await resolvePhone(senderId, msg);
-    if (!phone) { console.log("warn: could not resolve sender", senderId); return; }
+    if (!phone) {
+      lastInboundError = "could not resolve sender to a phone number";
+      console.log("warn: could not resolve sender", senderId);
+      return;
+    }
+    lastInboundPhone = phone;
 
     const context = contentContext(content, type);
     const replyTo = context.stanzaId ? String(context.stanzaId) : null;
@@ -1269,7 +1313,11 @@ async function handleIncomingMessage(msg) {
         return;
       }
       const allowed = dmAllowed(phone);
-      if (!allowed) return;
+      if (!allowed) {
+        lastInboundKind = "dm (not allowed)";
+        lastInboundError = "sender is not an owner/admin and DMs are closed";
+        return;
+      }
       const reply = await askLiam(text, phone, false, "", false, false);
       console.log(`\n📩 ${phone}: ${text}\n💬 Liam: ${reply}\n`);
       await sendLong(from, reply);
@@ -1286,7 +1334,10 @@ async function handleIncomingMessage(msg) {
       selfIds.some((id) => id && text.includes("@" + id)) ||
       isNameMention(text);
     const replyingToLiam = !!replyTo && isLiamMessage(from, replyTo);
-    if (!mentioned && !replyingToLiam) return;
+    if (!mentioned && !replyingToLiam) {
+      lastInboundKind = "group (not addressed)";
+      return;
+    }
 
     let who;
     if (OWNERS.includes(phone)) who = "owner";
@@ -1314,7 +1365,10 @@ async function handleIncomingMessage(msg) {
     console.log(`\n📩 [${from}] ${who} ${phone}: ${text}\n💬 Liam: ${reply}\n`);
     const sent = await sendLong(from, reply);
     rememberLiamMessage(from, messageId(sent));
-  } catch (e) { console.log(`\n💀 MSG HANDLER ERROR: ${String(e)}`); }
+  } catch (e) {
+    lastInboundError = String(e && e.message ? e.message : e).slice(0, 400);
+    console.log(`\n💀 MSG HANDLER ERROR: ${String(e)}`);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1912,11 +1966,47 @@ const server = http.createServer(async (req, res) => {
       return;
     }
     if (pathname === "/diag") {
-      // Unlinked-startup diagnostics only. Once WhatsApp is linked this page
-      // could expose message text, so it stays closed.
+      // Unlinked-startup diagnostics, plus safe message counters once linked.
+      // Message text is never stored or exposed; the token is required.
       const token = url.searchParams.get("token") || "";
       if (!pairTokenOk(token)) return sendHtml(res, 403, pageShell("Forbidden", "<h1>Forbidden</h1>"));
-      if (waState === "ready") return sendJson(res, 200, { ok: true, status: waState, note: "linked; diagnostics hidden" });
+      const agentAlive = !!(agentProc && agentProc.exitCode === null && !agentProc.killed);
+      if (waState === "ready") {
+        const base = {
+          ok: true,
+          status: waState,
+          note: "linked; message text hidden",
+          agentRunning: agentAlive,
+          inboundCount,
+          lastInboundAt: lastInboundAt || null,
+          lastInboundKind,
+          lastInboundPhone: maskPhone(lastInboundPhone),
+          lastInboundError,
+          lastOutboundAt: lastOutboundAt || null,
+          lastAgentRequestAt: lastAgentRequestAt || null,
+          lastAgentReplyAt: lastAgentReplyAt || null,
+          lastAgentError,
+          agentStderrTail: agentStderrTail.slice(-1200),
+          memoryMiB: containerMemoryMiB(),
+          uptimeSeconds: Math.round((Date.now() - STARTED_AT) / 1000),
+        };
+        if (url.searchParams.get("probe") === "1") {
+          try {
+            const reply = await withTimeout(
+              askLiam("Reply with exactly OK and do not use any tools.", OWNERS[0], false, "", false, false),
+              ASK_TIMEOUT_MS,
+              "probe timed out",
+            );
+            return sendJson(res, 200, { ...base, probeReply: String(reply == null ? "" : reply).slice(0, 600) });
+          } catch (e) {
+            return sendJson(res, 500, {
+              ...base,
+              probeError: String(e && e.message ? e.message : e).slice(0, 600),
+            });
+          }
+        }
+        return sendJson(res, 200, base);
+      }
       let creds = null;
       try { creds = JSON.parse(fs.readFileSync(CREDS_FILE, "utf8")); } catch (e) { creds = null; }
       sendJson(res, 200, {
