@@ -257,6 +257,35 @@ class AgentToolTests(unittest.TestCase):
             self.assertEqual(agent.leave_group("123@g.us", sender=OWNER), "left")
         leave.assert_called_once_with("123@g.us", sender=OWNER)
 
+    def test_send_tools_default_to_the_current_chat(self):
+        jid = "120363000000000000@g.us"
+        with mock.patch.object(agent.wa, "send_message", return_value="sent") as send:
+            agent._tools_for(OWNER, "", False)["send_dm"](text="hi")
+        send.assert_called_once_with(OWNER, "hi", sender=OWNER)
+        with mock.patch.object(agent.wa, "send_message", return_value="sent") as send:
+            agent._tools_for(OWNER, jid, True)["send_dm"](text="hello group")
+        send.assert_called_once_with(jid, "hello group", sender=OWNER)
+        with mock.patch.object(agent.wa, "send_message", return_value="sent") as send:
+            agent._tools_for(OWNER, jid, True)["send_dm"](to="me", text="here")
+        send.assert_called_once_with(jid, "here", sender=OWNER)
+
+    def test_send_tools_honour_an_explicit_recipient(self):
+        with mock.patch.object(agent.wa, "send_message", return_value="sent") as send:
+            agent._tools_for(OWNER, "120363000000000000@g.us", True)["send_dm"](
+                to="2347", text="hi")
+        send.assert_called_once_with("2347", "hi", sender=OWNER)
+
+    def test_media_tools_default_recipient_to_the_chat(self):
+        with mock.patch.object(agent, "send_image", return_value="sent") as image:
+            agent._tools_for(OWNER, "", False)["send_image"](prompt="a cat")
+        image.assert_called_once_with(OWNER, "a cat", sender=OWNER)
+        with mock.patch.object(agent, "send_voice", return_value="sent") as voice:
+            agent._tools_for(OWNER, "1@g.us", True)["send_voice"](text="hi")
+        voice.assert_called_once_with("1@g.us", "hi", sender=OWNER)
+        with mock.patch.object(agent, "screenshot", return_value="sent") as shot:
+            agent._tools_for(OWNER, "", False)["screenshot"](url="https://x.com")
+        shot.assert_called_once_with(OWNER, "https://x.com", sender=OWNER)
+
     def test_memory_tools_are_scoped(self):
         with mock.patch.object(agent, "remember", return_value="ok") as remember:
             agent._tools_for(MEMBER)["remember"](user="owner", fact="fact")
@@ -527,6 +556,28 @@ class SearchAndFetchTests(unittest.TestCase):
             out = agent.web_search("hello")
         self.assertIn("search failed", out)
         self.assertIn("DuckDuckGo", out)
+
+    def test_lite_parser_reads_redirect_links(self):
+        lite = (
+            '<a href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fpage">Example</a>'
+            '<a href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fpage">Dup</a>'
+            '<a href="https://duckduckgo.com/settings">Settings</a>'
+        )
+        with mock.patch.object(agent, "_safe_url", side_effect=lambda value: value):
+            out = agent._ddg_parse_lite(lite)
+        self.assertEqual(len(out), 1)
+        self.assertIn("https://example.com/page", out[0])
+        self.assertIn("Example", out[0])
+
+    def test_search_falls_back_to_lite_when_html_is_empty(self):
+        html = b'<html>no results here</html>'
+        lite = (b'<a href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fpage">'
+                b'Example</a>')
+        with mock.patch.object(agent, "_open_url",
+                               side_effect=[self._Context(html), self._Context(lite)]), \
+                mock.patch.object(agent, "_safe_url", side_effect=lambda value: value):
+            out = agent._search_duckduckgo("hello")
+        self.assertIn("https://example.com/page", out[0])
 
     def test_redirects_are_revalidated(self):
         handler = agent._SafeRedirectHandler()

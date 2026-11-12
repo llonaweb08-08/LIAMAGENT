@@ -60,10 +60,31 @@ services:
         sync: false
       - key: INSTABOX_API_KEY
         sync: false
+      # Optional: leave unset and Liam discovers (or creates) the free machine.
       - key: INSTABOX_MACHINE_ID
+        sync: false
+      # Email (IMAP). Gmail requires an App Password, not the account password,
+      # and "IMAP access" turned on in Gmail settings.
+      - key: LIAM_EMAIL_HOST
+        value: imap.gmail.com
+      - key: LIAM_EMAIL_PORT
+        value: "993"
+      - key: LIAM_EMAIL_USER
+        value: liamagent4q@gmail.com
+      - key: LIAM_EMAIL_PASSWORD
         sync: false
 
       # --- Behaviour --------------------------------------------------------
+      # Bridge waits longer than the agent's per-turn budget so a heavy browser
+      # turn is not cut off mid-work.
+      - key: LIAM_ASK_TIMEOUT_MS
+        value: "240000"
+      - key: LIAM_TURN_BUDGET
+        value: "180"
+      - key: LIAM_BROWSER_TIMEOUT
+        value: "90"
+      - key: LIAM_SCREENSHOT_TIMEOUT
+        value: "75"
       - key: LIAM_GROUP_PERMISSION_MS
         value: "10800000"
       - key: LIAM_TOOL_APPROVAL_MS

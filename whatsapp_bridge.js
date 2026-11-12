@@ -349,7 +349,7 @@ function isLiamMessage(jid, id) {
 }
 const pendingPerms = new Map();  // id -> { id, jid, phone, text, ts }
 const pendingTools = new Map();  // id -> { id, action, payload, actor, chat, isGroup, ts }
-const ASK_TIMEOUT_MS = Math.max(15000, Number.parseInt(process.env.LIAM_ASK_TIMEOUT_MS || "180000", 10));
+const ASK_TIMEOUT_MS = Math.max(15000, Number.parseInt(process.env.LIAM_ASK_TIMEOUT_MS || "240000", 10));
 let agentProc = null;            // spawned python agent process
 let agentPending = null;         // { resolve, reject, timeout, id } for the one in-flight request
 let agentRequestId = 0;
@@ -1393,50 +1393,145 @@ async function handleIncomingMessage(msg) {
 // InstaBox pentest VM (members need one-time owner approval)
 // ---------------------------------------------------------------------------
 const INSTABOX_API_KEY = String(process.env.INSTABOX_API_KEY || "").trim();
-const INSTABOX_MACHINE_ID = String(process.env.INSTABOX_MACHINE_ID || "").trim();
+// Optional: when unset, the first machine in the workspace is used, and one is
+// created from the agent-browser template if the workspace has none yet.
+let INSTABOX_MACHINE_ID = String(process.env.INSTABOX_MACHINE_ID || "").trim();
 const INSTABOX_API_URL = String(process.env.INSTABOX_API_URL || "https://api.instabox.sh").replace(/\/+$/, "").replace(/\/v1$/, "");
 
-async function instaboxExec(command, timeoutSeconds = 120, cwd = "") {
-  if (!INSTABOX_API_KEY || !INSTABOX_MACHINE_ID) {
-    throw new BadRequest("InstaBox is not configured (set INSTABOX_API_KEY and INSTABOX_MACHINE_ID)");
+function instaboxIdempotency(prefix) {
+  const rand = (typeof crypto !== "undefined" && crypto.randomUUID)
+    ? crypto.randomUUID()
+    : Math.random().toString(16).slice(2) + Date.now().toString(16);
+  return `${prefix}-${rand}`;
+}
+
+// One place for every InstaBox HTTP call. Lifecycle calls need an
+// Idempotency-Key; exec does not. Errors carry InstaBox's own code.
+async function instaboxRequest(pathname, opts = {}) {
+  if (!INSTABOX_API_KEY) {
+    throw new BadRequest("InstaBox is not configured (set INSTABOX_API_KEY)");
   }
-  const text = String(command || "").trim();
-  if (!text) throw new BadRequest("command is empty");
-  if (text.length > 8000) throw new BadRequest("command is too long");
-  const timeout = Math.min(600, Math.max(1, Number.parseInt(timeoutSeconds, 10) || 120));
-  const body = { cmd: text, timeoutSeconds: timeout };
-  if (cwd) body.cwd = String(cwd).slice(0, 500);
+  const headers = {
+    "X-API-Key": INSTABOX_API_KEY,
+    "Authorization": "Bearer " + INSTABOX_API_KEY,
+    "Accept": "application/json",
+  };
+  if (opts.body !== undefined) headers["Content-Type"] = "application/json";
+  if (opts.idempotency) headers["Idempotency-Key"] = opts.idempotency;
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), (timeout + 20) * 1000);
+  const ms = Math.max(5000, Number(opts.timeoutMs) || 30000);
+  const timer = setTimeout(() => controller.abort(), ms);
   try {
-    const res = await fetch(`${INSTABOX_API_URL}/v1/machines/${encodeURIComponent(INSTABOX_MACHINE_ID)}/exec`, {
-      method: "POST",
-      headers: {
-        "X-API-Key": INSTABOX_API_KEY,
-        "Authorization": "Bearer " + INSTABOX_API_KEY,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(body),
+    const res = await fetch(INSTABOX_API_URL + pathname, {
+      method: opts.method || "GET",
+      headers,
+      body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
       signal: controller.signal,
     });
     const raw = await res.text();
     let data = {};
     try { data = JSON.parse(raw); } catch (e) { data = { raw }; }
     if (!res.ok) {
-      const detail = String(data.message || data.error || raw || "").slice(0, 400);
-      throw new BadRequest(`InstaBox HTTP ${res.status}${detail ? ": " + detail : ""}`);
+      const err = (data && data.error) || {};
+      const code = err.code ? " " + err.code : "";
+      const detail = String(err.message || data.raw || raw || "").slice(0, 300);
+      throw new BadRequest(`InstaBox HTTP ${res.status}${code}${detail ? ": " + detail : ""}`);
     }
-    const out = [data.stdout, data.stderr].filter((v) => v != null && String(v).length).join("\n");
-    const exit = data.exitCode != null ? data.exitCode : (data.exit_code != null ? data.exit_code : "?");
-    const textOut = `exit=${exit}\n${out || "(no output)"}`;
-    return textOut.length > 8000 ? textOut.slice(0, 8000) + "\n… [truncated]" : textOut;
+    return data;
   } catch (e) {
-    if (e && e.name === "AbortError") throw new BadRequest("InstaBox command timed out");
+    if (e && e.name === "AbortError") throw new BadRequest("InstaBox request timed out");
     if (e instanceof BadRequest) throw e;
     throw new BadRequest(`InstaBox request failed: ${typeName(e)}`);
   } finally {
     clearTimeout(timer);
   }
+}
+
+// Lifecycle changes answer 202 with an operation; follow it to the end.
+async function instaboxWaitOperation(id, timeoutMs = 180000) {
+  const deadline = Date.now() + timeoutMs;
+  let op = null;
+  while (Date.now() < deadline) {
+    op = await instaboxRequest(`/v1/operations/${encodeURIComponent(id)}?wait=25s`, { timeoutMs: 40000 });
+    const state = String((op && op.state) || "");
+    if (state === "succeeded") return op;
+    if (state === "failed") {
+      const err = (op && op.error) || {};
+      throw new BadRequest(`InstaBox operation failed${err.code ? " (" + err.code + ")" : ""}: ${String(err.message || "").slice(0, 200)}`);
+    }
+  }
+  throw new BadRequest("InstaBox operation timed out");
+}
+
+// The workspace has at most one free machine. Reuse it, or create it once.
+async function instaboxMachineId() {
+  if (INSTABOX_MACHINE_ID) return INSTABOX_MACHINE_ID;
+  const list = await instaboxRequest("/v1/machines");
+  const machines = Array.isArray(list && list.machines) ? list.machines : [];
+  if (machines.length) {
+    INSTABOX_MACHINE_ID = String(machines[0].id || "");
+    if (INSTABOX_MACHINE_ID) {
+      console.log("info: InstaBox using machine", INSTABOX_MACHINE_ID);
+      return INSTABOX_MACHINE_ID;
+    }
+  }
+  console.log("info: InstaBox has no machine; creating one (agent-browser)");
+  const op = await instaboxRequest("/v1/machines", {
+    method: "POST",
+    body: { templateId: "agent-browser", name: "liam" },
+    idempotency: instaboxIdempotency("liam-create"),
+  });
+  const done = await instaboxWaitOperation(op && op.id, 240000);
+  const machine = (done && done.machine) || {};
+  INSTABOX_MACHINE_ID = String((op && op.machineId) || machine.id || "");
+  if (!INSTABOX_MACHINE_ID) throw new BadRequest("InstaBox created a machine but returned no id");
+  console.log("info: InstaBox created machine", INSTABOX_MACHINE_ID);
+  return INSTABOX_MACHINE_ID;
+}
+
+// A free machine pauses when idle. `wake` resumes an idle-suspended machine
+// (no Idempotency-Key needed); a manual stop/suspend needs `start`. Either way
+// exec would auto-resume an idle machine, so this is a best-effort head start.
+async function instaboxEnsureRunning(id) {
+  let info;
+  try {
+    info = await instaboxRequest(`/v1/machines/${encodeURIComponent(id)}`);
+  } catch (e) {
+    return; // let exec surface the real error
+  }
+  if (String(info && info.state) === "running") return;
+  console.log("info: InstaBox machine is", String(info && info.state) || "unknown", "- waking it");
+  try {
+    await instaboxRequest(`/v1/machines/${encodeURIComponent(id)}/wake`, { method: "POST" });
+    return;
+  } catch (e) {
+    if (!(e instanceof BadRequest) || !/HTTP 409/.test(e.message)) return;
+  }
+  const op = await instaboxRequest(`/v1/machines/${encodeURIComponent(id)}/start`, {
+    method: "POST",
+    idempotency: instaboxIdempotency("liam-start"),
+  });
+  if (op && op.state === "succeeded") return;
+  await instaboxWaitOperation(op && op.id, 180000);
+}
+
+async function instaboxExec(command, timeoutSeconds = 120, cwd = "") {
+  const text = String(command || "").trim();
+  if (!text) throw new BadRequest("command is empty");
+  if (text.length > 8000) throw new BadRequest("command is too long");
+  const timeout = Math.min(600, Math.max(1, Number.parseInt(timeoutSeconds, 10) || 120));
+  const machine = await instaboxMachineId();
+  await instaboxEnsureRunning(machine);
+  const body = { cmd: text, timeoutSeconds: timeout };
+  if (cwd) body.cwd = String(cwd).slice(0, 4000);
+  const data = await instaboxRequest(`/v1/machines/${encodeURIComponent(machine)}/exec`, {
+    method: "POST", body, timeoutMs: (timeout + 20) * 1000,
+  });
+  const out = [data.stdout, data.stderr].filter((v) => v != null && String(v).length).join("\n");
+  const exit = data.exitCode != null ? data.exitCode : (data.exit_code != null ? data.exit_code : "?");
+  let textOut = `exit=${exit}\n${out || "(no output)"}`;
+  if (data.timedOut) textOut = "command timed out\n" + textOut;
+  return textOut.length > 8000 ? textOut.slice(0, 8000) + "\n… [truncated]" : textOut;
 }
 
 function typeName(e) { return e && e.constructor ? e.constructor.name : "Error"; }
@@ -1448,8 +1543,13 @@ class BadRequest extends Error {}
 
 const outboundLog = [];
 
-function normalizeRecipient(value) {
+function isGroupJid(value) {
+  return /^\d{6,30}@g\.us$/i.test(String(value || "").trim());
+}
+
+function normalizeRecipient(value, allowGroup = false) {
   const raw = String(value || "").trim();
+  if (allowGroup && isGroupJid(raw)) return raw;
   let match = /^(\d{6,20})@(?:c\.us|s\.whatsapp\.net|newsletter)$/i.exec(raw);
   if (match) return match[1] + "@s.whatsapp.net";
   match = /^(\d{6,20})@lid$/i.exec(raw);
@@ -1516,8 +1616,8 @@ async function handleAction(d, ctx = {}) {
 
   if (action === "send") {
     assertOwner(d);
-    const to = normalizeRecipient(d.to);
-    assertAllowed(to);
+    const to = normalizeRecipient(d.to, true);
+    if (!isGroupJid(to)) assertAllowed(to);
     assertRate();
     const text = String(d.text == null ? "" : d.text);
     if (!text.trim()) throw new BadRequest("message is empty");
@@ -1528,8 +1628,8 @@ async function handleAction(d, ctx = {}) {
 
   if (action === "image") {
     assertOwner(d);
-    const to = normalizeRecipient(d.to);
-    assertAllowed(to);
+    const to = normalizeRecipient(d.to, true);
+    if (!isGroupJid(to)) assertAllowed(to);
     assertRate();
     const file = assertOutbox(d.path);
     const caption = String(d.text || "").slice(0, 1024);
@@ -1539,8 +1639,8 @@ async function handleAction(d, ctx = {}) {
 
   if (action === "voice") {
     assertOwner(d);
-    const to = normalizeRecipient(d.to);
-    assertAllowed(to);
+    const to = normalizeRecipient(d.to, true);
+    if (!isGroupJid(to)) assertAllowed(to);
     assertRate();
     const file = assertOutbox(d.path);
     const mimetype = audioMime(d.mimetype, file);
@@ -2017,7 +2117,7 @@ const server = http.createServer(async (req, res) => {
             },
             instabox: {
               apiKey: !!INSTABOX_API_KEY,
-              machineId: !!INSTABOX_MACHINE_ID,
+              machineId: INSTABOX_MACHINE_ID || null,
               url: INSTABOX_API_URL,
             },
             email: !!(process.env.LIAM_EMAIL_HOST && process.env.LIAM_EMAIL_USER
@@ -2305,7 +2405,7 @@ if (require.main === module) {
 
 module.exports = {
   server, getSock: () => sock, wa, sweepTimer, outboundLog, handleAction,
-  normalizeRecipient, normalizeGroup, assertAllowed, assertOutbox, audioMime, authorized,
+  normalizeRecipient, normalizeGroup, isGroupJid, assertAllowed, assertOutbox, audioMime, authorized,
   sync, pythonBin, sanitizeChromeLocks: sync.sanitizeChromeLocks,
   statusPayload, TEMP, tempDecision, sweepTemp, _setState: setWaState,
   stopAgent, initializeWhatsApp, hasSessionData, requestPairing, instaboxExec,

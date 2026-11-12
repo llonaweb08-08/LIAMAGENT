@@ -180,10 +180,10 @@ SCHEMAS = [
  {"type":"function","function":{"name":"recall","description":"Recall what you remember about the person you're talking to (pass user='me')","parameters":{"type":"object","properties":{"user":{"type":"string"}},"required":["user"],"additionalProperties":False}}},
  {"type":"function","function":{"name":"recall_all","description":"Recall every fact you are allowed to see (your own facts, or everyone's for the owner)","parameters":{"type":"object","properties":{},"additionalProperties":False}}},
  {"type":"function","function":{"name":"clear_memory","description":"Wipe saved memory for one person. Pass user='me' for your own. Only the owner can pass user='ALL'","parameters":{"type":"object","properties":{"user":{"type":"string"}},"additionalProperties":False}}},
- {"type":"function","function":{"name":"send_dm","description":"Owner only: DM an approved contact","parameters":{"type":"object","properties":{"to":{"type":"string"},"text":{"type":"string"}},"required":["to","text"],"additionalProperties":False}}},
- {"type":"function","function":{"name":"send_image","description":"Owner only: generate an image and send it","parameters":{"type":"object","properties":{"to":{"type":"string"},"prompt":{"type":"string"}},"required":["to","prompt"],"additionalProperties":False}}},
- {"type":"function","function":{"name":"send_voice","description":"Owner only: turn text into a voice note and send it","parameters":{"type":"object","properties":{"to":{"type":"string"},"text":{"type":"string"}},"required":["to","text"],"additionalProperties":False}}},
- {"type":"function","function":{"name":"screenshot","description":"Owner only: screenshot a public http(s) website and send it","parameters":{"type":"object","properties":{"to":{"type":"string"},"url":{"type":"string"}},"required":["to","url"],"additionalProperties":False}}},
+ {"type":"function","function":{"name":"send_dm","description":"Owner only: send a WhatsApp message to an approved contact. Omit 'to' to reply in the chat you are already in.","parameters":{"type":"object","properties":{"to":{"type":"string","description":"phone number or chat id; omit to use the current chat"},"text":{"type":"string"}},"required":["text"],"additionalProperties":False}}},
+ {"type":"function","function":{"name":"send_image","description":"Owner only: generate an image and send it. Omit 'to' to send it in the chat you are already in.","parameters":{"type":"object","properties":{"to":{"type":"string","description":"phone number or chat id; omit to use the current chat"},"prompt":{"type":"string"}},"required":["prompt"],"additionalProperties":False}}},
+ {"type":"function","function":{"name":"send_voice","description":"Owner only: turn text into a voice note and send it. Omit 'to' to send it in the chat you are already in.","parameters":{"type":"object","properties":{"to":{"type":"string","description":"phone number or chat id; omit to use the current chat"},"text":{"type":"string"}},"required":["text"],"additionalProperties":False}}},
+ {"type":"function","function":{"name":"screenshot","description":"Owner only: screenshot a public http(s) website and send it. Omit 'to' to send it in the chat you are already in.","parameters":{"type":"object","properties":{"to":{"type":"string","description":"phone number or chat id; omit to use the current chat"},"url":{"type":"string"}},"required":["url"],"additionalProperties":False}}},
  {"type":"function","function":{"name":"leave_group","description":"Owner only: leave the group this conversation is in","parameters":{"type":"object","properties":{},"additionalProperties":False}}},
  {"type":"function","function":{"name":"stop_task","description":"Owner only: stop whatever you're doing right now","parameters":{"type":"object","properties":{},"additionalProperties":False}}},
  {"type":"function","function":{"name":"permission","description":"Owner only: allow or deny a group member","parameters":{"type":"object","properties":{"jid":{"type":"string"},"who":{"type":"string"},"allow":{"type":"boolean"}},"required":["jid","who","allow"],"additionalProperties":False}}},
@@ -435,7 +435,7 @@ def screenshot(to, url, sender=None):
         try:
             result = subprocess.run(
                 [sys.executable, "-c", _SCREENSHOT_SCRIPT, safe, path, liam_keys.BROWSER_UA],
-                timeout=_env_int("LIAM_SCREENSHOT_TIMEOUT", 90, 20, 180),
+                timeout=_env_int("LIAM_SCREENSHOT_TIMEOUT", 75, 20, 180),
                 capture_output=True, text=False, check=False)
         except subprocess.TimeoutExpired as exc:
             raise RuntimeError("screenshot timed out") from exc
@@ -484,6 +484,8 @@ def browser_task(script):
         "    context = browser.new_context(viewport={'width': 1366, 'height': 900}, "
         "user_agent=os.environ.get('LIAM_USER_AGENT', ''))\n"
         "    page = context.new_page()\n"
+        "    page.set_default_timeout(15000)\n"
+        "    page.set_default_navigation_timeout(30000)\n"
         "    try:\n"
     )
     path = _unique_file(".py")
@@ -493,6 +495,10 @@ def browser_task(script):
             f.write(preamble)
             for line in str(script or "").splitlines():
                 f.write("        " + line + "\n")
+            f.write("    except Exception as _liam_exc:\n")
+            f.write("        import traceback\n")
+            f.write("        print('BROWSER_TASK_ERROR:', type(_liam_exc).__name__, _liam_exc)\n")
+            f.write("        traceback.print_exc()\n")
             f.write("    finally:\n")
             f.write("        context.close()\n")
             f.write("        browser.close()\n")
@@ -500,7 +506,7 @@ def browser_task(script):
         env.setdefault("LIAM_USER_AGENT", liam_keys.BROWSER_UA)
         r = subprocess.run(
             [sys.executable, path], capture_output=True, text=True,
-            timeout=_env_int("LIAM_BROWSER_TIMEOUT", 180, 10, 300), env=env)
+            timeout=_env_int("LIAM_BROWSER_TIMEOUT", 90, 10, 300), env=env)
         out = ((r.stdout or "") + (r.stderr or "")).strip()
         return out[:8000] or f"exit={r.returncode}"
     except subprocess.TimeoutExpired:
@@ -688,7 +694,7 @@ def _search_serper(query):
     return out
 
 def _ddg_target(href):
-    value = str(href or "")
+    value = str(href or "").replace("&amp;", "&")
     if value.startswith("//"):
         value = "https:" + value
     parsed = urllib.parse.urlparse(value)
@@ -697,19 +703,16 @@ def _ddg_target(href):
         return urllib.parse.unquote(target) or value
     return value
 
-def _search_duckduckgo(query):
-    url = "https://html.duckduckgo.com/html/?" + urllib.parse.urlencode({"q": query})
-    with _open_url(url, timeout=20, headers={
-        "User-Agent": liam_keys.BROWSER_UA,
-        "Accept": "text/html,application/xhtml+xml",
-    }) as response:
-        html = response.read(300000).decode("utf-8", "replace")
+def _ddg_clean_title(raw):
+    title = re.sub(r"<.*?>", " ", str(raw or ""))
+    return re.sub(r"\s+", " ", title).strip()
+
+def _ddg_parse_html(page):
     out = []
     for match in re.finditer(
-            r'class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>', html, re.S):
+            r'class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>', page, re.S):
         link = _ddg_target(match.group(1))
-        title = re.sub(r"<.*?>", " ", match.group(2))
-        title = re.sub(r"\s+", " ", title).strip() or "(untitled)"
+        title = _ddg_clean_title(match.group(2)) or "(untitled)"
         try:
             _safe_url(link)
         except ValueError:
@@ -718,6 +721,57 @@ def _search_duckduckgo(query):
         if len(out) >= 8:
             break
     return out
+
+def _ddg_parse_lite(page):
+    out, seen = [], set()
+    for match in re.finditer(r'<a[^>]+href="([^"]+)"[^>]*>(.*?)</a>', page, re.S):
+        raw = match.group(1)
+        if "uddg=" not in raw and not raw.startswith(("http://", "https://", "//")):
+            continue
+        link = _ddg_target(raw)
+        if not link.startswith(("http://", "https://")) or link in seen:
+            continue
+        parsed = urllib.parse.urlparse(link)
+        if parsed.hostname and "duckduckgo.com" in parsed.hostname:
+            continue
+        title = _ddg_clean_title(match.group(2))
+        if not title:
+            continue
+        try:
+            _safe_url(link)
+        except ValueError:
+            continue
+        seen.add(link)
+        out.append(f"- {title}: {link}")
+        if len(out) >= 8:
+            break
+    return out
+
+def _search_duckduckgo(query):
+    # Try the classic html endpoint first, then the lighter lite endpoint, which
+    # is friendlier to cloud IPs where the html endpoint sometimes errors.
+    headers = {
+        "User-Agent": liam_keys.BROWSER_UA,
+        "Accept": "text/html,application/xhtml+xml",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    encoded = urllib.parse.urlencode({"q": query})
+    endpoints = (
+        ("html", "https://html.duckduckgo.com/html/?" + encoded, _ddg_parse_html),
+        ("lite", "https://lite.duckduckgo.com/lite/?" + encoded, _ddg_parse_lite),
+    )
+    problems = []
+    for name, url, parser in endpoints:
+        try:
+            with _open_url(url, timeout=20, headers=headers) as response:
+                page = response.read(400000).decode("utf-8", "replace")
+            results = parser(page)
+            if results:
+                return results
+            problems.append(f"{name}: no results")
+        except Exception as e:
+            problems.append(f"{name}: {type(e).__name__}")
+    raise RuntimeError("; ".join(problems) or "no results")
 
 def web_search(query):
     text = str(query or "").strip()
@@ -1199,6 +1253,15 @@ def _tools_for(sender, chat_jid="", is_group=False):
         except Exception as e:
             return f"vps exec failed: {type(e).__name__}"
 
+    # The model does not know the current chat's number, so every send tool
+    # defaults to the chat Liam is already in when 'to' is omitted or vague.
+    def _recipient(to):
+        value = str(to or "").strip()
+        if value and value.lower() not in (
+                "me", "self", "here", "this chat", "current chat", "this group", "the group"):
+            return value
+        return chat_jid if (is_group and chat_jid) else me
+
     # Memory is scoped to whoever is actually talking; owners can name a known person.
     t["remember"] = _remember
     t["recall"] = _recall
@@ -1206,10 +1269,10 @@ def _tools_for(sender, chat_jid="", is_group=False):
     t["clear_memory"] = _clear
     t["switch_brain"] = lambda brain: switch_brain(brain, me)
     t["permission"] = lambda jid, who, allow: permission(jid, who, allow, sender=me)
-    t["send_dm"] = lambda to, text: send_dm(to, text, sender=me)
-    t["send_image"] = lambda to, prompt: send_image(to, prompt, sender=me)
-    t["send_voice"] = lambda to, text: send_voice(to, text, sender=me)
-    t["screenshot"] = lambda to, url: screenshot(to, url, sender=me)
+    t["send_dm"] = lambda to=None, text="": send_dm(_recipient(to), text, sender=me)
+    t["send_image"] = lambda to=None, prompt="": send_image(_recipient(to), prompt, sender=me)
+    t["send_voice"] = lambda to=None, text="": send_voice(_recipient(to), text, sender=me)
+    t["screenshot"] = lambda to=None, url="": screenshot(_recipient(to), url, sender=me)
     t["leave_group"] = lambda: leave_group(chat_jid, sender=me)
     t["stop_task"] = lambda: stop_task(sender=me)
     t["report_progress"] = lambda text: report_progress(text, sender=me)
@@ -1323,7 +1386,7 @@ def run_agent(user_message, sender, is_group, group_jid, mentioned, reply_to):
     cache = {}
     calls_done = 0
     last_text = ""
-    turn_deadline = time.monotonic() + _env_int("LIAM_TURN_BUDGET", 150, 20, 240)
+    turn_deadline = time.monotonic() + _env_int("LIAM_TURN_BUDGET", 180, 20, 240)
 
     def finish(text):
         text = _clean_reply(text or "") or FALLBACK_TEXT

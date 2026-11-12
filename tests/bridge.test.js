@@ -247,6 +247,38 @@ test('bridge endpoint security and actions', async (t) => {
     assert.match(response.json.msg, /recipient/);
   });
 
+  await t.test('normalizes group targets only when allowed', () => {
+    assert.equal(bridge.isGroupJid(GROUP), true);
+    assert.equal(bridge.isGroupJid('2347000000000@s.whatsapp.net'), false);
+    assert.equal(bridge.normalizeRecipient(GROUP, true), GROUP);
+    assert.throws(() => bridge.normalizeRecipient(GROUP), /recipient/);
+    assert.equal(bridge.normalizeRecipient('2347000000009'), '2347000000009@s.whatsapp.net');
+  });
+
+  await t.test('sends an image and voice into a group', async () => {
+    const image = path.join(OUTBOX, 'group.png');
+    fs.writeFileSync(image, Buffer.from('PNGDATA'));
+    const pic = await post({ action: 'image', to: GROUP, path: image, text: 'cap', sender: OWNER });
+    assert.equal(pic.status, 200);
+    assert.equal(fake.sent.at(-1).to, GROUP);
+
+    const voice = path.join(OUTBOX, 'group.wav');
+    fs.writeFileSync(voice, Buffer.from('RIFF'));
+    const audio = await post({
+      action: 'voice', to: GROUP, path: voice, mimetype: 'audio/wav', sender: OWNER,
+    });
+    assert.equal(audio.status, 200);
+    assert.equal(fake.sent.at(-1).to, GROUP);
+  });
+
+  await t.test('still blocks a group target for non-owners', async () => {
+    const image = path.join(OUTBOX, 'group.png');
+    fs.writeFileSync(image, Buffer.from('PNGDATA'));
+    const response = await post({ action: 'image', to: GROUP, path: image, sender: '2348999999999' });
+    assert.equal(response.status, 400);
+    assert.match(response.json.msg, /owner/);
+  });
+
   await t.test('sends an image only from the outbox', async () => {
     const outside = path.join(APP, 'secret.txt');
     fs.writeFileSync(outside, 'secret');
