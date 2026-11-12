@@ -6,7 +6,7 @@ liam_secrets.py
 *.pem
 *.key
 
-# WhatsApp / Chrome session credentials
+# WhatsApp login credentials (Baileys creds.json and keys)
 liam_session/
 tokens/
 
@@ -34,9 +34,6 @@ out.txt
 brain_out.txt
 brain_err.txt
 err.txt
-
-# WhatsApp Web cache
-.wwebjs_cache/
 
 # Node
 node_modules/

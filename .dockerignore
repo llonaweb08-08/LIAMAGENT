@@ -26,7 +26,6 @@ tokens/
 
 # Build and test artifacts
 node_modules/
-.wwebjs_cache/
 __pycache__/
 **/__pycache__/
 *.py[cod]

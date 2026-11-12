@@ -1,18 +1,18 @@
 #!/usr/bin/env node
 'use strict';
 
-// Upload the local WhatsApp profile (and memory DB) to Supabase so a free
-// Render instance can restore them after a restart. Run this from a machine
-// that already has Liam linked:
+// Upload the local Baileys WhatsApp session (and memory DB) to Supabase so a
+// free Render instance can restore them after a restart. Run this from a
+// machine that already has Liam linked, using the same Baileys version:
 //
 //   PowerShell:
-//     $env:LIAM_DATA_DIR="$env:LOCALAPPDATA\LiamWhatsApp"
+//     $env:LIAM_DATA_DIR="C:\path\to\baileys-data"
 //     $env:SUPABASE_URL="https://....supabase.co"
 //     $env:SUPABASE_SECRET_KEY="sb_secret_..."
 //     npm run seed:supabase
 //
-// The session archive excludes Chromium caches and lock files, so it is small
-// and safe to restore on a different machine.
+// A whatsapp-web.js/Chromium profile cannot be imported; pair on Render instead.
+// The Baileys archive is only creds.json plus app-state keys, well under 1 MB.
 
 const fs = require('fs');
 const os = require('os');
@@ -33,7 +33,7 @@ async function main() {
   const base = path.resolve(dataDir());
   const session = path.join(base, 'liam_session');
   if (!fs.existsSync(session)) {
-    console.error(`No WhatsApp profile found at ${session}`);
+    console.error(`No WhatsApp session found at ${session}`);
     console.error('Pair Liam locally first, or set LIAM_DATA_DIR to the right directory.');
     process.exitCode = 2;
     return;

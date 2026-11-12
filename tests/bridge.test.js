@@ -1,6 +1,6 @@
 'use strict';
 
-// Exercises the bridge's local HTTP API against a stubbed WhatsApp client.
+// Exercises the bridge's local HTTP API against a stubbed WhatsApp fake.
 // The bridge is copied to a temporary directory so no real session, cache, or
 // credentials are touched.
 
@@ -22,60 +22,73 @@ fs.copyFileSync(path.join(ROOT, 'whatsapp_bridge.js'), path.join(APP, 'whatsapp_
 fs.copyFileSync(path.join(ROOT, 'supabase_sync.js'), path.join(APP, 'supabase_sync.js'));
 fs.copyFileSync(path.join(ROOT, 'liam_config.json'), path.join(APP, 'liam_config.json'));
 
-const whatsappStubDir = path.join(APP, 'node_modules', 'whatsapp-web.js');
-fs.mkdirSync(whatsappStubDir, { recursive: true });
-fs.writeFileSync(path.join(whatsappStubDir, 'index.js'), [
+const baileysStubDir = path.join(APP, 'node_modules', '@whiskeysockets', 'baileys');
+fs.mkdirSync(baileysStubDir, { recursive: true });
+fs.writeFileSync(path.join(baileysStubDir, 'index.js'), [
   "'use strict';",
   "const { EventEmitter } = require('node:events');",
-  'class FakeClient extends EventEmitter {',
-  '  constructor(options) {',
-  '    super();',
-  '    this.options = options;',
-  '    this.info = { wid: { _serialized: "2340000000000@c.us" } };',
-  '    this.pupPage = {};',
+  'class FakeSocket {',
+  '  constructor(config) {',
+  '    this.config = config;',
+  '    this.ev = new EventEmitter();',
+  '    this.authState = { creds: { registered: false } };',
+  '    this.user = { id: "2340000000000@s.whatsapp.net", lid: "100000000000001@lid" };',
   '    this.sent = [];',
-  '    this.chats = new Map();',
-  '    global.__liamFakeClient = this;',
+  '    this.leftGroups = [];',
+  '    this.messagesSent = 0;',
+  '    global.__liamFakeSock = this;',
+  '    // Baileys emits the first QR frame shortly after the socket is created.',
+  '    setTimeout(() => { try { this.ev.emit("connection.update", { qr: "stub-qr" }); } catch (e) {} }, 0);',
   '  }',
-  '  initialize() {}',
   '  async requestPairingCode(phone) {',
   "    if (!/^\\d{7,15}$/.test(String(phone))) throw new Error('bad phone');",
   "    return 'ABCD1234';",
   '  }',
   '  async sendMessage(to, content, options) {',
   '    this.sent.push({ to, content, options });',
-  "    return { id: { _serialized: 'MSG-' + this.sent.length } };",
+  "    return { key: { id: 'MSG-' + this.sent.length } };",
   '  }',
-  '  async getChatById(jid) {',
-  "    if (!this.chats.has(jid)) throw new Error('chat not found');",
-  '    return this.chats.get(jid);',
-  '  }',
+  '  async groupMetadata() { return { participants: [] }; }',
+  '  async groupLeave(jid) { this.leftGroups.push(jid); }',
+  '  end() {}',
   '}',
-  'class FakeLocalAuth { constructor(options) { this.options = options; } }',
-  'const MessageMedia = { fromFilePath: (file) => ({ file }) };',
-  'module.exports = { Client: FakeClient, LocalAuth: FakeLocalAuth, MessageMedia };',
+  'function makeWASocket(config) { return new FakeSocket(config); }',
+  'async function useMultiFileAuthState(dir) {',
+  '  return { state: { creds: { registered: false } }, saveCreds: async () => {} };',
+  '}',
+  'async function fetchLatestBaileysVersion() { return { version: [2, 3000, 0], isLatest: true }; }',
+  'const DisconnectReason = { loggedOut: 401, restartRequired: 515, connectionClosed: 428 };',
+  'const Browsers = { ubuntu: () => ["Ubuntu", "Chrome", "22.04.4"] };',
+  'function isJidGroup(jid) { return String(jid || "").endsWith("@g.us"); }',
+  'function getContentType(message) {',
+  '  if (!message || typeof message !== "object") return null;',
+  '  return Object.keys(message).find((k) => k !== "messageContextInfo") || null;',
+  '}',
+  'function normalizeMessageContent(message) { return message; }',
+  'module.exports = {',
+  '  __esModule: true, default: makeWASocket,',
+  '  useMultiFileAuthState, fetchLatestBaileysVersion, DisconnectReason, Browsers,',
+  '  isJidGroup, getContentType, normalizeMessageContent,',
+  '};',
 ].join('\n'));
-
-const qrStubDir = path.join(APP, 'node_modules', 'qrcode');
-fs.mkdirSync(qrStubDir, { recursive: true });
-fs.writeFileSync(path.join(qrStubDir, 'index.js'),
-  "module.exports = { toFile: async () => {} };\n");
 
 process.env.LIAM_DATA_DIR = DATA;
 process.env.LIAM_PORT = '0';
 process.env.LIAM_DM_ALLOWLIST = '2347000000009';
+process.env.LIAM_DISABLE_AGENT = '1';
 
 const bridge = require(path.join(APP, 'whatsapp_bridge.js'));
-const client = bridge.client || global.__liamFakeClient;
 const CONFIG = require(path.join(APP, 'liam_config.json'));
 const OWNER = CONFIG.owners[0];
 const ADMIN = Object.keys(CONFIG.admins)[0];
 const GROUP = '120363000000000000@g.us';
+let fake = null;
 
 after(() => {
   try { if (bridge.sync && bridge.sync.stopPeriodicBackup) bridge.sync.stopPeriodicBackup(); } catch (e) {}
   try { clearInterval(bridge.sweepTimer); } catch (e) {}
   try { if (bridge.stopAgent) bridge.stopAgent(); } catch (e) {}
+  try { if (bridge.closeSocket) bridge.closeSocket('test finished'); } catch (e) {}
   try { bridge.server.close(); } catch (e) {}
   if (typeof bridge.server.closeAllConnections === 'function') {
     try { bridge.server.closeAllConnections(); } catch (e) {}
@@ -122,6 +135,11 @@ function request(port, options = {}) {
 
 test('bridge endpoint security and actions', async (t) => {
   if (!bridge.server.listening) await once(bridge.server, 'listening');
+  await bridge.initializeWhatsApp('test');
+  fake = bridge.getSock();
+  // Let the stub deliver its first QR frame so pairing is allowed.
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.ok(fake, 'a fake Baileys socket should exist');
   const { port } = bridge.server.address();
   const token = fs.readFileSync(path.join(DATA, 'tool_token'), 'utf8').trim();
   const post = (body, extra = {}) => request(port, { body, token, ...extra });
@@ -130,8 +148,8 @@ test('bridge endpoint security and actions', async (t) => {
     const response = await post({ action: 'send', to: OWNER, text: 'hello', sender: OWNER });
     assert.equal(response.status, 200);
     assert.equal(response.json.ok, true);
-    const sent = client.sent.at(-1);
-    assert.equal(sent.to, `${OWNER}@c.us`);
+    const sent = fake.sent.at(-1);
+    assert.equal(sent.to, `${OWNER}@s.whatsapp.net`);
     assert.equal(sent.content, 'hello');
   });
 
@@ -219,7 +237,7 @@ test('bridge endpoint security and actions', async (t) => {
   await t.test('accepts LIAM_DM_ALLOWLIST recipients', async () => {
     const response = await post({ action: 'send', to: '2347000000009', text: 'hi', sender: OWNER });
     assert.equal(response.status, 200);
-    assert.equal(client.sent.at(-1).to, '2347000000009@c.us');
+    assert.equal(fake.sent.at(-1).to, '2347000000009@s.whatsapp.net');
   });
 
   await t.test('rejects invalid recipient formats', async () => {
@@ -239,9 +257,10 @@ test('bridge endpoint security and actions', async (t) => {
     fs.writeFileSync(image, Buffer.from('PNGDATA'));
     const allowed = await post({ action: 'image', to: OWNER, path: image, text: 'caption', sender: OWNER });
     assert.equal(allowed.status, 200);
-    const sent = client.sent.at(-1);
-    assert.equal(sent.content.file, fs.realpathSync(image));
-    assert.equal(sent.options.caption, 'caption');
+    const sent = fake.sent.at(-1);
+    assert.ok(Buffer.isBuffer(sent.content.image), 'image should be sent as bytes');
+    assert.deepEqual(sent.content.image, fs.readFileSync(fs.realpathSync(image)));
+    assert.equal(sent.content.caption, 'caption');
   });
 
   await t.test('rejects missing outbox files', async () => {
@@ -259,13 +278,14 @@ test('bridge endpoint security and actions', async (t) => {
       action: 'voice', to: OWNER, path: voice, mimetype: 'audio/wav', sender: OWNER,
     });
     assert.equal(response.status, 200);
-    const sent = client.sent.at(-1);
-    assert.equal(sent.options.sendAudioAsVoice, true);
-    assert.equal(sent.options.mimetype, 'audio/wav');
+    const sent = fake.sent.at(-1);
+    assert.equal(sent.content.ptt, true);
+    assert.equal(sent.content.mimetype, 'audio/wav');
+    assert.ok(Buffer.isBuffer(sent.content.audio));
 
     const inferred = await post({ action: 'voice', to: OWNER, path: voice, sender: OWNER });
     assert.equal(inferred.status, 200);
-    assert.equal(client.sent.at(-1).options.mimetype, 'audio/wav');
+    assert.equal(fake.sent.at(-1).content.mimetype, 'audio/wav');
   });
 
   await t.test('rejects unsupported audio types', async () => {
@@ -277,19 +297,10 @@ test('bridge endpoint security and actions', async (t) => {
     assert.equal(response.status, 400);
   });
 
-  await t.test('leaves a group through the real chat API', async () => {
-    let left = false;
-    client.chats.set(GROUP, { leave: async () => { left = true; } });
+  await t.test('leaves a group through the socket', async () => {
     const response = await post({ action: 'leave', jid: GROUP, sender: OWNER });
     assert.equal(response.status, 200);
-    assert.equal(left, true);
-  });
-
-  await t.test('refuses chats that cannot be left', async () => {
-    const noLeave = '120363000000000001@g.us';
-    client.chats.set(noLeave, {});
-    const response = await post({ action: 'leave', jid: noLeave, sender: OWNER });
-    assert.equal(response.status, 400);
+    assert.equal(fake.leftGroups.includes(GROUP), true);
   });
 
   await t.test('validates permission changes', async () => {
@@ -336,7 +347,7 @@ test('bridge endpoint security and actions', async (t) => {
     assert.equal(qrForbidden.status, 403);
     const qrOk = await request(port, { method: 'GET', path: `/qr?token=${bridge.PAIR_TOKEN}` });
     assert.equal(qrOk.status, 200);
-    assert.match(qrOk.text, /Waiting for a QR/);
+    assert.match(qrOk.text, /phone code/);
     const pairForbidden = await request(port, { method: 'GET', path: '/pair' });
     assert.equal(pairForbidden.status, 403);
   });
@@ -368,11 +379,11 @@ test('bridge endpoint security and actions', async (t) => {
     assert.match(p.id, /^t[0-9a-f]+$/);
     assert.equal(bridge.pendingTools.has(p.id), true);
 
-    const bareYes = await bridge.handleApprovalCommand('yes', OWNER, `${OWNER}@c.us`, false);
+    const bareYes = await bridge.handleApprovalCommand('yes', OWNER, `${OWNER}@s.whatsapp.net`, false);
     assert.equal(bareYes, true);
     assert.equal(bridge.pendingTools.has(p.id), true, 'bare yes must not approve a tool');
 
-    const denied = await bridge.handleApprovalCommand(`no ${p.id}`, OWNER, `${OWNER}@c.us`, false);
+    const denied = await bridge.handleApprovalCommand(`no ${p.id}`, OWNER, `${OWNER}@s.whatsapp.net`, false);
     assert.equal(denied, true);
     assert.equal(bridge.pendingTools.has(p.id), false);
 
@@ -381,11 +392,11 @@ test('bridge endpoint security and actions', async (t) => {
       { chat: member, isGroup: false },
     );
     const confirmed = await bridge.handleApprovalCommand(
-      `yes ${second.id}`, OWNER, `${OWNER}@c.us`, false,
+      `yes ${second.id}`, OWNER, `${OWNER}@s.whatsapp.net`, false,
     );
     assert.equal(confirmed, true);
     assert.equal(bridge.pendingTools.has(second.id), false, 'approval is one-time');
-    assert.match(String(client.sent.at(-1).content), /vps_exec failed|InstaBox/);
+    assert.match(String(fake.sent.at(-1).content), /vps_exec failed|InstaBox/);
   });
 
   await t.test('applies .allowdm semantics', async () => {

@@ -8,7 +8,7 @@ storage bucket, and one UptimeRobot monitor.
 
 | Item | Lives on Render | Persisted to Supabase |
 | --- | --- | --- |
-| WhatsApp login (`liam_session/`) | `/data/liam_session` | yes, cache-excluded archive |
+| WhatsApp login (`liam_session/`) | `/data/liam_session` | yes, small Baileys archive |
 | Memory (`liam_memory.db`) | `/data/liam_memory.db` | yes, `VACUUM INTO` snapshot |
 | Tool token, pair token | `/data/` | no (set `LIAM_PAIR_TOKEN` in Render) |
 | `dm_open`, known members | `/data/` | no |
@@ -30,9 +30,8 @@ place.
    - the **secret** key (`sb_secret_...`). Do not use the publishable key.
 4. Keep the bucket private. It contains the WhatsApp login.
 
-Free plan limits are sufficient for a cache-excluded profile (about 20 MB) and
-a small SQLite database. Watch the storage and egress quotas if the profile
-grows.
+Free plan limits are sufficient: a Baileys session archive is well under 1 MB,
+and the SQLite database is small.
 
 ## 2. Render
 
@@ -44,41 +43,38 @@ grows.
    - `MOON_KEYS`, `UNO_KEYS`, `AGNES_KEY`, `HCN_KEY`
    - optional: `GOOGLE_API_KEY`, `TAVILY_API_KEY`, `BRAVE_API_KEY`,
      `SERPER_API_KEY`, `INSTABOX_API_KEY`, `INSTABOX_MACHINE_ID`
-4. Deploy. The first Docker build downloads Node, Python, Puppeteer's Chromium,
-   and Playwright's Chromium; expect several minutes.
+4. Deploy. The first Docker build downloads Node, Python, and Playwright's
+   Chromium (for screenshots); expect several minutes. There is no Puppeteer or
+   WhatsApp browser download.
 5. Render keeps `LIAM_PAIR_TOKEN` stable because the blueprint uses
    `generateValue: true`. If you created the service manually, set it yourself
    to a long random string.
 
 The service listens on Render's `PORT` (the image default is 5678) and binds
 `0.0.0.0`. Render health-checks `/health`, which stays 200 while WhatsApp is
-still restoring or waiting for a QR code. That is intentional: the pairing page
-must remain reachable during a cold boot.
+still restoring or waiting for a pairing code. That is intentional: the pairing
+page must remain reachable during a cold boot.
 
-## 3. Seed an existing local profile (recommended)
+## 3. Optional: reuse an existing Baileys login
 
-If Liam is already linked on your PC, upload that profile before pairing again.
-
-On Windows, double-click **`seed_cloud.bat`** and paste the Supabase URL and
-secret key when asked. Or run:
+Only do this if you already linked Liam with **this Baileys version** on another
+machine. A `whatsapp-web.js`/Chromium profile cannot be imported; skip to
+section 4 and pair on Render.
 
 ```powershell
-$env:LIAM_DATA_DIR="$env:LOCALAPPDATA\LiamWhatsApp"
+$env:LIAM_DATA_DIR="C:\path\to\baileys-data"
 $env:SUPABASE_URL="https://<project>.supabase.co"
 $env:SUPABASE_SECRET_KEY="sb_secret_..."
 npm run seed:supabase
 ```
 
-The script archives `liam_session/` without Chromium caches, turns link files
-into normal files, validates the archive before uploading, snapshots the memory
-DB safely, and uploads both objects. It exits non-zero unless the WhatsApp login
-itself uploaded. The local profile is not modified.
+The script validates the archive before uploading, snapshots the memory DB
+safely, and exits non-zero unless the WhatsApp login itself uploaded. The local
+profile is not modified.
 
 Then restart (or redeploy) the Render service. The logs should say
-`session restored from Supabase`. Older archives that contain harmless Chromium
-links log `contained N link entries; skipped them safely` and still restore.
-If the logs say `no remote session archive`, the seed upload did not reach the
-configured bucket.
+`session restored from Supabase`. If they say `no remote session archive`, the
+upload did not reach the configured bucket.
 
 ## 4. Pair on Render
 
@@ -88,36 +84,41 @@ Open the deploy logs and find:
 🔗 Pairing page: https://<service>.onrender.com/pair?token=<LIAM_PAIR_TOKEN>
 ```
 
-Open that URL and either:
+Pairing uses an **8-character phone code**. There is no QR scan.
 
-- enter the bot's phone number (default `447881161023`) and press
-  **Get pairing code**. Prepare the phone first: WhatsApp on that phone ->
-  **Linked devices -> Link with phone number**, so it is already waiting.
-  Then type the 8-character code immediately, or
-- open `/qr?token=<LIAM_PAIR_TOKEN>` and scan the QR.
+1. First remove stale devices: on the bot phone open WhatsApp **Business** ->
+   **Settings** -> **Linked devices** and delete every old **Liam** entry.
+   WhatsApp allows at most 4 devices, and every failed attempt leaves one
+   behind.
+2. On the phone open **Linked devices** -> **Link a device** ->
+   **Link with phone number instead**. Leave that screen waiting.
+3. On the Render pairing page, confirm the number (default `447881161023`) and
+   press **Get pairing code** once.
+4. Type the code on the phone immediately. Do not reload the page or press the
+   button again while you type: that cancels the handshake and leaves a zombie
+   device.
 
 Opening or reloading `/pair` never creates a code; only the button does, so a
 refresh cannot burn one of WhatsApp's few allowed attempts. A code is reused for
 60 seconds and a new request is refused for 120 seconds
-(`LIAM_PAIRING_COOLDOWN_MS`). Never reload the page while typing the code: a
-reload kills the link handshake and leaves a zombie device on the phone.
+(`LIAM_PAIRING_COOLDOWN_MS`). If WhatsApp answers `429 rate-overlimit`, wait
+10-15 minutes before trying again.
 
-The code/QR expires quickly. Once linked, the logs show `LIAM IS LIVE`, the
-bridge backs up the session after three seconds, and `/ready` starts returning
-200.
+A successful code entry normally closes the socket with `restartRequired`
+(515). The bridge reconnects immediately with the same credentials; that is not
+an error. Once linked, the logs show `LIAM IS LIVE`, the bridge backs up the
+session after three seconds, and `/ready` starts returning 200.
 
-A session is only kept when the profile contains `wa_linked.json`, which is
-written after WhatsApp confirms the login. On boot, a profile without that
-marker is deleted and the browser starts empty, so a half-finished link or a
-corrupt restore can never poison the next attempt.
+A session is only kept when `liam_session/session/creds.json` and
+`wa_linked.json` both exist. On boot, a profile without them is deleted so a
+half-finished link or a corrupt restore can never poison the next attempt.
 
 If a link attempt gets stuck, two token-protected helpers exist:
 
-- `/cancelpair?token=<LIAM_PAIR_TOKEN>` — leave pairing-code mode and return to
-  QR mode (clears the page-side retry timer that keeps hitting WhatsApp's rate
-  limit).
-- `/reset?token=<LIAM_PAIR_TOKEN>` — close the browser, delete the local
-  profile, and load a fresh WhatsApp Web page without restarting Render.
+- `/cancelpair?token=<LIAM_PAIR_TOKEN>` — discard the half-finished code
+  attempt, wipe the unlinked profile, and wait for a fresh button press.
+- `/reset?token=<LIAM_PAIR_TOKEN>` — close the socket, delete the local login,
+  and start a clean connection without restarting Render.
 
 If the session is restored successfully, pairing is not needed at all.
 
@@ -157,14 +158,13 @@ unless you are comfortable with "down" alerts during pairing and restarts.
 
 | Log line | Meaning |
 | --- | --- |
-| `session restored from Supabase (N entries)` | profile restored |
-| `contained N link entries; skipped them safely` | old archive restored without its disposable links |
+| `session restored from Supabase (N entries)` | session restored |
 | `db restored from Supabase` | memory restored |
 | `no remote session archive` | bucket empty or wrong credentials |
-| `QR READY` / `Pairing page` | waiting for a link (the log repeats at most every 5 minutes) |
+| `READY TO PAIR` / `Pairing page` | waiting for a link (the log repeats at most every 5 minutes) |
 | `LIAM IS LIVE` | WhatsApp connected, agent started |
+| `WhatsApp connection closed (515)` | expected `restartRequired` after entering the code; the bridge reconnects |
 | `session backed up to Supabase` | persistence working |
-| `refusing to upload an archive with N link entries` | bad local archive; the previous cloud copy was kept |
 | `warn: session backup failed: status 401` | wrong/expired Supabase secret key |
 | `warn: session backup failed: status 413` | archive over the bucket limit |
 
@@ -172,19 +172,18 @@ unless you are comfortable with "down" alerts during pairing and restarts.
 
 1. Open `/status` and `/ready`.
 2. If `/health` is down, read the Render deploy logs. A common cause is a
-   failed `npm ci` while downloading Chromium; redeploy usually fixes it.
-3. If `/health` is up but `/ready` is 503 with `needsQr`, pair again.
-4. If the profile restores but WhatsApp logs out immediately, the archive is
-   stale or was created with a different Chrome profile. Re-run
-   `npm run seed:supabase` from the working local install, or pair again on
-   Render.
+   failed `npm ci`; redeploy usually fixes it.
+3. If `/health` is up but `/ready` is 503 with `needsQr`, pair again (section 4).
+   If WhatsApp answers `429`, wait 10-15 minutes and remove stale linked devices
+   first.
+4. If the session restores but WhatsApp logs out immediately, the archive is
+   stale or was made by a different WhatsApp version. Pair again on Render.
 5. If memory is empty but the session works, the DB object is missing or was
    rejected as non-SQLite. The bridge logs the reason; a fresh DB is created so
    Liam keeps working.
-6. If an old deploy logged `archive contains a link entry`, update to a version
-   that restores links safely, then re-run `seed_cloud.bat` from the linked PC.
-   Earlier versions could also overwrite the good upload with an unpaired
-   profile; current versions refuse to upload before `LIAM IS LIVE`.
+6. If a link attempt fails with `couldn't link device`, remove every old **Liam**
+   entry under **Linked devices** on the phone. Failed attempts leave zombie
+   entries that block a new link.
 
 ### Rotating the Supabase secret
 
@@ -218,8 +217,9 @@ Then open <http://127.0.0.1:5678/health>.
 ## 9. Free-tier limits
 
 - **Instance hours:** 750 per month. One always-awake service uses about 720.
-- **RAM:** 512 MB. WhatsApp Chromium plus a Playwright browser can exceed it;
-  run browser tasks one at a time and avoid full-page screenshots.
+- **RAM:** 512 MB. The Baileys bridge is small, but a Playwright screenshot or
+  browser task creates its own Chromium and can exceed the limit; run browser
+  tasks one at a time and avoid full-page screenshots.
 - **CPU:** 0.1. Model calls are network-bound, but heavy scraping will be slow.
 - **Disk:** ephemeral. Supabase restore is mandatory for continuity.
 - **Spin-down:** 15 minutes without traffic. UptimeRobot keeps it warm.

@@ -12,7 +12,6 @@ ENV DEBIAN_FRONTEND=noninteractive \
     LIAM_DB=/data/liam_memory.db \
     LIAM_PYTHON=/opt/venv/bin/python \
     PORT=5678 \
-    PUPPETEER_CACHE_DIR=/home/liam/.cache/puppeteer \
     PLAYWRIGHT_BROWSERS_PATH=/home/liam/.cache/ms-playwright
 
 # python3 is Debian's Python 3.11; sqlite3 gives the bridge a WAL-safe snapshot
@@ -29,8 +28,7 @@ RUN useradd --create-home --home-dir /home/liam --shell /usr/sbin/nologin liam \
 WORKDIR /app
 
 # Node dependencies first so a source-only change keeps this layer cached.
-# npm ci runs Puppeteer's install script, which downloads WhatsApp Web's
-# Chromium into the persistent cache directory above.
+# Baileys is pure JavaScript, so no browser download happens here.
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
 

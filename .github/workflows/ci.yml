@@ -41,7 +41,7 @@ jobs:
       - name: Install dependencies
         run: npm ci --ignore-scripts
       - name: Note
-        run: echo "Chromium download skipped in CI; the Docker job still validates the real install"
+        run: echo "Baileys is pure JavaScript; no browser download is needed in CI"
       - name: Syntax check
         run: npm run check && node --check scripts/seed_supabase.js && node --check scripts/verify_deployment.js
       - name: Bridge and sync tests
@@ -58,6 +58,6 @@ jobs:
         run: docker build --pull -t liam:ci .
       - name: Smoke-check the image
         run: |
-          docker run --rm liam:ci node -e "const p=require('puppeteer'),fs=require('fs');const exe=p.executablePath();if(!fs.existsSync(exe)){console.error('missing Chromium:',exe);process.exit(1)}console.log('puppeteer Chromium ok:',exe)"
+          docker run --rm liam:ci node -e "const b=require('@whiskeysockets/baileys');if(typeof b.default!=='function'){console.error('missing makeWASocket');process.exit(1)}console.log('baileys ok:',require('@whiskeysockets/baileys/package.json').version)"
           docker run --rm liam:ci /opt/venv/bin/python -c "import agent, playwright; print('python agent import ok')"
           docker run --rm liam:ci /opt/venv/bin/python -c "import os,glob; p=os.environ['PLAYWRIGHT_BROWSERS_PATH']; found=glob.glob(p+'/chromium-*/*/chrome'); print('playwright Chromium:', found); assert found"

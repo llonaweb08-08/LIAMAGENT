@@ -1,136 +1,22 @@
-const { Client, LocalAuth, MessageMedia } = require("whatsapp-web.js");
+// Baileys speaks the WhatsApp Web protocol directly. It replaces
+// whatsapp-web.js/Puppeteer so the bridge does not need Chromium at all, which
+// is what makes a 512 MiB Render free instance enough.
+const {
+  default: makeWASocket,
+  useMultiFileAuthState,
+  fetchLatestBaileysVersion,
+  DisconnectReason,
+  Browsers,
+  isJidGroup,
+  getContentType,
+  normalizeMessageContent,
+} = require("@whiskeysockets/baileys");
 const { spawn, spawnSync } = require("child_process");
 
 // Timestamp of this process. /status exposes it so an OOM kill or crash shows up
 // as a fresh start instead of silently looking like a normal reconnect.
 const STARTED_AT = Date.now();
 
-// ---------------------------------------------------------------------------
-// WhatsApp Web load guard
-// ---------------------------------------------------------------------------
-// On Render's free tier the browser can take a long time to start WhatsApp Web.
-// whatsapp-web.js injects its helpers immediately after the page loads; if the
-// web app's internal Store is not ready yet, that throws
-// "Cannot read properties of null (reading 'Socket')" and the QR flow restarts
-// forever, so a scan is accepted by the phone but never by the server.
-//
-// Wait for the Store to exist before running the library's inject step, retry
-// when the call still races a page reload, and report what the page actually
-// shows when it never becomes ready.
-const _originalInject = Client.prototype.inject;
-let waInjectDiag = "";
-
-async function describeWaPage(page) {
-  if (!page) return { page: null };
-  try {
-    // A page stuck in a retry loop stops answering evaluate() at all, which made
-    // /diag hang. Never wait longer than a few seconds for page details.
-    const answered = page.evaluate(() => {
-      const safe = (fn) => { try { return fn(); } catch (e) { return null; } };
-      const text = safe(() => (document.body ? document.body.innerText : "")) || "";
-      return {
-        href: safe(() => location.href) || "",
-        title: safe(() => document.title) || "",
-        readyState: safe(() => document.readyState) || "",
-        hasRequire: safe(() => typeof window.require === "function") === true,
-        hasSocket: safe(() => !!(window.require && window.require("WAWebSocketModel") &&
-          window.require("WAWebSocketModel").Socket)) === true,
-        hasAuthStore: safe(() => !!window.AuthStore) === true,
-        hasPairingUtils: safe(() => !!(window.AuthStore && window.AuthStore.PairingCodeLinkUtils)) === true,
-        authStoreKeys: safe(() => (window.AuthStore ? Object.keys(window.AuthStore).slice(0, 30) : [])) || [],
-        text: String(text).replace(/\s+/g, " ").trim().slice(0, 200),
-      };
-    });
-    const timeout = new Promise((resolve) => setTimeout(
-      () => resolve({ page: "busy", note: "the WhatsApp page did not answer within 8 seconds" }), 8000));
-    return await Promise.race([answered, timeout]);
-  } catch (e) {
-    return { page: "unreachable", error: String(e) };
-  }
-}
-
-Client.prototype.inject = async function patchedInject(...args) {
-  const storeReady = async () => {
-    if (!this.pupPage) return false;
-    try {
-      return await this.pupPage.evaluate(() => {
-        try {
-          const model = window.require && window.require("WAWebSocketModel");
-          return !!(model && model.Socket);
-        } catch (e) {
-          return false;
-        }
-      });
-    } catch (e) {
-      return false;
-    }
-  };
-  const waitForStore = async (seconds) => {
-    const deadline = Date.now() + seconds * 1000;
-    while (Date.now() < deadline) {
-      if (await storeReady()) return true;
-      await new Promise((resolve) => setTimeout(resolve, 1000));
-    }
-    return false;
-  };
-
-  // A first boot on a cold free instance can need well over a minute. Loop
-  // instead of giving up after a single reload. Only one caller may reload the
-  // page, otherwise every navigation would start another reload and the page
-  // would never finish loading.
-  const authInFlight = () =>
-    waState === "linking" ||
-    (authAt && Date.now() - authAt < 5 * 60 * 1000) ||
-    (lastPairAt && Date.now() - lastPairAt < 5 * 60 * 1000);
-
-  for (let attempt = 1; attempt <= 5; attempt += 1) {
-    if (await waitForStore(attempt === 1 ? 45 : 20)) {
-      this._liamStoreSeen = true;
-      try {
-        return await _originalInject.apply(this, args);
-      } catch (e) {
-        const msg = String(e && e.stack ? e.stack : e);
-        if (!/reading 'Socket'|Cannot read properties of null|AuthStore/i.test(msg)) throw e;
-        waInjectDiag = msg;
-        console.log(`warn: WhatsApp inject raced the page load (attempt ${attempt}): ${msg}`);
-        const info = await describeWaPage(this.pupPage);
-        console.log("warn: page state:", JSON.stringify(info));
-        if (/unsupported|update whatsapp|update your browser/i.test(String(info.text || ""))) {
-          waInjectDiag = "WhatsApp Web says this browser is unsupported: " + String(info.text || "");
-          break;
-        }
-        await new Promise((resolve) => setTimeout(resolve, 3000));
-        continue;
-      }
-    }
-
-    // Never reload a page that has already loaded or while a QR/pairing-code
-    // login is being completed: a reload cancels the handshake, so the phone
-    // shows the device as linked while the server falls back to a new QR.
-    if (this._liamStoreSeen || authInFlight()) {
-      console.log(`warn: WhatsApp Web is reloading itself (attempt ${attempt}); waiting instead of forcing a reload`);
-      await new Promise((resolve) => setTimeout(resolve, 5000));
-      continue;
-    }
-    if (this._liamReloading) {
-      try { await this._liamReloading; } catch (e) {}
-      continue;
-    }
-    console.log(`warn: WhatsApp Web not ready yet (attempt ${attempt}); reloading the page`);
-    this._liamReloading = (async () => {
-      try {
-        await this.pupPage.reload({ waitUntil: "load", timeout: 90000 });
-      } catch (e) {}
-    })();
-    try {
-      await this._liamReloading;
-    } finally {
-      this._liamReloading = null;
-    }
-  }
-  throw new Error("WhatsApp Web never finished loading. " + (waInjectDiag || "page stayed empty"));
-};
-const QRCode = require("qrcode");
 const path = require("path");
 const fs = require("fs");
 const os = require("os");
@@ -256,29 +142,17 @@ if (!fs.existsSync(SESSION_DIR) && fs.existsSync(LEGACY_SESSION)) {
   try { fs.chmodSync(SESSION_DIR, 0o700); } catch (e) {}
 }
 
-// Remove QR images left behind by earlier runs.
+// Remove QR images left behind by earlier runs. Linking now uses an
+// 8-character phone code, but old deployments may still have these files.
 for (const name of ["liam_qr.png", "whatsapp_qr.png", "scan_liam.png"]) {
   try { fs.rmSync(path.join(BASE_DIR, name), { force: true }); } catch (e) {}
 }
 try { fs.rmSync(QR_FILE, { force: true }); } catch (e) {}
 
-// Drop web-version cache entries that do not match the pinned WhatsApp version.
-function pinnedWebVersion() {
-  try {
-    const source = fs.readFileSync(path.join(
-      BASE_DIR, "node_modules", "whatsapp-web.js", "src", "util", "Constants.js"), "utf8");
-    const match = /webVersion:\s*'([^']+)'/.exec(source);
-    return match ? match[1] : null;
-  } catch (e) { return null; }
-}
-const CACHE_DIR = path.join(BASE_DIR, ".wwebjs_cache");
-const PINNED_VERSION = pinnedWebVersion();
-if (fs.existsSync(CACHE_DIR)) {
-  for (const name of fs.readdirSync(CACHE_DIR)) {
-    if (!PINNED_VERSION || !name.startsWith(PINNED_VERSION + ".")) {
-      try { fs.rmSync(path.join(CACHE_DIR, name), { recursive: true, force: true }); } catch (e) {}
-    }
-  }
+// Old whatsapp-web.js builds left a Chromium profile and a web-version cache
+// behind. Nothing reads them any more, so remove them to keep the archive small.
+for (const stale of [path.join(BASE_DIR, ".wwebjs_cache"), path.join(BASE_DIR, "node_modules", "whatsapp-web.js")]) {
+  try { if (fs.existsSync(stale)) fs.rmSync(stale, { recursive: true, force: true }); } catch (e) {}
 }
 
 // ---------------------------------------------------------------------------
@@ -330,29 +204,34 @@ function writeFileAtomic(file, value) {
 }
 
 // ---------------------------------------------------------------------------
-// WhatsApp client
+// WhatsApp state
 // ---------------------------------------------------------------------------
-function puppeteerArgs() {
-  const base = [
-    "--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage",
-    "--disable-gpu", "--no-first-run", "--no-zygote",
-  ];
-  if (process.env.LIAM_CHROME_SINGLE_PROCESS === "1") base.push("--single-process");
-  return base;
-}
-
 let waState = "starting";        // starting | restoring | needs_qr | linking | ready | disconnected | error
 let waStateDetail = "";
 let waInitError = "";
-let waLastQrAt = 0;
 let waInitPromise = null;
-let lastQr = null;
+let waLastQrAt = 0;              // last time the socket was ready to pair
 let lastPairCode = null;
 let lastPairAt = 0;
 let pairingError = "";
-let lastQrLogAt = 0;
 let authAt = 0;
 let pairingInFlight = null;
+let pairingEpoch = 0;
+
+// The one live Baileys socket. `connecting` covers the async gap while a new
+// socket is being created; `sockReadyForPairing` becomes true only after
+// WhatsApp sends the first QR payload, which is the moment requestPairingCode()
+// is allowed (calling it earlier fails with "couldn't link device").
+let sock = null;
+let connecting = false;
+let sockReadyForPairing = false;
+let registered = false;
+let readyHandled = false;
+let reconnectTimer = null;
+let reconnectDelayMs = 3000;
+let waVersion = null;
+let closeCount = 0;
+let closeWindowStart = 0;
 
 // Small ring buffer of connection events. Render's free logs are painful to
 // read from a phone, so /diag exposes the last few events instead.
@@ -369,17 +248,16 @@ function setWaState(state, detail = "") {
   waStateDetail = detail || "";
 }
 
-// True while the phone is completing a QR scan or a phone-code login. Nothing
-// may reload or restart the browser in this window: doing so cancels the
-// handshake and leaves a "zombie" device on the phone while the server falls
-// back to a new QR.
+// True while the phone is completing an 8-character code login. Nothing may
+// restart the socket in this window: doing so cancels the handshake and leaves
+// a "zombie" device on the phone while the server falls back to a new code.
 function linkHandshakeActive() {
   return waState === "linking" &&
     Date.now() - Math.max(lastPairAt || 0, authAt || 0) < 5 * 60 * 1000;
 }
 
-// Real container memory (includes Chromium). Render kills the instance when the
-// free plan's limit is exceeded, so this is the number that matters.
+// Real container memory. Render kills the instance when the free plan's limit
+// is exceeded, so this is the number that matters.
 function containerMemoryInfo() {
   const readNum = (file) => {
     try {
@@ -406,28 +284,20 @@ function containerMemoryMiB() {
   return containerMemoryInfo().usedMiB;
 }
 
+// Baileys keeps its login in this directory: creds.json plus a handful of
+// app-state keys. It lives inside SESSION_DIR so it travels with the Supabase
+// archive under the same "liam_session/session" path as before.
+const CREDS_FILE = path.join(SESSION_PROFILE_DIR, "creds.json");
 function profileHasCredentials() {
-  const markers = [
-    path.join(SESSION_PROFILE_DIR, "Default", "Preferences"),
-    path.join(SESSION_PROFILE_DIR, "Default", "Local Storage", "leveldb"),
-    path.join(SESSION_PROFILE_DIR, "Default", "IndexedDB"),
-    path.join(SESSION_PROFILE_DIR, "Local State"),
-  ];
-  if (markers.some((p) => { try { return fs.existsSync(p); } catch (e) { return false; } })) return true;
-  // Older profiles may not have the exact markers; an empty LocalAuth profile
-  // (just the session directory) must not count as a linked session.
-  try {
-    if (!fs.existsSync(SESSION_PROFILE_DIR)) return false;
-    return fs.readdirSync(SESSION_PROFILE_DIR).some((name) => name !== "Default" && name !== "SingletonLock");
-  } catch (e) { return false; }
+  try { return fs.existsSync(CREDS_FILE); } catch (e) { return false; }
 }
 function hasSessionData() { return profileHasCredentials(); }
 
 // A marker written only after WhatsApp confirms the login. It lives next to the
-// Chromium profile (inside SESSION_DIR, so it travels with the Supabase
-// archive). Boot uses it to tell a real linked session from a dead profile:
-// Chromium always writes files like "Local State" into an empty profile, so the
-// file listing alone cannot prove that WhatsApp is linked.
+// credentials (inside SESSION_DIR, so it travels with the Supabase archive).
+// Boot uses it to tell a real linked session from a half-finished pairing:
+// Baileys writes creds.json before the phone confirms the code, so the file
+// alone cannot prove that WhatsApp is linked.
 const LINK_MARKER = path.join(SESSION_DIR, "wa_linked.json");
 function hasLinkMarker() {
   try { return fs.existsSync(LINK_MARKER); } catch (e) { return false; }
@@ -445,15 +315,9 @@ function markLinked(extra) {
 function clearLinkMarker() {
   try { fs.rmSync(LINK_MARKER, { force: true }); } catch (e) {}
 }
-
-const client = new Client({
-  authStrategy: new LocalAuth({ dataPath: SESSION_DIR }),
-  puppeteer: {
-    headless: true,
-    args: puppeteerArgs(),
-    protocolTimeout: Number.parseInt(process.env.LIAM_PUPPETEER_TIMEOUT_MS || "180000", 10),
-  },
-});
+function removeQrFile() {
+  try { fs.rmSync(QR_FILE, { force: true }); } catch (e) {}
+}
 
 function loadDmOpen() {
   if (process.env.LIAM_DM_OPEN != null) return String(process.env.LIAM_DM_OPEN || "0") === "1";
@@ -493,6 +357,23 @@ let agentQueue = Promise.resolve();
 
 function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
 
+// A plain Promise.race leaves the losing timer running, which keeps a Node test
+// process (and any short-lived script) alive for minutes. This clears it.
+async function withTimeout(promise, ms, message) {
+  let timer = null;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(message)), ms);
+        if (typeof timer.unref === "function") timer.unref();
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 function pythonBin() {
   const candidates = [];
   if (process.env.LIAM_PYTHON) candidates.push(process.env.LIAM_PYTHON);
@@ -507,6 +388,8 @@ function pythonBin() {
 }
 
 function startAgent() {
+  // Tests drive the HTTP surface without spawning Python.
+  if (String(process.env.LIAM_DISABLE_AGENT || "") === "1") return null;
   if (agentProc && agentProc.exitCode === null && !agentProc.killed) return agentProc;
   let bin;
   try { bin = pythonBin(); }
@@ -587,26 +470,161 @@ const LID_MAP_FILE = path.join(DATA_DIR, "lid_map.json");
 let lidCache = new Map();
 try { const raw = JSON.parse(fs.readFileSync(LID_MAP_FILE, "utf8")); for (const [k,v] of Object.entries(raw)) lidCache.set(k,v); } catch (e) {}
 function saveLidMap() { try { fs.writeFileSync(LID_MAP_FILE, JSON.stringify(Object.fromEntries(lidCache)), { mode: 0o600 }); } catch (e) {} }
-async function resolvePhone(id) {
-  const raw = String(id || "");
-  const base = bareId(raw);
-  if (!raw.includes("@lid")) return base;
-  if (lidCache.has(base)) return lidCache.get(base);
-  let phone = null;
-  try {
-    const res = await client.getContactLidAndPhone([raw]);
-    const pn = res && res[0] && res[0].pn;
-    if (pn) phone = bareId(pn);
-  } catch (e) { console.log("🔍 LID lookup failed:", String(e)); }
-  if (!phone) {
-    try {
-      const c = await client.getContactById(raw);
-      if (c && c.number) phone = bareId(c.number);
-    } catch (e) { console.log("🔍 contact lookup failed:", String(e)); }
-  }
-  if (phone) { lidCache.set(base, phone); saveLidMap(); }
-  return phone || null;
+
+// WhatsApp now hides phone numbers behind LIDs in many chats. Permissions are
+// keyed by phone number, so keep the LID -> phone mapping learned from contact
+// updates and group metadata.
+const lidContacts = new Map();
+
+function isLidJid(value) { return String(value || "").includes("@lid"); }
+function barePhone(value) {
+  const raw = String(value || "");
+  if (!raw || isLidJid(raw)) return "";
+  const phone = bareId(raw);
+  return /^\d{6,20}$/.test(phone) ? phone : "";
 }
+
+function rememberLidContacts(contacts) {
+  if (!Array.isArray(contacts)) return;
+  let changed = false;
+  for (const contact of contacts) {
+    if (!contact) continue;
+    const lid = String(contact.lid || "");
+    const phone = barePhone(contact.id || contact.jid || "");
+    if (!lid.includes("@lid") || !phone) continue;
+    const lidBare = bareId(lid);
+    if (!lidBare || lidContacts.has(lidBare)) continue;
+    lidContacts.set(lidBare, phone);
+    lidCache.set(lidBare, phone);
+    changed = true;
+  }
+  if (changed) saveLidMap();
+}
+
+// Group participants carry both identities. Prefer the phone-number one.
+function pnFromParticipant(participant) {
+  if (!participant) return "";
+  for (const candidate of [participant.phoneNumber, participant.id, participant.lid]) {
+    const value = candidate && typeof candidate === "object"
+      ? (candidate.id || candidate._serialized || candidate.user || "")
+      : candidate;
+    const phone = barePhone(value);
+    if (phone) return phone;
+  }
+  return "";
+}
+
+function socketSelfIds() {
+  const ids = new Set();
+  try {
+    if (sock && sock.user) {
+      for (const value of [sock.user.id, sock.user.lid, sock.user.jid]) {
+        const bare = bareId(value);
+        if (bare) ids.add(bare);
+      }
+    }
+  } catch (e) {}
+  return [...ids];
+}
+
+function socketUserId() {
+  try { return sock && sock.user ? String(sock.user.id || sock.user.jid || "") : ""; } catch (e) { return ""; }
+}
+
+async function resolvePhone(id, message) {
+  const raw = String(id || "");
+  if (!raw) return null;
+  if (!isLidJid(raw)) return barePhone(raw) || null;
+  const base = bareId(raw);
+  const key = message && message.key ? message.key : {};
+
+  // The message key usually carries the phone-number alias.
+  for (const candidate of [key.participantPn, key.senderPn, key.remoteJidAlt]) {
+    const phone = barePhone(candidate);
+    if (phone) return phone;
+  }
+  if (lidCache.has(base)) return lidCache.get(base);
+  if (lidContacts.has(base)) {
+    const phone = lidContacts.get(base);
+    lidCache.set(base, phone);
+    saveLidMap();
+    return phone;
+  }
+
+  // Group metadata pairs each LID with its phone-number JID.
+  const chatJid = key.remoteJid || "";
+  if (chatJid && isJidGroup(chatJid) && sock) {
+    try {
+      const meta = await sock.groupMetadata(chatJid);
+      for (const participant of (meta && meta.participants) || []) {
+        const lid = participant && participant.lid ? bareId(participant.lid) : "";
+        const phone = pnFromParticipant(participant);
+        if (!phone) continue;
+        if (lid === base || bareId(participant.id) === base || phone === base) {
+          lidCache.set(base, phone);
+          saveLidMap();
+          return phone;
+        }
+      }
+    } catch (e) {}
+  }
+
+  // Newer Baileys builds keep a LID mapping in the signal repository.
+  try {
+    const mapping = sock && sock.signalRepository && sock.signalRepository.lidMapping;
+    if (mapping && typeof mapping.getPNForLID === "function") {
+      const result = await mapping.getPNForLID(raw);
+      const phone = barePhone(result && (result.id || result.phoneNumber || result));
+      if (phone) { lidCache.set(base, phone); saveLidMap(); return phone; }
+    }
+  } catch (e) {}
+
+  // Last resort: ask WhatsApp about this identity.
+  try {
+    const list = await sock.onWhatsApp(raw);
+    if (Array.isArray(list)) {
+      for (const hit of list) {
+        const phone = barePhone(hit && (hit.jid || hit.pn || hit.phoneNumber));
+        if (phone) { lidCache.set(base, phone); saveLidMap(); return phone; }
+      }
+    }
+  } catch (e) { console.log("🔍 LID lookup failed:", String(e && e.message ? e.message : e)); }
+  console.log("warn: could not map a LID sender to a phone number:", base);
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// Thin adapter so the rest of the bridge does not care that Baileys replaced
+// whatsapp-web.js. Targets are phone-number JIDs; groups and LIDs pass through.
+// ---------------------------------------------------------------------------
+function jidForSend(value) {
+  const raw = String(value || "").trim();
+  if (!raw) throw new Error("missing recipient");
+  if (/@(?:g\.us|lid|broadcast|newsletter|s\.whatsapp\.net)$/i.test(raw)) return raw;
+  if (/@c\.us$/i.test(raw)) return raw.replace(/@c\.us$/i, "@s.whatsapp.net");
+  if (/^\d{6,20}(?::\d+)?$/.test(raw)) return raw.split(":")[0] + "@s.whatsapp.net";
+  return raw;
+}
+
+function messageId(sent) {
+  try { return sent && sent.key && sent.key.id ? String(sent.key.id) : null; } catch (e) { return null; }
+}
+
+const wa = {
+  get connected() { return !!(sock && registered); },
+  async sendMessage(jid, content, options) {
+    if (!sock) throw new Error("WhatsApp is not connected");
+    return sock.sendMessage(jidForSend(jid), content, options);
+  },
+  async groupMetadata(jid) {
+    if (!sock) throw new Error("WhatsApp is not connected");
+    return sock.groupMetadata(jidForSend(jid));
+  },
+  async leaveGroup(jid) {
+    if (!sock) throw new Error("WhatsApp is not connected");
+    return sock.groupLeave(jidForSend(jid));
+  },
+};
 
 function askLiam(user, phone, isGroup, groupJid, mentioned, replyTo) {
   const job = () => new Promise((resolve, reject) => {
@@ -687,9 +705,11 @@ function participantId(participant) {
 
 async function ownerIdsInGroup(jid) {
   try {
-    const chat = await client.getChatById(jid);
-    const parts = Array.isArray(chat && chat.participants) ? chat.participants : [];
-    return OWNERS.filter((owner) => parts.some((p) => participantId(p) === owner));
+    const meta = await wa.groupMetadata(jid);
+    const parts = Array.isArray(meta && meta.participants) ? meta.participants : [];
+    return OWNERS.filter((owner) => parts.some((p) => (
+      participantId(p) === owner || pnFromParticipant(p) === owner
+    )));
   } catch (e) {
     return [];
   }
@@ -701,8 +721,8 @@ async function sendApprovalPrompt(text, groupJid) {
     if (owners.length) {
       const tags = owners.map((o) => "@" + o).join(" ");
       try {
-        await client.sendMessage(groupJid, `${tags} ${text}`.trim(), {
-          mentions: owners.map((o) => o + "@c.us"),
+        await wa.sendMessage(groupJid, `${tags} ${text}`.trim(), {
+          mentions: owners.map((o) => o + "@s.whatsapp.net"),
         });
         return true;
       } catch (e) { console.log("warn: group approval prompt failed:", String(e)); }
@@ -711,7 +731,7 @@ async function sendApprovalPrompt(text, groupJid) {
   let sent = 0;
   for (const owner of OWNERS) {
     try {
-      await client.sendMessage(owner + "@c.us", text);
+      await wa.sendMessage(owner + "@s.whatsapp.net", text);
       sent += 1;
     } catch (e) { console.log("warn: owner approval DM failed:", String(e)); }
   }
@@ -794,12 +814,12 @@ async function executeToolApproval(id, ownerChat) {
     const target = chatTarget(p.chat || p.actor, p.isGroup);
     await sendLong(target, `✅ Approved ${p.action} — result:\n${text.slice(0, 3500)}`);
     if (ownerChat && ownerChat !== target) {
-      try { await client.sendMessage(ownerChat, `Done — ${p.action} ran.`); } catch (e) {}
+      try { await wa.sendMessage(ownerChat, `Done — ${p.action} ran.`); } catch (e) {}
     }
     return "approved and executed";
   } catch (e) {
     const message = e instanceof BadRequest ? e.message : "the approved action failed";
-    try { await client.sendMessage(chatTarget(p.chat || p.actor, p.isGroup), `❌ ${p.action} failed: ${message}`); } catch (e2) {}
+    try { await wa.sendMessage(chatTarget(p.chat || p.actor, p.isGroup), `❌ ${p.action} failed: ${message}`); } catch (e2) {}
     return message;
   }
 }
@@ -822,7 +842,7 @@ async function handleApprovalCommand(text, phone, chat, isGroup) {
       await executeToolApproval(toolId, chat);
     } else {
       pendingTools.delete(toolId);
-      try { await client.sendMessage(chat, `🚫 denied ${toolId} (${p ? p.action : "tool"}).`); } catch (e) {}
+      try { await wa.sendMessage(chat, `🚫 denied ${toolId} (${p ? p.action : "tool"}).`); } catch (e) {}
     }
     return true;
   }
@@ -839,7 +859,7 @@ async function handleApprovalCommand(text, phone, chat, isGroup) {
     pool.sort((a, b) => b.ts - a.ts);
     if (pool.length === 1) permId = pool[0].id;
     else if (pool.length > 1) {
-      try { await client.sendMessage(chat, "There is more than one request — reply with the id, e.g. `yes p123abc`."); } catch (e) {}
+      try { await wa.sendMessage(chat, "There is more than one request — reply with the id, e.g. `yes p123abc`."); } catch (e) {}
       return true;
     }
   }
@@ -849,88 +869,81 @@ async function handleApprovalCommand(text, phone, chat, isGroup) {
     if (!allow) {
       TEMP[p.jid] = TEMP[p.jid] || {};
       TEMP[p.jid][p.phone] = -Date.now();
-      try { await client.sendMessage(p.jid, `okay, I won't reply to ${p.phone} in this group.`); } catch (e) {}
-      if (chat !== p.jid) { try { await client.sendMessage(chat, `okay — denied ${p.id}.`); } catch (e) {} }
+      try { await wa.sendMessage(p.jid, `okay, I won't reply to ${p.phone} in this group.`); } catch (e) {}
+      if (chat !== p.jid) { try { await wa.sendMessage(chat, `okay — denied ${p.id}.`); } catch (e) {} }
       return true;
     }
     TEMP[p.jid] = TEMP[p.jid] || {};
     TEMP[p.jid][p.phone] = Date.now();
-    try { await client.sendMessage(p.jid, `okay, I'll reply to ${p.phone} for the next 3 hours.`); } catch (e) {}
+    try { await wa.sendMessage(p.jid, `okay, I'll reply to ${p.phone} for the next 3 hours.`); } catch (e) {}
     try {
       const reply = await askLiam(p.text, p.phone, true, p.jid, true, false);
-      const sent = await client.sendMessage(p.jid, reply);
-      rememberLiamMessage(p.jid, sent && sent.id ? sent.id._serialized : null);
+      const sent = await wa.sendMessage(p.jid, reply);
+      rememberLiamMessage(p.jid, messageId(sent));
     } catch (e) { console.log("warn: approved reply failed:", String(e)); }
-    if (chat !== p.jid) { try { await client.sendMessage(chat, `okay — allowed ${p.phone} for 3 hours.`); } catch (e) {} }
+    if (chat !== p.jid) { try { await wa.sendMessage(chat, `okay — allowed ${p.phone} for 3 hours.`); } catch (e) {} }
     return true;
   }
 
   if (wanted) {
     const prefix = wanted[0];
     if (prefix === "t" || prefix === "p") {
-      try { await client.sendMessage(chat, `I don't see ${wanted} — it expired or was already used.`); } catch (e) {}
+      try { await wa.sendMessage(chat, `I don't see ${wanted} — it expired or was already used.`); } catch (e) {}
       return true;
     }
   }
   if (!wanted && pendingTools.size) {
     try {
-      await client.sendMessage(chat, "Tool approvals need the request id — reply `yes t…` or `no t…`.");
+      await wa.sendMessage(chat, "Tool approvals need the request id — reply `yes t…` or `no t…`.");
     } catch (e) {}
     return true;
   }
   return false;
 }
 
-function removeQr() {
-  lastQr = null;
-  try { fs.rmSync(QR_FILE, { force: true }); } catch (e) {}
+// Baileys logs every protocol frame at debug level. On Render's free log plan
+// that is noise, so drop everything and print only the events Liam cares about.
+function baileysLogger() {
+  const noop = () => {};
+  const logger = {
+    level: "silent",
+    trace: noop, debug: noop, info: noop, warn: noop, error: noop, fatal: noop,
+    child: () => logger,
+  };
+  return logger;
 }
 
-client.on("qr", async (qr) => {
-  // After a scan WhatsApp reloads the web app and can emit one last QR from the
-  // old page. Ignoring it keeps the phone-side "linked" state from flipping
-  // back to "scan me" while authentication finishes. The same applies to a
-  // phone-code login: WhatsApp Web keeps emitting QRs behind the code screen,
-  // and showing them would hide that a link is in progress.
-  const pairingWindow = linkHandshakeActive();
-  if (waState === "ready" || pairingWindow) {
-    return;
-  }
-  setWaState("needs_qr", "scan the QR code or use the pairing page to link WhatsApp");
-  waLastQrAt = Date.now();
-  lastQr = String(qr || "");
-  noteWaEvent("qr");
+function closeStatusCode(lastDisconnect) {
+  const error = lastDisconnect && lastDisconnect.error;
+  if (!error) return 0;
+  const output = error.output || {};
+  return Number(output.statusCode) || Number(error.statusCode) || 0;
+}
+
+function socketIsRegistered() {
   try {
-    await QRCode.toFile(QR_FILE, qr, { width: 520, margin: 2 });
-    try { fs.chmodSync(QR_FILE, 0o600); } catch (e) {}
-    // WhatsApp rotates the QR every ~20 seconds. Writing the file every time is
-    // required, but logging every rotation only floods Render's log viewer.
-    if (!lastQrLogAt || Date.now() - lastQrLogAt >= 5 * 60 * 1000) {
-      lastQrLogAt = Date.now();
-      console.log("\n📱 QR READY — open the pairing page from the logs to scan it.");
-    }
-  } catch (e) { console.log("\n❌ QR FAILED:", String(e)); }
-});
-client.on("code", (code) => { lastPairCode = String(code || ""); lastPairAt = Date.now(); setWaState("linking", "pairing code generated"); noteWaEvent("code"); });
-let readyHandled = false;
+    const creds = sock && sock.authState && sock.authState.creds;
+    return !!(creds && creds.registered);
+  } catch (e) { return false; }
+}
+
 function handleReady() {
   if (readyHandled) return;
   readyHandled = true;
+  registered = true;
+  sockReadyForPairing = false;
+  reconnectDelayMs = 3000;
+  closeCount = 0;
+  closeWindowStart = 0;
+  pairingError = "";
   noteWaEvent("ready");
   console.log("\n🚀 LIAM IS LIVE — waiting for messages...\n");
-  removeQr();
+  removeQrFile();
   setWaState("ready", "WhatsApp connected");
   // Remember that this profile is a real, completed login. Boot wipes any
   // profile without this marker so a half-finished link cannot poison the next
   // attempt.
-  try {
-    const wid = client.info && client.info.wid
-      ? String(client.info.wid._serialized || client.info.wid)
-      : "linked";
-    markLinked({ wid });
-  } catch (e) {
-    markLinked({ wid: "linked" });
-  }
+  markLinked({ wid: socketUserId() || "linked" });
   startAgent();
   // Start backups only after WhatsApp is actually linked. Before this point
   // the profile is disposable and must never replace a good cloud copy.
@@ -946,93 +959,180 @@ function handleReady() {
   }, 3000);
 }
 
-client.on("authenticated", () => {
-  authAt = Date.now();
-  noteWaEvent("authenticated");
-  removeQr();
-  setWaState("linking", "authenticated, finishing startup");
-  console.log("\n✅ LIAM LINKED — finishing startup\n");
-  // Some WhatsApp Web builds authenticate but never emit "ready". Poll the
-  // connection for a few minutes and start the agent as soon as it is
-  // CONNECTED, instead of dropping the new login and showing another QR.
-  let checks = 0;
-  const poll = setInterval(async () => {
-    checks += 1;
-    if (readyHandled || waState === "ready") { clearInterval(poll); return; }
-    if (checks > 18) { clearInterval(poll); return; }
+function scheduleReconnect(reason, delay) {
+  if (reconnectTimer || resetInFlight) return;
+  const wait = Math.max(500, Number.isFinite(delay) ? delay : reconnectDelayMs);
+  reconnectTimer = setTimeout(async () => {
+    reconnectTimer = null;
+    if (waState === "ready") return;
+    if (resetInFlight) return;
+    noteWaEvent("reconnect", `${reason} (after ${wait} ms)`);
     try {
-      const state = await Promise.race([
-        client.getState(),
-        new Promise((_, reject) => setTimeout(() => reject(new Error("state timeout")), 10000)),
-      ]);
-      if (String(state) === "CONNECTED") {
-        console.log("note: ready event was delayed; WhatsApp state is CONNECTED");
-        clearInterval(poll);
-        handleReady();
-      }
-    } catch (e) {}
-  }, 10000);
-});
-client.on("auth_failure", (m) => {
-  removeQr();
-  clearLinkMarker();
-  setWaState("error", "WhatsApp auth failed");
-  noteWaEvent("auth_failure", m);
-  console.log("\n❌ AUTH FAILED:", String(m));
+      await initializeWhatsApp(`reconnect: ${reason}`);
+    } catch (e) {
+      console.log("warn: reconnect failed:", String(e).split("\n")[0]);
+    }
+  }, wait);
+  if (typeof reconnectTimer.unref === "function") reconnectTimer.unref();
+  reconnectDelayMs = Math.min(60000, Math.max(3000, reconnectDelayMs * 2));
+}
+
+function handleConnectionClose(socket, status, detail) {
+  if (socket !== sock) return;
+  sockReadyForPairing = false;
+  registered = false;
+  readyHandled = false;
+  const reason = String(detail || "").split("\n")[0].slice(0, 200);
+  noteWaEvent("closed", `${status || "?"} ${reason}`);
+  console.log(`\n⚠️ WhatsApp connection closed (${status || "unknown"})${reason ? ": " + reason : ""}`);
   stopAgent();
-  autoReset("WhatsApp rejected the login");
-});
-client.on("loading_screen", (percent) => { if (Number(percent) >= 100) console.log("info: WhatsApp Web loaded 100%"); });
-client.on("ready", handleReady);
-let disconnectCount = 0;
-let disconnectWindowStart = 0;
-client.on("disconnected", (r) => {
-  removeQr();
-  const reason = String(r && r.toString ? r.toString() : r);
-  noteWaEvent("disconnected", reason);
-  console.log("\n⚠️ Disconnected:", reason);
-  stopAgent();
-  if (/LOGOUT/i.test(reason)) {
-    // The phone removed this device. The stored profile is dead; restart with
-    // a clean QR instead of restoring it.
+
+  if (status === DisconnectReason.loggedOut) {
+    // The phone removed this device. The stored profile is dead, so start over
+    // with a clean one instead of reconnecting with dead credentials.
     clearLinkMarker();
-    setWaState("error", "WhatsApp logged out");
-    autoReset("the phone removed this device");
+    setWaState("error", "the phone removed this device; link it again");
+    resetWhatsApp("the phone removed this device").catch((e) => console.log("warn: reset after logout failed:", String(e)));
     return;
   }
-  const now = Date.now();
-  if (!disconnectWindowStart || now - disconnectWindowStart > 5 * 60 * 1000) {
-    disconnectWindowStart = now;
-    disconnectCount = 0;
+
+  if (status === DisconnectReason.restartRequired) {
+    // This is the normal end of a successful 8-character code login: WhatsApp
+    // closes the socket once and wants an immediate reconnect with the new
+    // credentials. Never wipe anything here.
+    setWaState("linking", "code accepted - finishing login");
+    noteWaEvent("restart_required", "reconnecting with the new credentials");
+    scheduleReconnect("restart required", 1000);
+    return;
   }
-  disconnectCount += 1;
-  if (disconnectCount > 2) {
+
+  const rateLimited = status === 429 || /rate[- ]?overlimit|too many|429/i.test(reason);
+  if (rateLimited) {
+    setWaState("disconnected", "WhatsApp is limiting this number; waiting 5 minutes");
+    noteWaEvent("rate_limited", reason);
+    scheduleReconnect("rate limited", 5 * 60 * 1000);
+    return;
+  }
+
+  const now = Date.now();
+  if (!closeWindowStart || now - closeWindowStart > 5 * 60 * 1000) {
+    closeWindowStart = now;
+    closeCount = 0;
+  }
+  closeCount += 1;
+  if (closeCount > 3) {
     setWaState("error", "WhatsApp keeps disconnecting");
     autoReset("WhatsApp keeps disconnecting");
     return;
   }
-  // Keep the freshly-linked profile alive: close the broken browser and start
-  // again from the same session instead of exiting and losing the pairing.
   setWaState("disconnected", "connection dropped; reconnecting");
-  setTimeout(async () => {
-    try {
-      if (waState === "ready") return;
-      // Never tear the browser down in the middle of a scan or phone-code
-      // handshake: WhatsApp Web reconnects on its own, and a restart here is
-      // exactly what leaves a zombie device on the phone.
-      if (linkHandshakeActive()) {
-        noteWaEvent("reconnect_deferred", "link in progress");
-        console.log("info: not restarting the browser while a link is being completed");
-        return;
+  scheduleReconnect(`closed (${status || "unknown"})`, reconnectDelayMs);
+}
+
+function onConnectionUpdate(socket, update) {
+  if (socket !== sock) return;
+  const { connection, lastDisconnect, qr } = update || {};
+  if (qr) {
+    if (socketIsRegistered()) {
+      // After a code login WhatsApp can emit one last QR while credentials are
+      // already registered. Showing "scan me" there would look like a failure.
+      noteWaEvent("qr_ignored", "credentials are already registered");
+    } else {
+      sockReadyForPairing = true;
+      waLastQrAt = Date.now();
+      noteWaEvent("qr_ready");
+      if (waState !== "ready" && waState !== "linking") {
+        setWaState("needs_qr", "ready to link - open the pairing page");
+        console.log("\n📱 READY TO PAIR — open the pairing page and press the button.");
       }
-      readyHandled = false;
-      try { if (client.pupBrowser) await client.destroy(); } catch (e) {}
-      await sleep(3000);
-      await initializeWhatsApp("reconnect after disconnect");
-    } catch (e) { console.log("warn: reconnect failed:", String(e)); }
-  }, 5000);
-});
-client.on("change_state", (s) => { if (waState !== "ready" && waState !== "needs_qr") setWaState(waState, String(s || waStateDetail)); });
+    }
+  }
+  if (connection === "open") {
+    sockReadyForPairing = false;
+    authAt = Date.now();
+    noteWaEvent("open");
+    handleReady();
+    return;
+  }
+  if (connection === "close") {
+    const error = lastDisconnect && lastDisconnect.error;
+    handleConnectionClose(socket, closeStatusCode(lastDisconnect), error && error.message);
+  }
+}
+
+async function closeSocket(reason) {
+  if (reconnectTimer) {
+    try { clearTimeout(reconnectTimer); } catch (e) {}
+    reconnectTimer = null;
+  }
+  const current = sock;
+  sock = null;
+  connecting = false;
+  sockReadyForPairing = false;
+  registered = false;
+  if (!current) return;
+  try { current.ev.removeAllListeners("connection.update"); } catch (e) {}
+  try { current.ev.removeAllListeners("creds.update"); } catch (e) {}
+  try { current.end(new Error(reason || "closing")); } catch (e) {}
+  // Give the websocket a moment to send the close frame; it is not required for
+  // correctness, but avoids reconnecting while the old socket is still open.
+  await sleep(150);
+}
+
+async function connectSocket(reason) {
+  if (connecting) return sock;
+  connecting = true;
+  try {
+    await closeSocket(reason);
+    if (!waVersion) {
+      try {
+        const info = await fetchLatestBaileysVersion();
+        waVersion = Array.isArray(info && info.version) ? info.version : null;
+        if (waVersion) console.log("info: WhatsApp Web version", waVersion.join("."));
+      } catch (e) {
+        waVersion = null;
+        console.log("warn: could not fetch the WhatsApp Web version; using the bundled default");
+      }
+    }
+    fs.mkdirSync(SESSION_PROFILE_DIR, { recursive: true, mode: 0o700 });
+    const { state, saveCreds } = await useMultiFileAuthState(SESSION_PROFILE_DIR);
+    const socket = makeWASocket({
+      version: waVersion || undefined,
+      logger: baileysLogger(),
+      printQRInTerminal: false,
+      browser: Browsers.ubuntu("Chrome"),
+      auth: state,
+      markOnlineOnConnect: false,
+      syncFullHistory: false,
+      generateHighQualityLinkPreview: false,
+      // Receipts and decryption retries ask for the original message. Liam
+      // stores nothing, so returning undefined is the honest answer.
+      getMessage: async () => undefined,
+      connectTimeoutMs: 60000,
+      keepAliveIntervalMs: 30000,
+      defaultQueryTimeoutMs: 60000,
+      retryRequestDelayMs: 2000,
+    });
+    sock = socket;
+    readyHandled = false;
+    registered = false;
+    sockReadyForPairing = false;
+    socket.ev.on("creds.update", saveCreds);
+    socket.ev.on("connection.update", (update) => onConnectionUpdate(socket, update));
+    socket.ev.on("messages.upsert", (event) => {
+      if (!event || event.type !== "notify" || !Array.isArray(event.messages)) return;
+      for (const message of event.messages) handleIncomingMessage(message);
+    });
+    // Contact events carry the LID -> phone mapping permissions depend on.
+    const remember = (list) => { try { rememberLidContacts(list); } catch (e) {} };
+    socket.ev.on("contacts.upsert", remember);
+    socket.ev.on("contacts.update", remember);
+    console.log(`info: WhatsApp socket opened (${reason || "startup"})`);
+    return socket;
+  } finally {
+    connecting = false;
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Message routing
@@ -1049,8 +1149,8 @@ function isNameMention(text) {
 function chatTarget(value, isGroup) {
   const raw = String(value || "").trim();
   if (!raw) return raw;
-  if (isGroup || raw.endsWith("@g.us") || raw.endsWith("@c.us")) return raw;
-  return raw + "@c.us";
+  if (isGroup || raw.endsWith("@g.us") || raw.endsWith("@s.whatsapp.net") || raw.endsWith("@lid")) return raw;
+  return raw + "@s.whatsapp.net";
 }
 
 function splitMessage(text, limit = 4000) {
@@ -1073,7 +1173,7 @@ async function sendLong(to, text) {
   let last = null;
   for (const chunk of splitMessage(text)) {
     if (!chunk.trim()) continue;
-    last = await client.sendMessage(to, chunk);
+    last = await wa.sendMessage(to, chunk);
   }
   return last;
 }
@@ -1082,86 +1182,131 @@ async function ownerPresentInGroup(jid) {
   return (await ownerIdsInGroup(jid)).length > 0;
 }
 
-client.on("message", async (msg) => {
-  try {
-  const text = msg.body;
-  if (!text || msg.fromMe) return;
-  const from = msg.from;
-  if (from === "status@broadcast" || from.endsWith("@broadcast") || from.endsWith("@newsletter")) return;
-
-  const isGroup = from.endsWith("@g.us");
-  const senderId = isGroup ? (msg.author || from) : from;
-  const phone = await resolvePhone(senderId);
-  if (!phone) { console.log("warn: could not resolve sender", senderId); return; }
-
-  let replyTo = null;
-  if (msg.hasQuotedMsg) {
-    try { const q = await msg.getQuotedMessage(); replyTo = q && q.id ? q.id._serialized : null; } catch (e) {}
+const recentMessageIds = new Set();
+function seenMessage(id) {
+  if (!id) return false;
+  if (recentMessageIds.has(id)) return true;
+  recentMessageIds.add(id);
+  if (recentMessageIds.size > 500) {
+    const oldest = recentMessageIds.values().next().value;
+    recentMessageIds.delete(oldest);
   }
+  return false;
+}
 
-  // Owner approval/denial works in a DM or in the group, before any gate.
-  if (await handleApprovalCommand(text, phone, from, isGroup)) return;
+function messageText(content, type) {
+  const part = content && content[type];
+  if (!part) return "";
+  switch (type) {
+    case "conversation": return String(content.conversation || "");
+    case "extendedTextMessage": return String(part.text || "");
+    case "imageMessage":
+    case "videoMessage":
+    case "documentMessage": return String(part.caption || "");
+    case "buttonsResponseMessage": return String(part.selectedButtonId || part.selectedDisplayText || "");
+    case "listResponseMessage": return String(part.title || (part.singleSelectReply && part.singleSelectReply.selectedRowId) || "");
+    case "templateButtonReplyMessage": return String(part.selectedDisplayText || part.selectedId || "");
+    default: return "";
+  }
+}
 
-  if (!isGroup) {
-    // .allowdm: owners + admins + known group members. .disallowdm: owners + admins.
-    if (!OWNERS.includes(phone) && (text === ".allowdm" || text === ".disallowdm")) return;
-    if (OWNERS.includes(phone) && (text === ".allowdm" || text === ".disallowdm")) {
-      setDmOpen(text === ".allowdm");
-      const reply = dmOpen
-        ? "okay babe, DMs are open to owners, admins and people I already know from groups"
-        : "okay babe, DMs are closed again — only you, Precious and Temi can reach me now";
-      console.log(`\n📩 [toggle] ${phone}\n💬 Liam: ${reply}\n`);
+function contentContext(content, type) {
+  try {
+    const part = content && content[type];
+    return (part && part.contextInfo) || {};
+  } catch (e) { return {}; }
+}
+
+async function handleIncomingMessage(msg) {
+  try {
+    if (!msg || !msg.message || !msg.key) return;
+    const key = msg.key;
+    if (key.fromMe) return;
+    const from = String(key.remoteJid || "");
+    if (!from || from === "status@broadcast" || from.endsWith("@broadcast") || from.endsWith("@newsletter")) return;
+    if (seenMessage(key.id)) return;
+
+    const content = normalizeMessageContent(msg.message);
+    if (!content) return;
+    const type = getContentType(content);
+    if (!type || type === "protocolMessage" || type === "reactionMessage" ||
+        type === "senderKeyDistributionMessage" || type === "messageContextInfo") return;
+    const text = messageText(content, type);
+    if (!text) return;
+
+    const isGroup = isJidGroup(from) || from.endsWith("@g.us");
+    const senderId = isGroup
+      ? (key.participant || key.participantPn || key.senderPn || from)
+      : (key.remoteJidAlt || from);
+    const phone = await resolvePhone(senderId, msg);
+    if (!phone) { console.log("warn: could not resolve sender", senderId); return; }
+
+    const context = contentContext(content, type);
+    const replyTo = context.stanzaId ? String(context.stanzaId) : null;
+
+    // Owner approval/denial works in a DM or in the group, before any gate.
+    if (await handleApprovalCommand(text, phone, from, isGroup)) return;
+
+    if (!isGroup) {
+      // .allowdm: owners + admins + known group members. .disallowdm: owners + admins.
+      if (!OWNERS.includes(phone) && (text === ".allowdm" || text === ".disallowdm")) return;
+      if (OWNERS.includes(phone) && (text === ".allowdm" || text === ".disallowdm")) {
+        setDmOpen(text === ".allowdm");
+        const reply = dmOpen
+          ? "okay babe, DMs are open to owners, admins and people I already know from groups"
+          : "okay babe, DMs are closed again — only you, Precious and Temi can reach me now";
+        console.log(`\n📩 [toggle] ${phone}\n💬 Liam: ${reply}\n`);
+        await sendLong(from, reply);
+        return;
+      }
+      const allowed = dmAllowed(phone);
+      if (!allowed) return;
+      const reply = await askLiam(text, phone, false, "", false, false);
+      console.log(`\n📩 ${phone}: ${text}\n💬 Liam: ${reply}\n`);
       await sendLong(from, reply);
       return;
     }
-    const allowed = dmAllowed(phone);
-    if (!allowed) return;
-    const reply = await askLiam(text, phone, false, "", false, false);
-    console.log(`\n📩 ${phone}: ${text}\n💬 Liam: ${reply}\n`);
-    await sendLong(from, reply);
-    return;
-  }
 
-  // Track people Liam has seen in a group; used only by .allowdm.
-  if (!OWNERS.includes(phone) && !(phone in ADMINS)) rememberKnownMember(phone);
+    // Track people Liam has seen in a group; used only by .allowdm.
+    if (!OWNERS.includes(phone) && !(phone in ADMINS)) rememberKnownMember(phone);
 
-  const selfId = client.info && client.info.wid ? client.info.wid._serialized : "";
-  const selfBare = bareId(selfId);
-  const mentioned =
-    (Array.isArray(msg.mentionedIds) && msg.mentionedIds.some((id) => bareId(id) === selfBare)) ||
-    (!!selfBare && text.includes("@" + selfBare)) ||
-    isNameMention(text);
-  const replyingToLiam = !!replyTo && isLiamMessage(from, replyTo);
-  if (!mentioned && !replyingToLiam) return;
+    const selfIds = socketSelfIds();
+    const mentionedIds = Array.isArray(context.mentionedJid) ? context.mentionedJid.map(bareId) : [];
+    const mentioned =
+      mentionedIds.some((id) => selfIds.includes(id)) ||
+      selfIds.some((id) => id && text.includes("@" + id)) ||
+      isNameMention(text);
+    const replyingToLiam = !!replyTo && isLiamMessage(from, replyTo);
+    if (!mentioned && !replyingToLiam) return;
 
-  let who;
-  if (OWNERS.includes(phone)) who = "owner";
-  else if (phone in ADMINS) who = "admin";
-  else who = "member";
+    let who;
+    if (OWNERS.includes(phone)) who = "owner";
+    else if (phone in ADMINS) who = "admin";
+    else who = "member";
 
-  // Members need a 3-hour permission per group. Owners and admins do not.
-  if (who === "member") {
-    const decision = tempDecision(from, phone);
-    if (decision === "deny") return;
-    if (decision !== "allow") {
-      const p = await createPermissionRequest(from, phone, text);
-      if (!p) {
-        try { await client.sendMessage(from, "I couldn't reach an owner to approve that, so I didn't reply."); } catch (e) {}
+    // Members need a 3-hour permission per group. Owners and admins do not.
+    if (who === "member") {
+      const decision = tempDecision(from, phone);
+      if (decision === "deny") return;
+      if (decision !== "allow") {
+        const p = await createPermissionRequest(from, phone, text);
+        if (!p) {
+          try { await wa.sendMessage(from, "I couldn't reach an owner to approve that, so I didn't reply."); } catch (e) {}
+          return;
+        }
+        try {
+          await wa.sendMessage(from, `I've asked the owner whether I can reply to ${phone}. (request ${p.id})`);
+        } catch (e) {}
         return;
       }
-      try {
-        await client.sendMessage(from, `I've asked the owner whether I can reply to ${phone}. (request ${p.id})`);
-      } catch (e) {}
-      return;
     }
-  }
 
-  const reply = await askLiam(text, phone, true, from, mentioned, replyingToLiam);
-  console.log(`\n📩 [${from}] ${who} ${phone}: ${text}\n💬 Liam: ${reply}\n`);
-  const sent = await sendLong(from, reply);
-  rememberLiamMessage(from, sent && sent.id ? sent.id._serialized : null);
+    const reply = await askLiam(text, phone, true, from, mentioned, replyingToLiam);
+    console.log(`\n📩 [${from}] ${who} ${phone}: ${text}\n💬 Liam: ${reply}\n`);
+    const sent = await sendLong(from, reply);
+    rememberLiamMessage(from, messageId(sent));
   } catch (e) { console.log(`\n💀 MSG HANDLER ERROR: ${String(e)}`); }
-});
+}
 
 // ---------------------------------------------------------------------------
 // InstaBox pentest VM (members need one-time owner approval)
@@ -1224,9 +1369,11 @@ const outboundLog = [];
 
 function normalizeRecipient(value) {
   const raw = String(value || "").trim();
-  const match = /^(\d{6,20})@c\.us$/.exec(raw);
-  if (match) return match[1] + "@c.us";
-  if (/^\d{6,20}$/.test(raw)) return raw + "@c.us";
+  let match = /^(\d{6,20})@(?:c\.us|s\.whatsapp\.net|newsletter)$/i.exec(raw);
+  if (match) return match[1] + "@s.whatsapp.net";
+  match = /^(\d{6,20})@lid$/i.exec(raw);
+  if (match) return match[1] + "@lid";
+  if (/^\d{6,20}$/.test(raw)) return raw + "@s.whatsapp.net";
   throw new BadRequest("invalid recipient");
 }
 
@@ -1294,8 +1441,8 @@ async function handleAction(d, ctx = {}) {
     const text = String(d.text == null ? "" : d.text);
     if (!text.trim()) throw new BadRequest("message is empty");
     if (text.length > 4096) throw new BadRequest("message is too long");
-    const sent = await client.sendMessage(to, text);
-    return sent && sent.id ? sent.id._serialized : "sent";
+    const sent = await wa.sendMessage(to, text);
+    return messageId(sent) || "sent";
   }
 
   if (action === "image") {
@@ -1305,8 +1452,8 @@ async function handleAction(d, ctx = {}) {
     assertRate();
     const file = assertOutbox(d.path);
     const caption = String(d.text || "").slice(0, 1024);
-    const sent = await client.sendMessage(to, MessageMedia.fromFilePath(file), { caption });
-    return sent && sent.id ? sent.id._serialized : "sent";
+    const sent = await wa.sendMessage(to, { image: fs.readFileSync(file), caption });
+    return messageId(sent) || "sent";
   }
 
   if (action === "voice") {
@@ -1316,19 +1463,18 @@ async function handleAction(d, ctx = {}) {
     assertRate();
     const file = assertOutbox(d.path);
     const mimetype = audioMime(d.mimetype, file);
-    const sent = await client.sendMessage(to, MessageMedia.fromFilePath(file), {
-      sendAudioAsVoice: true,
+    const sent = await wa.sendMessage(to, {
+      audio: fs.readFileSync(file),
       mimetype,
+      ptt: true,
     });
-    return sent && sent.id ? sent.id._serialized : "sent";
+    return messageId(sent) || "sent";
   }
 
   if (action === "leave") {
     assertOwner(d);
     const jid = normalizeGroup(d.jid);
-    const chat = await client.getChatById(jid);
-    if (!chat || typeof chat.leave !== "function") throw new BadRequest("I can't leave that group");
-    await chat.leave();
+    await wa.leaveGroup(jid);
     return "I've left the group";
   }
 
@@ -1468,40 +1614,42 @@ function pairPage(token, opts = {}) {
   const action = `/pair?token=${encodeURIComponent(token)}`;
   const value = opts.phone ? escapeHtml(opts.phone) : BOT_PHONE;
   let result = "";
-  if (opts.error) result = `<p style="color:#fca5a5">${escapeHtml(opts.error)}</p>`;
+  if (opts.error) {
+    result = `<div style="border:1px solid #7f1d1d;background:#2a1215;padding:.8rem 1rem;border-radius:.5rem;margin-bottom:1rem">` +
+      `<p style="margin:0;color:#fecaca"><strong>Could not get a code.</strong> ${escapeHtml(opts.error)}</p></div>`;
+  }
   if (opts.code) {
     const formatted = opts.code.length === 8 ? `${opts.code.slice(0, 4)}-${opts.code.slice(4)}` : opts.code;
     const asked = opts.requestedAt ? new Date(opts.requestedAt).toLocaleTimeString() : "";
-    result = `<p>Enter this 8-character code in WhatsApp → Linked devices → Link with phone number:</p>` +
+    result = `<p>Type this code into WhatsApp <strong>now</strong>:</p>` +
       `<p><code id="code" style="font-size:1.7rem;letter-spacing:.15em">${escapeHtml(formatted)}</code></p>` +
       `<p style="opacity:.8">Requested at ${escapeHtml(asked)}. <strong>Do not close or reload this page.</strong> ` +
-      `If the code is older than about a minute, get a new one below.</p>` +
+      `The code expires in about a minute.</p>` +
       `<p id="age" style="color:#fca5a5;font-weight:600"></p>` +
       `<script>(function(){var t0=Date.now();setInterval(function(){` +
       `var s=Math.round((Date.now()-t0)/1000);var e=document.getElementById('age');if(!e)return;` +
-      `e.textContent = s>75 ? 'This code has almost certainly expired — get a new one below.' : '';` +
+      `e.textContent = s>75 ? 'This code has almost certainly expired - press the button once for a new one.' : '';` +
       `},1000);})();</script>`;
+    return pageShell("Liam pairing", `<h1>Pair Liam</h1>${result}` +
+      `<form method="post" action="${action}">` +
+      `<input type="hidden" name="phone" value="${value}">` +
+      `<button type="submit">Get a new code</button></form>`);
   }
   return pageShell("Liam pairing", `<h1>Pair Liam</h1>${result}` +
-    `<p style="opacity:.8">First open the phone: <strong>WhatsApp → Linked devices → Link with phone number</strong>, ` +
-    `so it is waiting for a code. Then press the button here and type the code straight away.</p>` +
+    `<ol style="line-height:1.7">` +
+    `<li>Keep this page open.</li>` +
+    `<li>On the bot phone, open <strong>WhatsApp Business</strong>.</li>` +
+    `<li>Tap <strong>Settings &rarr; Linked devices &rarr; Link a device</strong>.</li>` +
+    `<li>Tap <strong>Link with phone number instead</strong>.</li>` +
+    `<li>Then press the button below and type the code on the phone <strong>immediately</strong>.</li>` +
+    `</ol>` +
+    `<p style="opacity:.8">WhatsApp allows at most 4 linked devices. If the phone says the list is full, ` +
+    `remove old <strong>Liam</strong> entries there first.</p>` +
     `<form method="post" action="${action}">` +
-    `<label for="phone">WhatsApp number with country code (digits only)</label>` +
+    `<label for="phone">Bot number with country code (digits only)</label>` +
     `<input id="phone" name="phone" inputmode="numeric" autocomplete="tel" value="${value}" required>` +
-    `<button type="submit">${opts.code ? "Get a new code" : "Get pairing code"}</button></form>` +
-    `<p style="opacity:.7">Or use the QR page: <a href="/qr?token=${encodeURIComponent(token)}">/qr</a></p>`);
-}
-
-function qrPage(token, opts = {}) {
-  if (opts.error) return pageShell("Liam QR", `<h1>QR unavailable</h1><p>${escapeHtml(opts.error)}</p>`);
-  if (opts.dataUrl) {
-    return pageShell("Liam QR", `<h1>Scan to link Liam</h1><img alt="WhatsApp QR code" src="${opts.dataUrl}">` +
-      `<p>WhatsApp → Linked devices → Link a device. This page refreshes every 20 seconds.</p>` +
-      `<meta http-equiv="refresh" content="20;url=/qr?token=${encodeURIComponent(token)}">`);
-  }
-  return pageShell("Liam QR", `<h1>Waiting for a QR code…</h1><p>WhatsApp is still starting. This page refreshes automatically.</p>` +
-    `<p>Status: <code>${escapeHtml(waState)}</code></p>` +
-    `<meta http-equiv="refresh" content="3;url=/qr?token=${encodeURIComponent(token)}">`);
+    `<button type="submit">Get pairing code</button></form>` +
+    `<p style="opacity:.7">This page only asks WhatsApp for a code when you press the button.</p>`);
 }
 
 function readBody(req, limit) {
@@ -1521,64 +1669,55 @@ function readBody(req, limit) {
   });
 }
 
-// Stop WhatsApp Web's pairing-code mode and go back to QR mode.
-// requestPairingCode() installs a repeating timer inside the page that retries
-// the alt-device-link request every few minutes. When WhatsApp rate-limits the
-// account, that timer keeps hitting the limit in the background and the QR
-// stops rotating, so a failed code attempt must always be cancelled.
+// A code request writes a half identity into creds.json before WhatsApp answers.
+// Cancelling or failing must return to a clean, unlinked profile so the next
+// attempt is not rejected by a stale companion registration.
 async function cancelPairing() {
-  let cleared = false;
-  try {
-    if (client.pupPage) {
-      cleared = await client.pupPage.evaluate(() => {
-        let had = false;
-        try {
-          if (window.codeInterval) { clearInterval(window.codeInterval); window.codeInterval = null; had = true; }
-        } catch (e) {}
-        return had;
-      });
-    }
-  } catch (e) {}
-  try {
-    if (typeof client.cancelPairingCode === "function") await client.cancelPairingCode();
-  } catch (e) { console.log("warn: cancelPairingCode failed:", String(e).split("\n")[0]); }
-  if (waState !== "ready") setWaState("needs_qr", "pairing cancelled; scan the QR code");
-  return cleared;
+  pairingEpoch += 1;
+  pairingInFlight = null;
+  lastPairCode = null;
+  pairingError = "";
+  noteWaEvent("pairing_cancelled");
+  await closeSocket("pairing cancelled");
+  if (!hasLinkMarker()) {
+    // Never delete a completed login; only drop a half-finished one.
+    try { fs.rmSync(SESSION_PROFILE_DIR, { recursive: true, force: true }); } catch (e) {}
+  }
+  if (waState !== "ready") {
+    setWaState("needs_qr", "pairing cancelled - press the button once for a new code");
+    // Bring a clean socket up so the next button press can request a code.
+    initializeWhatsApp("pairing cancelled").catch(() => {});
+  }
+  return true;
 }
 
-// Wipe the local WhatsApp profile and load a brand-new WhatsApp Web page.
-// A Chromium profile left behind by an interrupted link can keep WhatsApp in a
-// half-linked state; this returns the browser to a clean first-run profile
-// without needing a Render restart.
+// Wipe the local login and connect a brand-new socket. A half-linked Baileys
+// profile can keep WhatsApp in a companion-registration state that refuses new
+// codes; this returns to a clean first-run profile without a Render restart.
 let resetInFlight = null;
 async function resetWhatsApp(reason, opts = {}) {
   if (resetInFlight) return resetInFlight;
   const wipe = opts.wipe !== false;
   resetInFlight = (async () => {
-    noteWaEvent("reset", `${reason || "manual reset"}${wipe ? "" : " (profile kept)"}`);
-    console.log(`\n♻️ Resetting WhatsApp: ${reason || "manual reset"}${wipe ? " (clean profile)" : " (profile kept)"}`);
-    setWaState("starting", wipe ? "resetting WhatsApp (clean profile)" : "recycling the browser (profile kept)");
+    noteWaEvent("reset", `${reason || "manual reset"}${wipe ? "" : " (login kept)"}`);
+    console.log(`\n♻️ Resetting WhatsApp: ${reason || "manual reset"}${wipe ? " (clean profile)" : " (login kept)"}`);
+    setWaState("starting", wipe ? "resetting WhatsApp (clean profile)" : "reconnecting (login kept)");
     stopAgent();
+    pairingEpoch += 1;
     readyHandled = false;
     lastPairCode = null;
-    lastPairAt = 0;
     pairingError = "";
     pairingInFlight = null;
-    waInjectDiag = "";
     waInitError = "";
-    removeQr();
-    if (wipe) clearLinkMarker();
-    try {
-      if (client && typeof client.destroy === "function") {
-        await Promise.race([client.destroy(), sleep(15000)]);
-      }
-    } catch (e) { console.log("warn: reset could not close the browser:", String(e).split("\n")[0]); }
-    try { client.pupPage = null; client.pupBrowser = null; } catch (e) {}
+    removeQrFile();
+    await closeSocket(reason || "reset");
     if (wipe) {
+      clearLinkMarker();
       try { fs.rmSync(SESSION_PROFILE_DIR, { recursive: true, force: true }); } catch (e) {}
     }
-    setWaState("needs_qr", wipe ? "clean profile; waiting for a QR code" : "browser recycled; waiting for a QR code");
-    await initializeWhatsApp(wipe ? "reset" : "browser recycle");
+    setWaState(wipe ? "needs_qr" : "starting",
+      wipe ? "clean profile - press the button once for a code" : "reconnecting with the saved login");
+    await initializeWhatsApp(wipe ? "reset" : "reconnect");
   })();
   try {
     return await resetInFlight;
@@ -1608,14 +1747,14 @@ function autoReset(reason) {
 }
 
 // Render kills the whole container (and any in-progress link) when the free
-// plan's memory limit is exceeded. Recycle just the browser before that happens.
+// plan's memory limit is exceeded. Recycle just the socket before that happens.
 // The profile is kept, so a linked account reconnects without re-pairing.
 let memoryGuardTimer = null;
 function startMemoryGuard() {
   if (memoryGuardTimer) return;
-  // Opt-in only: the boot peak is inherent to loading WhatsApp Web, and
-  // recycling during a login would cancel the link. Set LIAM_MEM_LIMIT_MB to a
-  // value below the plan limit to enable an early browser recycle.
+  // Opt-in only: a boot peak can still happen, and recycling during a login
+  // would cancel the link. Set LIAM_MEM_LIMIT_MB to a value below the plan limit
+  // to enable an early socket recycle.
   const limit = Number.parseInt(process.env.LIAM_MEM_LIMIT_MB || "0", 10);
   if (!Number.isFinite(limit) || limit < 300) return;
   memoryGuardTimer = setInterval(() => {
@@ -1625,7 +1764,7 @@ function startMemoryGuard() {
     if (waState === "starting" || waState === "restoring") return;
     if (Date.now() - lastMemoryReset < 5 * 60 * 1000) return;
     lastMemoryReset = Date.now();
-    console.log(`warn: memory at ${used} MiB (limit ${limit} MiB); recycling the browser to avoid an out-of-memory kill`);
+    console.log(`warn: memory at ${used} MiB (limit ${limit} MiB); recycling the WhatsApp socket to avoid an out-of-memory kill`);
     noteWaEvent("memory_reset", `${used} MiB`);
     resetWhatsApp(`memory guard (${used} MiB)`, { wipe: false })
       .catch((e) => console.log("warn: memory recycle failed:", String(e)));
@@ -1633,12 +1772,28 @@ function startMemoryGuard() {
   if (typeof memoryGuardTimer.unref === "function") memoryGuardTimer.unref();
 }
 
+function friendlyWaError(message) {
+  const text = String(message || "");
+  if (/429|rate[- ]?overlimit|too many|overlimit/i.test(text)) {
+    return "WhatsApp is limiting code requests for this number. Wait 10-15 minutes, " +
+      "remove old Liam entries from Linked devices on the phone, then try once.";
+  }
+  if (/couldn'?t link|bad session|401|not[- ]?authorized|conflict|already/i.test(text)) {
+    return "WhatsApp refused this link attempt. Remove old Liam entries from Linked devices " +
+      "on the phone, then try again.";
+  }
+  if (/timeout|timed out|timedout/i.test(text)) {
+    return "WhatsApp did not answer in time. Try once more.";
+  }
+  return text.split("\n")[0].slice(0, 200) || "unknown WhatsApp error";
+}
+
 async function requestPairing(phone) {
   const normalized = String(phone || "").replace(/\D/g, "");
   if (!/^\d{7,15}$/.test(normalized)) {
     throw new BadRequest("phone must be the full international number, digits only (e.g. 447881161023)");
   }
-  if (waState === "ready") throw new BadRequest("this WhatsApp account is already linked");
+  if (waState === "ready" || registered) throw new BadRequest("this WhatsApp account is already linked");
   if (pairingInFlight) return pairingInFlight;
   // WhatsApp rate-limits code requests hard and every request restarts the
   // block. Give the same code back while it is fresh, then enforce a cooldown.
@@ -1647,36 +1802,51 @@ async function requestPairing(phone) {
   if (sinceLast < PAIRING_COOLDOWN_MS) {
     const wait = Math.ceil((PAIRING_COOLDOWN_MS - sinceLast) / 1000);
     throw new BadRequest(
-      `a code was requested ${Math.round(sinceLast / 1000)} seconds ago; wait ${wait} seconds before asking again — ` +
+      `a code was requested ${Math.round(sinceLast / 1000)} seconds ago; wait ${wait} seconds before asking again - ` +
       "every request restarts WhatsApp's own rate limit");
   }
   pairingInFlight = (async () => {
+    const epoch = pairingEpoch;
     const deadline = Date.now() + 60000;
+    // requestPairingCode() is only valid after the socket has received its
+    // first QR payload. Calling it earlier is the classic "couldn't link
+    // device" failure, so wait for that stage instead of guessing.
     while (Date.now() < deadline) {
-      if (client.pupPage) break;
+      if (epoch !== pairingEpoch) throw new BadRequest("pairing was cancelled");
+      if (sock && sockReadyForPairing) break;
+      if (!sock && !connecting && !reconnectTimer) {
+        await initializeWhatsApp("pairing code request").catch(() => {});
+      }
       await sleep(500);
     }
-    if (!client.pupPage) throw new BadRequest("WhatsApp is still starting — try again in a few seconds");
+    if (!sock || !sockReadyForPairing) {
+      throw new BadRequest("WhatsApp is still starting - wait a few seconds and press the button again");
+    }
     try {
-      const code = await Promise.race([
-        // The third argument is the page-side retry interval. Using the largest
-        // allowed delay stops WhatsApp Web from re-requesting a code in the
-        // background after a rate limit.
-        client.requestPairingCode(normalized, true, 2147483647),
-        sleep(90000).then(() => { throw new Error("the phone-code screen did not appear within 90 seconds"); }),
-      ]);
-      lastPairCode = String(code || "");
+      const code = await withTimeout(
+        sock.requestPairingCode(normalized),
+        90000,
+        "WhatsApp did not answer the code request within 90 seconds",
+      );
+      if (epoch !== pairingEpoch) throw new BadRequest("pairing was cancelled");
+      const clean = String(code || "").replace(/[^0-9A-Za-z]/g, "").toUpperCase();
+      if (clean.length !== 8) throw new Error("WhatsApp returned an unexpected code");
+      lastPairCode = clean;
       lastPairAt = Date.now();
       pairingError = "";
       setWaState("linking", "pairing code generated");
+      noteWaEvent("pairing_code");
       return lastPairCode;
     } catch (e) {
       const msg = String(e && e.message ? e.message : e).split("\n")[0].slice(0, 200);
-      pairingError = msg;
+      const friendly = friendlyWaError(msg);
+      pairingError = friendly;
+      lastPairCode = null;
+      lastPairAt = Date.now();  // enforce the cooldown after any failure
       noteWaEvent("pairing_failed", msg);
       console.log("warn: pairing code failed:", msg);
-      await cancelPairing();
-      throw new BadRequest("could not generate a pairing code: " + msg);
+      try { await cancelPairing(); } catch (e2) {}
+      throw new BadRequest("could not get a pairing code: " + friendly);
     }
   })();
   try { return await pairingInFlight; }
@@ -1707,11 +1877,11 @@ const server = http.createServer(async (req, res) => {
       const token = url.searchParams.get("token") || "";
       if (!pairTokenOk(token)) return sendJson(res, 403, { ok: false, msg: "forbidden" });
       try {
-        const cleared = await Promise.race([
+        await Promise.race([
           cancelPairing(),
           sleep(20000).then(() => { throw new Error("cancel timed out"); }),
         ]);
-        sendJson(res, 200, { ok: true, clearedPageTimer: cleared, ...statusPayload() });
+        sendJson(res, 200, { ok: true, ...statusPayload() });
       } catch (e) {
         sendJson(res, 500, { ok: false, msg: String(e && e.message ? e.message : e) });
       }
@@ -1738,41 +1908,47 @@ const server = http.createServer(async (req, res) => {
       const token = url.searchParams.get("token") || "";
       if (!pairTokenOk(token)) return sendHtml(res, 403, pageShell("Forbidden", "<h1>Forbidden</h1>"));
       if (waState === "ready") return sendJson(res, 200, { ok: true, status: waState, note: "linked; diagnostics hidden" });
-      const page = await describeWaPage(client.pupPage);
+      let creds = null;
+      try { creds = JSON.parse(fs.readFileSync(CREDS_FILE, "utf8")); } catch (e) { creds = null; }
       sendJson(res, 200, {
         ok: true,
         status: waState,
         detail: waStateDetail,
         lastError: waInitError,
-        injectError: waInjectDiag,
         pairingError,
         pairingRequestedAt: lastPairAt || null,
         authenticatedAt: authAt || null,
         codeAgeSeconds: lastPairCode && lastPairAt ? Math.round((Date.now() - lastPairAt) / 1000) : null,
+        code: lastPairCode ? `${lastPairCode.slice(0, 4)}-${lastPairCode.slice(4)}` : null,
         linkHandshakeActive: linkHandshakeActive(),
+        socketOpen: !!(sock && registered),
+        readyForPairing: !!sockReadyForPairing,
+        registered: !!(creds && creds.registered),
+        socketUserId: socketUserId(),
+        reconnectScheduled: !!reconnectTimer,
+        waVersion: waVersion ? waVersion.join(".") : null,
         startedAt: STARTED_AT,
         uptimeSeconds: Math.round((Date.now() - STARTED_AT) / 1000),
         memoryMiB: containerMemoryMiB(),
         memory: containerMemoryInfo(),
         linkedMarker: hasLinkMarker(),
         marker: readLinkMarker(),
-        profileFiles: (() => {
+        credsPresent: profileHasCredentials(),
+        sessionFiles: (() => {
           try { return fs.readdirSync(SESSION_PROFILE_DIR).length; } catch (e) { return 0; }
         })(),
         events: waEvents.slice(-15),
-        page,
       });
       return;
     }
     if (pathname === "/qr") {
       const token = url.searchParams.get("token") || "";
       if (!pairTokenOk(token)) return sendHtml(res, 403, pageShell("Forbidden", "<h1>Forbidden</h1>"));
-      if (waState === "ready") return sendHtml(res, 200, pageShell("Liam QR", "<h1>Liam is already linked.</h1>"));
-      if (!lastQr) return sendHtml(res, 200, qrPage(token));
-      QRCode.toDataURL(lastQr, { width: 520, margin: 2 }).then((dataUrl) => {
-        sendHtml(res, 200, qrPage(token, { dataUrl }));
-      }).catch(() => sendHtml(res, 500, qrPage(token, { error: "QR rendering failed" })));
-      return;
+      return sendHtml(res, 200, pageShell("Liam pairing",
+        `<h1>Liam uses a phone code</h1>` +
+        `<p>QR linking has been removed. Open the <a href="/pair?token=${encodeURIComponent(token)}">pairing page</a> ` +
+        `and press the button to get an 8-character code.</p>` +
+        (waState === "ready" ? `<p>Liam is already linked.</p>` : "")));
     }
     if (pathname === "/pair") {
       const token = url.searchParams.get("token") || "";
@@ -1884,51 +2060,24 @@ server.listen(PORT, HOST, () => {
   console.log(`⚙️ Liam's tool endpoint is live on :${port} (HOST=${HOST})`);
   const base = PUBLIC_URL || `http://127.0.0.1:${port}`;
   console.log(`🔗 Pairing page: ${base}/pair?token=${PAIR_TOKEN}`);
-  if (PUBLIC_URL) console.log(`🔗 QR page: ${base}/qr?token=${PAIR_TOKEN}`);
 });
 
 async function initializeWhatsApp(reason) {
   if (waInitPromise) return waInitPromise;
   waInitPromise = (async () => {
     try {
-      setWaState(waState === "ready" ? "ready" : "starting", reason || "initializing WhatsApp");
-      const timeoutMs = Math.max(60000, Number.parseInt(process.env.LIAM_INIT_TIMEOUT_MS || "300000", 10));
-      await Promise.race([
-        client.initialize(),
-        new Promise((_, reject) => setTimeout(() => reject(new Error("WhatsApp init timed out")), timeoutMs)),
-      ]);
+      setWaState(waState === "ready" ? "ready" : (waState === "needs_qr" ? "needs_qr" : "starting"),
+        reason || "starting WhatsApp");
+      await connectSocket(reason);
+      waInitError = "";
     } catch (e) {
       const msg = String(e && e.stack ? e.stack : e);
       waInitError = msg;
       console.log("\n💀 WHATSAPP INIT FAILED:", msg);
-      if (/singleton|profile appears to be in use|ProcessSingleton|Code: 21/i.test(msg)) {
-        const removed = sync.sanitizeChromeLocks(SESSION_DIR);
-        console.log(`🔧 Removed ${removed} stale Chrome lock file(s); retrying WhatsApp init once...`);
-        setWaState("starting", "retrying after stale Chrome lock cleanup");
-        try {
-          await client.initialize();
-          waInitError = "";
-          return;
-        } catch (e2) {
-          waInitError = String(e2 && e2.stack ? e2.stack : e2);
-          console.log("\n💀 WHATSAPP INIT RETRY FAILED:", waInitError);
-        }
-      }
-      // A half-started browser cannot recover on its own. Close it and give the
-      // free instance one clean attempt instead of sitting in "error" forever.
-      try {
-        console.log("🔁 Restarting the browser for a clean WhatsApp Web load...");
-        try { if (client && client.pupBrowser) await client.destroy(); } catch (e2) {}
-        await sleep(3000);
-        setWaState("starting", "retrying WhatsApp init with a fresh browser");
-        await client.initialize();
-        waInitError = "";
-        return;
-      } catch (e3) {
-        waInitError = String(e3 && e3.stack ? e3.stack : e3);
-        console.log("\n💀 WHATSAPP CLEAN RETRY FAILED:", waInitError);
-      }
-      setWaState("error", "WhatsApp init failed");
+      // A socket cannot recover from a failed creation. Try again shortly
+      // instead of sitting in "error" and needing a manual reset.
+      setWaState("error", "WhatsApp connection failed");
+      scheduleReconnect("init failed", 10000);
     } finally {
       waInitPromise = null;
     }
@@ -1938,8 +2087,8 @@ async function initializeWhatsApp(reason) {
 
 async function boot() {
   setWaState("restoring", "restoring state from Supabase (if configured)");
-  // Restore to completion before Chromium starts. Abandoning a restore on a
-  // timer would let it swap the profile underneath a running browser, so the
+  // Restore to completion before a socket starts. Abandoning a restore on a
+  // timer would let it swap the login files underneath a running socket, so the
   // internal fetch and tar timeouts are the only limits.
   try {
     const dbRes = await sync.restoreDb(DATA_DIR);
@@ -1951,25 +2100,28 @@ async function boot() {
       console.log("warn: session restore did not complete; continuing");
     }
     const removed = sync.sanitizeChromeLocks(SESSION_DIR);
-    if (removed) console.log(`🔧 Sanitized ${removed} stale Chrome lock file(s) before init`);
+    if (removed) console.log(`🔧 Sanitized ${removed} stale lock file(s) before init`);
   } catch (e) {
     console.log("warn: restore phase failed:", String(e));
   }
-  if (!hasLinkMarker()) {
-    // No completed WhatsApp login on this profile. Chromium always writes files
-    // like "Local State" into an empty profile, so the file listing cannot prove
-    // that WhatsApp is linked. A leftover or half-restored profile makes the web
-    // app start with a dead identity: the phone accepts a scan or code, then the
-    // link never completes. Throw it away so every attempt starts clean.
-    let removed = false;
-    if (fs.existsSync(SESSION_PROFILE_DIR)) {
-      try { fs.rmSync(SESSION_PROFILE_DIR, { recursive: true, force: true }); removed = true; } catch (e) {}
+
+  const markerPresent = hasLinkMarker();
+  const credsPresent = profileHasCredentials();
+  if (!markerPresent || !credsPresent) {
+    // No completed login, or the marker survived but creds.json did not (a
+    // failed restore). Baileys writes creds.json before the phone confirms the
+    // code, so either file alone cannot prove that WhatsApp is linked. Start
+    // clean so a half-finished link cannot poison the next attempt.
+    const removed = fs.existsSync(SESSION_PROFILE_DIR);
+    if (removed) {
+      try { fs.rmSync(SESSION_PROFILE_DIR, { recursive: true, force: true }); } catch (e) {}
     }
-    removeQr();
+    if (markerPresent && !credsPresent) clearLinkMarker();
+    removeQrFile();
     console.log(removed
-      ? "info: discarded the unlinked WhatsApp profile — starting from a clean browser profile"
-      : "info: no linked WhatsApp profile yet — starting from a clean browser profile");
-    setWaState("needs_qr", "no saved WhatsApp session; waiting for QR or pairing code");
+      ? "info: discarded a half-finished WhatsApp login - starting clean"
+      : "info: no linked WhatsApp login yet - starting clean");
+    setWaState("needs_qr", "no saved login - press the button once on the pairing page");
   } else {
     const marker = readLinkMarker();
     if (marker && marker.wid) console.log(`info: restoring linked WhatsApp session (${marker.wid})`);
@@ -1996,9 +2148,7 @@ async function shutdown(signal) {
   }, 25000);
   if (typeof deadline.unref === "function") deadline.unref();
   try {
-    if (client && typeof client.destroy === "function") {
-      await Promise.race([client.destroy(), sleep(5000)]);
-    }
+    await Promise.race([closeSocket("shutdown"), sleep(5000)]);
   } catch (e) { console.log("warn: WhatsApp shutdown failed:", String(e)); }
   try { await sync.backupNow(DATA_DIR, SESSION_DIR, DATA_DIR, { session: sessionReady }); }
   catch (e) { console.log("warn: shutdown backup failed:", String(e)); }
@@ -2017,7 +2167,7 @@ if (require.main === module) {
 }
 
 module.exports = {
-  server, client, sweepTimer, outboundLog, handleAction,
+  server, getSock: () => sock, wa, sweepTimer, outboundLog, handleAction,
   normalizeRecipient, normalizeGroup, assertAllowed, assertOutbox, audioMime, authorized,
   sync, pythonBin, sanitizeChromeLocks: sync.sanitizeChromeLocks,
   statusPayload, TEMP, tempDecision, sweepTemp, _setState: setWaState,
@@ -2025,4 +2175,6 @@ module.exports = {
   pendingPerms, pendingTools, PAIR_TOKEN, ownerIdsInGroup, sendApprovalPrompt,
   createToolApproval, executeToolApproval, handleApprovalCommand, createPermissionRequest,
   dmAllowed, setDmOpen, rememberKnownMember, knownMembers,
+  cancelPairing, resetWhatsApp, connectSocket, closeSocket, handleIncomingMessage,
+  messageId, jidForSend, socketUserId, friendlyWaError,
 };

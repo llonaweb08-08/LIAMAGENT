@@ -5,7 +5,7 @@ services:
     dockerfilePath: ./Dockerfile
     plan: free
     # Render's liveness check. It returns 200 as soon as the HTTP server is up,
-    # even while WhatsApp is still restoring or waiting for a QR/pairing code.
+    # even while WhatsApp is still restoring or waiting for a pairing code.
     # Monitor /ready separately (UptimeRobot) to alert when Liam is not linked.
     healthCheckPath: /health
     autoDeploy: true

@@ -65,9 +65,9 @@ async function verify(target) {
     console.error('WhatsApp is not linked. Open the pairing page printed in the Render logs:');
     console.error('  https://<your-service>.onrender.com/pair?token=<LIAM_PAIR_TOKEN>');
   } else if (status.json && status.json.hasSessionData) {
-    console.error('A WhatsApp profile is present but the client is not ready yet; check the logs.');
+    console.error('A WhatsApp session is present but the client is not ready yet; check the logs.');
   } else {
-    console.error('No saved WhatsApp profile was found; pair with /qr or /pair.');
+    console.error('No saved WhatsApp session was found; pair with /pair.');
   }
   process.exitCode = allowNotReady ? 0 : 1;
 }

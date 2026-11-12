@@ -15,7 +15,6 @@
     "verify": "node scripts/verify_deployment.js"
   },
   "dependencies": {
-    "qrcode": "^1.5.4",
-    "whatsapp-web.js": "^1.34.7"
+    "@whiskeysockets/baileys": "6.7.24"
   }
 }
