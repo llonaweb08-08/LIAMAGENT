@@ -2005,6 +2005,26 @@ const server = http.createServer(async (req, res) => {
           lastAgentReplyAt: lastAgentReplyAt || null,
           lastAgentError,
           agentStderrTail: agentStderrTail.slice(-1200),
+          // Read-only: which optional integrations have credentials present.
+          // Never exposes the values, only whether each tool can work.
+          config: {
+            imageVoice: !!process.env.GOOGLE_API_KEY,
+            search: {
+              tavily: !!process.env.TAVILY_API_KEY,
+              brave: !!process.env.BRAVE_API_KEY,
+              serper: !!process.env.SERPER_API_KEY,
+              duckduckgo: true,
+            },
+            instabox: {
+              apiKey: !!INSTABOX_API_KEY,
+              machineId: !!INSTABOX_MACHINE_ID,
+              url: INSTABOX_API_URL,
+            },
+            email: !!(process.env.LIAM_EMAIL_HOST && process.env.LIAM_EMAIL_USER
+              && process.env.LIAM_EMAIL_PASSWORD),
+            dmAllowlist: DM_ALLOW.size,
+            owners: OWNERS.length,
+          },
           memoryMiB: containerMemoryMiB(),
           uptimeSeconds: Math.round((Date.now() - STARTED_AT) / 1000),
         };
