@@ -1037,6 +1037,11 @@ function onConnectionUpdate(socket, update) {
       // After a code login WhatsApp can emit one last QR while credentials are
       // already registered. Showing "scan me" there would look like a failure.
       noteWaEvent("qr_ignored", "credentials are already registered");
+    } else if (waState === "linking" && linkHandshakeActive()) {
+      // Baileys keeps rotating QR refs until they run out, even after a pairing
+      // code was requested. Do not let that reset the UI to needs_qr while the
+      // phone is still typing the code.
+      noteWaEvent("qr_ignored", "pairing code handshake in progress");
     } else {
       sockReadyForPairing = true;
       waLastQrAt = Date.now();
@@ -1105,6 +1110,10 @@ async function connectSocket(reason) {
       markOnlineOnConnect: false,
       syncFullHistory: false,
       generateHighQualityLinkPreview: false,
+      // Keep each QR ref alive for a minute. Baileys closes the socket with 408
+      // after the server's refs run out; a longer interval leaves more headroom
+      // for the phone to finish typing an 8-character code.
+      qrTimeout: 60000,
       // Receipts and decryption retries ask for the original message. Liam
       // stores nothing, so returning undefined is the honest answer.
       getMessage: async () => undefined,
