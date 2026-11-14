@@ -121,6 +121,20 @@ function sanitizeChromeLocks(rootDir) {
   return removed;
 }
 
+// A profile counts as linked only when the completed-login marker is present and
+// the stored credentials say "registered". Baileys writes creds.json before the
+// phone confirms a code, so creds alone are not proof of a real login.
+function sessionLooksLinked(sessionDir) {
+  try {
+    if (!fs.existsSync(path.join(sessionDir, "wa_linked.json"))) return false;
+    const raw = fs.readFileSync(path.join(sessionDir, "session", "creds.json"), "utf8");
+    const creds = JSON.parse(raw);
+    return !!(creds && creds.registered);
+  } catch (e) {
+    return false;
+  }
+}
+
 async function downloadToFile(res, dest, maxBytes) {
   const declared = Number(res.headers && res.headers.get ? res.headers.get("content-length") : 0);
   if (Number.isFinite(declared) && declared > maxBytes) {
@@ -442,6 +456,13 @@ async function backupSession(dataDir, sessionDir) {
   const base = baseDir(dataDir);
   const targetSession = sessionDir || defaultSessionDir(base);
   if (!fs.existsSync(targetSession)) return { ok: false, reason: "no session dir" };
+  // Never replace a good cloud copy with an unlinked profile. After a wipe (or
+  // before a link) the local profile still has a creds.json, so this checks the
+  // completed-login marker and the registered flag, not just file existence.
+  if (!sessionLooksLinked(targetSession)) {
+    console.log("info: session is not linked; keeping the previous cloud copy");
+    return { ok: false, skipped: true, reason: "session not linked" };
+  }
   const sessionName = path.basename(targetSession);
   const tmp = path.join(base, SESSION_ARCHIVE + ".backup.tmp");
   try {
@@ -516,5 +537,5 @@ module.exports = {
   restoreSession, backupSession, restoreDb, backupDb, backupNow,
   sanitizeChromeLocks, startPeriodicBackup, stopPeriodicBackup,
   configured, vacuumInto, validateArchive, archiveExcludes, defaultDbFile,
-  looksLikeSqlite, unsafeEntry, CACHE_EXCLUDES,
+  looksLikeSqlite, unsafeEntry, CACHE_EXCLUDES, sessionLooksLinked,
 };

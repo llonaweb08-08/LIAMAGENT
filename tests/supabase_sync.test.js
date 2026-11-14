@@ -68,7 +68,8 @@ function startMockSupabase() {
 }
 
 function writeProfile(base) {
-  const session = path.join(base, 'liam_session', 'session');
+  const root = path.join(base, 'liam_session');
+  const session = path.join(root, 'session');
   const files = {
     'Local State': '{}',
     'Default/Preferences': '{}',
@@ -86,6 +87,10 @@ function writeProfile(base) {
     fs.mkdirSync(path.dirname(file), { recursive: true });
     fs.writeFileSync(file, value);
   }
+  // A completed login: creds marked registered plus the link marker that boot
+  // and the backup guard use to tell a linked profile from a half-finished one.
+  fs.writeFileSync(path.join(session, 'creds.json'), JSON.stringify({ registered: true }));
+  fs.writeFileSync(path.join(root, 'wa_linked.json'), JSON.stringify({ at: Date.now() }));
   return session;
 }
 
@@ -209,6 +214,28 @@ test('supabase session and database persistence', async (t) => {
     const result = await sync.backupNow(
       path.join(TMP, 'source'), undefined, path.join(TMP, 'source'), { session: false });
     assert.equal(result.session.skipped, true);
+    assert.deepEqual(objects.get('session.tar.gz'), keep);
+  });
+
+  await t.test('treats a profile with the marker and registered creds as linked', () => {
+    const base = path.join(TMP, 'linked');
+    writeProfile(base);
+    const session = path.join(base, 'liam_session');
+    assert.equal(sync.sessionLooksLinked(session), true);
+    fs.writeFileSync(path.join(session, 'session', 'creds.json'),
+      JSON.stringify({ registered: false }));
+    assert.equal(sync.sessionLooksLinked(session), false);
+  });
+
+  await t.test('never overwrites the cloud session with an unlinked profile', async () => {
+    const base = path.join(TMP, 'unlinked');
+    writeProfile(base);
+    fs.rmSync(path.join(base, 'liam_session', 'wa_linked.json'));
+    assert.equal(sync.sessionLooksLinked(path.join(base, 'liam_session')), false);
+    const keep = Buffer.from('good cloud copy');
+    objects.set('session.tar.gz', keep);
+    const result = await sync.backupSession(base);
+    assert.equal(result.skipped, true);
     assert.deepEqual(objects.get('session.tar.gz'), keep);
   });
 
