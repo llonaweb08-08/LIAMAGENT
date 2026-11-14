@@ -2827,6 +2827,29 @@ const server = http.createServer(async (req, res) => {
             return sendJson(res, 200, { ...base, deliverProbe: out });
           }
         }
+        if (probe === "account") {
+          // Safe, masked view of the linked device so a half-registered or
+          // wrong-server session is visible. Never returns the full number.
+          const info = {};
+          try {
+            const me = sock && sock.authState && sock.authState.creds && sock.authState.creds.me;
+            const acc = sock && sock.authState && sock.authState.creds && sock.authState.creds.account;
+            const uid = sock && sock.user && sock.user.id;
+            info.userIdKind = jidType(uid);
+            info.userDevice = uid ? (String(uid).split(":")[1] || null) : null;
+            info.meIdKind = jidType(me && me.id);
+            info.meDevice = me && me.id ? (String(me.id).split(":")[1] || null) : null;
+            info.hasLid = !!(sock && sock.user && sock.user.lid);
+            info.registered = !!(sock && sock.authState && sock.authState.creds && sock.authState.creds.registered);
+            info.platform = (sock && sock.authState && sock.authState.creds && sock.authState.creds.platform) || null;
+            info.hasAccountDetails = !!(acc && acc.details);
+            info.wsOpen = !!(sock && sock.ws && sock.ws.isOpen);
+            info.wsClosed = !!(sock && sock.ws && sock.ws.isClosed);
+            info.wsHost = (sock && sock.ws && sock.ws.url)
+              ? String(sock.ws.url).replace(/^wss?:\/\//, "").split("/")[0] : null;
+          } catch (e) { info.error = String(e && e.message ? e.message : e).slice(0, 200); }
+          return sendJson(res, 200, { ...base, accountProbe: info });
+        }
         if (probe === "email") {
           try {
             const reply = await withTimeout(
