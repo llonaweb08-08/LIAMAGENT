@@ -411,6 +411,9 @@ let lastSendError = "";
 // ack, which tells a delivery problem apart from a routing one.
 const recentSends = [];
 const outboundAcks = new Map();
+const ackSamples = [];
+let messagesUpdateCount = 0;
+let receiptUpdateCount = 0;
 const ACK_NAMES = { 0: "error", 1: "pending", 2: "server", 3: "delivered", 4: "read", 5: "played" };
 function ackName(status) {
   const n = Number(status);
@@ -428,6 +431,8 @@ function recordAcks(updates) {
     if (!id || status === undefined || status === null) continue;
     const prior = outboundAcks.get(id) || { to: jidType(item.key && item.key.remoteJid) };
     outboundAcks.set(id, { status: ackName(status), at: Date.now(), to: prior.to || "" });
+    ackSamples.push({ id: String(id).slice(-6), to: jidType(item.key && item.key.remoteJid), status: ackName(status), at: Date.now() });
+    while (ackSamples.length > 8) ackSamples.shift();
   }
   if (outboundAcks.size > 40) {
     for (const key of outboundAcks.keys()) {
@@ -1448,8 +1453,12 @@ async function connectSocket(reason) {
     });
     // Delivery acknowledgements for our own outbound messages, so a reply that
     // WhatsApp accepts but never delivers is visible instead of silent.
-    socket.ev.on("messages.update", (updates) => { try { recordAcks(updates); } catch (e) {} });
+    socket.ev.on("messages.update", (updates) => {
+      messagesUpdateCount += 1;
+      try { recordAcks(updates); } catch (e) {}
+    });
     socket.ev.on("message-receipt.update", (updates) => {
+      receiptUpdateCount += 1;
       try {
         for (const item of Array.isArray(updates) ? updates : []) {
           const id = item && item.key && item.key.id;
@@ -2535,6 +2544,7 @@ const server = http.createServer(async (req, res) => {
           lastSendTargetType,
           lastSendError,
           recentSends: recentSendReport(),
+          ackDebug: { messagesUpdateCount, receiptUpdateCount, samples: ackSamples.slice(-5) },
           lastAgentRequestAt: lastAgentRequestAt || null,
           lastAgentStartedAt: lastAgentStartedAt || null,
           lastAgentReplyAt: lastAgentReplyAt || null,
