@@ -381,7 +381,7 @@ def send_image(to, prompt, sender=None):
 def send_voice(to, text, sender=None): return wa.send_voice(to, text, sender=sender)
 
 _SCREENSHOT_SCRIPT = r"""
-import ipaddress, socket, sys
+import ipaddress, os, socket, sys
 from urllib.parse import urlparse
 from playwright.sync_api import sync_playwright
 
@@ -412,10 +412,14 @@ def public_url(url):
     return True
 
 url, out, ua = sys.argv[1], sys.argv[2], sys.argv[3]
+_liam_launch = dict(headless=True, args=[
+    "--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
+])
+_liam_exec = os.environ.get("LIAM_CHROMIUM_PATH") or None
+if _liam_exec:
+    _liam_launch["executable_path"] = _liam_exec
 with sync_playwright() as p:
-    browser = p.chromium.launch(headless=True, args=[
-        "--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
-    ])
+    browser = p.chromium.launch(**_liam_launch)
     try:
         context = browser.new_context(
             viewport={"width": 1366, "height": 900},
@@ -509,9 +513,13 @@ def _browser_script_text(script, extensions=True):
         args += [f"--load-extension={ext_dir}", "--disable-extensions-except=" + ext_dir]
     out = []
     out.append("import os\n")
+    out.append("_liam_launch = {'headless': True, 'args': " + repr(args) + "}\n")
+    out.append("_liam_exec = os.environ.get('LIAM_CHROMIUM_PATH') or None\n")
+    out.append("if _liam_exec:\n")
+    out.append("    _liam_launch['executable_path'] = _liam_exec\n")
     out.append("from playwright.sync_api import sync_playwright\n")
     out.append("with sync_playwright() as p:\n")
-    out.append("    browser = p.chromium.launch(headless=True, args=" + repr(args) + ")\n")
+    out.append("    browser = p.chromium.launch(**_liam_launch)\n")
     out.append("    context = browser.new_context(viewport={'width': 1366, 'height': 900}, "
                "user_agent=os.environ.get('LIAM_USER_AGENT', ''))\n")
     out.append("    page = context.new_page()\n")
@@ -565,11 +573,17 @@ def _vps_ok(output):
     match = re.match(r"\s*exit=(-?\d+)", str(output or ""))
     return bool(match) and match.group(1) == "0"
 
+# The agent-browser template ships Chromium but not Playwright's own browser, so
+# point Playwright at the system binary before running anything.
+_CHROMIUM_ENV = ("LIAM_CHROMIUM_PATH=$(command -v chromium || command -v chromium-browser "
+                 "|| command -v google-chrome || command -v google-chrome-stable || true)")
+
 def _remote_browser_task(script):
     path = _vps_stage("task_%s.py" % os.urandom(6).hex(),
                       _browser_script_text(script, extensions=False))
-    command = "cd %s && LIAM_USER_AGENT=%s python3 %s" % (
-        shlex.quote(VPS_BROWSER_DIR), shlex.quote(liam_keys.BROWSER_UA), shlex.quote(path))
+    command = "cd %s && %s LIAM_USER_AGENT=%s python3 %s" % (
+        shlex.quote(VPS_BROWSER_DIR), _CHROMIUM_ENV,
+        shlex.quote(liam_keys.BROWSER_UA), shlex.quote(path))
     output = vps_exec(
         command, timeout=_clamp_timeout(_env_int("LIAM_BROWSER_TIMEOUT", 90, 10, 300)),
         sender=OWNERS[0])
@@ -580,9 +594,9 @@ def _remote_browser_task(script):
 def _remote_screenshot(to, url, sender):
     script_path = _vps_stage("shot_%s.py" % os.urandom(6).hex(), _SCREENSHOT_SCRIPT)
     remote_png = VPS_BROWSER_DIR + "/shot_%s.png" % os.urandom(6).hex()
-    command = "cd %s && python3 %s %s %s %s" % (
-        shlex.quote(VPS_BROWSER_DIR), shlex.quote(script_path), shlex.quote(url),
-        shlex.quote(remote_png), shlex.quote(liam_keys.BROWSER_UA))
+    command = "cd %s && %s python3 %s %s %s %s" % (
+        shlex.quote(VPS_BROWSER_DIR), _CHROMIUM_ENV, shlex.quote(script_path),
+        shlex.quote(url), shlex.quote(remote_png), shlex.quote(liam_keys.BROWSER_UA))
     output = vps_exec(
         command, timeout=_clamp_timeout(_env_int("LIAM_SCREENSHOT_TIMEOUT", 75, 20, 180)),
         sender=OWNERS[0])

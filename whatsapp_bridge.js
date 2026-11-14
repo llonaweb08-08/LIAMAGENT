@@ -2409,28 +2409,97 @@ const server = http.createServer(async (req, res) => {
           }
         }
         if (probe === "vps") {
-          // Does the free VM have Playwright and a working Chromium? If so the
-          // browser tools can run there instead of on this container.
+          // What does the free VM actually offer for browser work? Report the
+          // interpreters, the Chromium binary and free space so the offload can
+          // use what is really there instead of assuming.
           const script = [
-            "import sys",
+            "import shutil, subprocess, sys",
+            "def run(*a):",
+            "    try:",
+            "        return subprocess.run(a, capture_output=True, text=True, timeout=30).stdout.strip()",
+            "    except Exception as e:",
+            "        return 'err: %s' % e",
+            "print('python', sys.version.split()[0])",
+            "print('pip', run('python3', '-m', 'pip', '--version')[:80])",
+            "print('node', run('node', '--version'))",
+            "print('bun', run('bun', '--version'))",
             "try:",
             "    import playwright",
-            "    print('playwright ok')",
+            "    print('playwright: python module present')",
             "except Exception as e:",
-            "    print('playwright missing:', e)",
-            "try:",
-            "    from playwright.sync_api import sync_playwright",
-            "    p = sync_playwright().start()",
-            "    b = p.chromium.launch(headless=True, args=['--no-sandbox'])",
-            "    print('chromium ok')",
-            "    b.close(); p.stop()",
-            "except Exception as e:",
-            "    print('chromium failed:', type(e).__name__, e)",
+            "    print('playwright: missing (%s)' % e)",
+            "for name in ('chromium', 'chromium-browser', 'google-chrome', 'google-chrome-stable', 'chrome'):",
+            "    p = shutil.which(name)",
+            "    if p:",
+            "        print('browser:', name, '->', p)",
+            "import glob",
+            "for pattern in ('/usr/bin/*chrom*', '/opt/*chrom*', '/opt/google/chrome/chrome', '/root/.cache/ms-playwright/*'):",
+            "    for hit in glob.glob(pattern)[:5]:",
+            "        print('found:', hit)",
+            "print('disk', run('df', '-h', '/data/home'))",
           ].join("\n");
           const heredoc = "python3 - <<'PY'\n" + script + "\nPY";
           try {
             const out = await instaboxExec(heredoc, 180);
-            return sendJson(res, 200, { ...base, vpsProbe: { ok: true, out: String(out).slice(0, 1500) } });
+            const result = { ok: true, out: String(out).slice(0, 3000) };
+            if (String(url.searchParams.get("install") || "") === "1") {
+              // One-time provisioning: add the Playwright Python package. The
+              // template already ships Chromium, so no browser download is
+              // needed - the scripts launch the system binary.
+              const installScript = [
+                "import subprocess",
+                "def run(*a):",
+                "    p = subprocess.run(a, capture_output=True, text=True)",
+                "    return (p.stdout + p.stderr).strip()",
+                "print('installing playwright...')",
+                "print(run('python3', '-m', 'pip', 'install', '--quiet', '--disable-pip-version-check', 'playwright')[-1200:])",
+                "try:",
+                "    import playwright",
+                "    print('playwright module is now importable')",
+                "except Exception as e:",
+                "    print('still missing:', e)",
+              ].join("\n");
+              try {
+                const inst = await instaboxExec("python3 - <<'PY'\n" + installScript + "\nPY", 420);
+                result.install = String(inst).slice(0, 2000);
+              } catch (e) {
+                result.install = "install failed: " + String(e && e.message ? e.message : e).slice(0, 300);
+              }
+            }
+            const shotUrl = String(url.searchParams.get("shot") || "").trim();
+            if (/^https?:\/\//i.test(shotUrl)) {
+              // End-to-end proof: drive Chromium on the VM exactly as the
+              // screenshot tool would, and report the PNG size.
+              const shotScript = [
+                "import os, sys",
+                "from playwright.sync_api import sync_playwright",
+                "url, out = sys.argv[1], sys.argv[2]",
+                "exe = os.environ.get('LIAM_CHROMIUM_PATH') or None",
+                "kw = dict(headless=True, args=['--no-sandbox', '--disable-dev-shm-usage'])",
+                "if exe:",
+                "    kw['executable_path'] = exe",
+                "with sync_playwright() as p:",
+                "    b = p.chromium.launch(**kw)",
+                "    pg = b.new_page(viewport={'width': 1366, 'height': 900})",
+                "    pg.goto(url, wait_until='domcontentloaded', timeout=45000)",
+                "    pg.screenshot(path=out)",
+                "    b.close()",
+                "print('shot bytes', os.path.getsize(out))",
+              ].join("\n");
+              const scriptPath = "/data/home/liam_browser/probe_shot.py";
+              try {
+                await instaboxUpload(scriptPath, Buffer.from(shotScript, "utf8"));
+                const quoted = "'" + shotUrl.replace(/'/g, "'\\''") + "'";
+                const chromeEnv = 'export LIAM_CHROMIUM_PATH="$(command -v chromium '
+                  + '|| command -v chromium-browser || command -v google-chrome || true)"; ';
+                const cmd = chromeEnv + "python3 " + scriptPath + " " + quoted
+                  + " /data/home/liam_browser/probe_shot.png";
+                result.shot = String(await instaboxExec(cmd, 180)).slice(0, 800);
+              } catch (e) {
+                result.shot = "shot failed: " + String(e && e.message ? e.message : e).slice(0, 300);
+              }
+            }
+            return sendJson(res, 200, { ...base, vpsProbe: result });
           } catch (e) {
             return sendJson(res, 200, {
               ...base,
