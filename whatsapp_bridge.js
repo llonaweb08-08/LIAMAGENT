@@ -2452,7 +2452,7 @@ const server = http.createServer(async (req, res) => {
                 "    p = subprocess.run(a, capture_output=True, text=True)",
                 "    return (p.stdout + p.stderr).strip()",
                 "print('installing playwright...')",
-                "print(run('python3', '-m', 'pip', 'install', '--quiet', '--disable-pip-version-check', 'playwright')[-1200:])",
+                "print(run('python3', '-m', 'pip', 'install', '--quiet', '--disable-pip-version-check', '--break-system-packages', 'playwright')[-1200:])",
                 "try:",
                 "    import playwright",
                 "    print('playwright module is now importable')",
