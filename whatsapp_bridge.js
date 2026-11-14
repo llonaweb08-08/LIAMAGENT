@@ -493,8 +493,48 @@ async function refreshReachoutLock() {
     if (reachoutLock && reachoutLock.isActive) {
       console.log(`warn: WhatsApp is blocking outgoing messages (${reachoutLock.enforcementType || "restriction"})`
         + (reachoutLock.endsAt ? ` until ${reachoutLock.endsAt}` : ""));
+    } else if (!reachoutLockActive()) {
+      // The block has lifted: release anything we held back while it was on.
+      void flushHeldReplies();
     }
   } catch (e) { /* keep the last known value on a failed check */ }
+}
+
+// While WhatsApp is time-locking the number, replies cannot be delivered, so
+// instead of dropping them they wait here and go out as soon as the block
+// lifts. Bounded in count and age so a long block cannot replay a flood of
+// stale answers or grow without limit.
+const heldReplies = [];
+const HELD_REPLY_MAX = 20;
+const HELD_REPLY_TTL_MS = 3 * 60 * 60 * 1000;
+function holdReply(target, text, options) {
+  try {
+    heldReplies.push({ target, text, options, at: Date.now() });
+    while (heldReplies.length > HELD_REPLY_MAX) heldReplies.shift();
+    console.log(`warn: holding a reply for ${jidType(target)} until WhatsApp stops blocking sends`);
+  } catch (e) {}
+}
+let flushingHeldReplies = false;
+async function flushHeldReplies() {
+  if (flushingHeldReplies || reachoutLockActive() || !heldReplies.length) return;
+  flushingHeldReplies = true;
+  try {
+    while (heldReplies.length) {
+      const item = heldReplies[0];
+      if (Date.now() - item.at > HELD_REPLY_TTL_MS) { heldReplies.shift(); continue; }
+      try {
+        const sent = await sendLong(item.target, item.text, item.options);
+        heldReplies.shift();
+        console.log(`info: delivered a held reply to ${jidType(item.target)} (id ${messageId(sent) || "?"})`);
+      } catch (e) {
+        if (e && e.reachoutLocked) break; // still blocked; keep it for the next check
+        heldReplies.shift(); // a real error would never succeed, so do not loop
+        console.log(`warn: dropped a held reply (${String(e && e.message ? e.message : e).slice(0, 120)})`);
+      }
+    }
+  } finally {
+    flushingHeldReplies = false;
+  }
 }
 const ACK_NAMES = { 0: "error", 1: "pending", 2: "server", 3: "delivered", 4: "read", 5: "played" };
 function ackName(status) {
@@ -1005,6 +1045,12 @@ function stopTyping(jid) {
       Promise.resolve(sock.sendPresenceUpdate("paused", target)).catch(() => {});
     }
   } catch (e) {}
+}
+// A held or failed reply must never leave "typing..." running: WhatsApp keeps
+// showing it while presence updates arrive, so a forgotten timer looks like an
+// agent that is stuck. Called from every failure path.
+function stopAllTyping() {
+  for (const target of Array.from(typingTimers.keys())) stopTyping(target);
 }
 
 function askLiam(user, phone, isGroup, groupJid, mentioned, replyTo) {
@@ -1745,9 +1791,15 @@ async function handleIncomingMessage(msg) {
         return;
       }
       console.log(`\n📩 ${phone}: ${text}\n💬 Liam: ${reply}\n`);
-      const sent = await sendLong(dmTarget, reply);
-      console.log(`   ↳ reply accepted by WhatsApp (${jidType(dmTarget)}, id ${messageId(sent) || "?"})`);
-      stopTyping(dmTarget);
+      try {
+        const sent = await sendLong(dmTarget, reply);
+        console.log(`   ↳ reply accepted by WhatsApp (${jidType(dmTarget)}, id ${messageId(sent) || "?"})`);
+      } catch (e) {
+        if (e && e.reachoutLocked) holdReply(dmTarget, reply);
+        else throw e;
+      } finally {
+        stopTyping(dmTarget);
+      }
       return;
     }
 
@@ -1801,11 +1853,18 @@ async function handleIncomingMessage(msg) {
     console.log(`\n📩 [${from}] ${who} ${phone}: ${text}\n💬 Liam: ${reply}\n`);
     // In a group, answer the exact message that triggered her with a WhatsApp
     // quoted reply instead of dropping a bare line into the chat.
-    const sent = await sendLong(from, reply, { quoted: msg });
-    console.log(`   ↳ reply accepted by WhatsApp (${jidType(from)}, id ${messageId(sent) || "?"})`);
-    stopTyping(from);
-    rememberLiamMessage(from, messageId(sent));
+    try {
+      const sent = await sendLong(from, reply, { quoted: msg });
+      console.log(`   ↳ reply accepted by WhatsApp (${jidType(from)}, id ${messageId(sent) || "?"})`);
+      rememberLiamMessage(from, messageId(sent));
+    } catch (e) {
+      if (e && e.reachoutLocked) holdReply(from, reply, { quoted: msg });
+      else throw e;
+    } finally {
+      stopTyping(from);
+    }
   } catch (e) {
+    stopAllTyping();
     lastInboundError = String(e && e.message ? e.message : e).slice(0, 400);
     console.log(`\n💀 MSG HANDLER ERROR: ${String(e)}`);
   }
@@ -2299,6 +2358,7 @@ function statusPayload() {
     // delivered no matter what, and it is not a fault of this process.
     sendingBlocked: reachoutLockActive(),
     sendingBlockedUntil: reachoutLock && reachoutLock.isActive ? reachoutLock.endsAt : null,
+    heldReplies: heldReplies.length,
   };
 }
 
@@ -2701,6 +2761,7 @@ const server = http.createServer(async (req, res) => {
           // text, so a flapping socket is visible while linked.
           events: waEvents.slice(-15),
           reachoutLock,
+          heldReplies: heldReplies.length,
         };
         const probe = url.searchParams.get("probe");
         // Optional runtime Baileys log level, so a protocol bug can be watched
