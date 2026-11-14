@@ -371,9 +371,12 @@ let lastInboundPhone = "";
 let lastInboundError = "";
 let lastOutboundAt = 0;
 let lastAgentRequestAt = 0;
+let lastAgentStartedAt = 0;
 let lastAgentReplyAt = 0;
 let lastAgentError = "";
 let agentStderrTail = "";
+// Last turn's timing breakdown from the Python agent (no message text).
+let lastAgentTrace = null;
 function maskPhone(value) {
   const p = barePhone(value);
   return p ? "***" + p.slice(-4) : "";
@@ -467,6 +470,7 @@ function startAgent() {
         const p = agentPending; agentPending = null;
         try { clearTimeout(p.timeout); } catch (e) {}
         lastAgentReplyAt = Date.now();
+        if (msg.trace && typeof msg.trace === "object") lastAgentTrace = msg.trace;
         p.resolve(msg.reply == null ? "" : String(msg.reply));
       }
     }
@@ -711,6 +715,7 @@ function askLiam(user, phone, isGroup, groupJid, mentioned, replyTo) {
   lastAgentRequestAt = Date.now();
   lastAgentError = "";
   const job = () => new Promise((resolve, reject) => {
+    lastAgentStartedAt = Date.now();
     const proc = startAgent();
     if (!proc || proc.exitCode !== null || !proc.stdin || proc.stdin.destroyed) {
       return reject(new Error("agent is not running"));
@@ -2198,7 +2203,13 @@ const server = http.createServer(async (req, res) => {
           lastInboundError,
           lastOutboundAt: lastOutboundAt || null,
           lastAgentRequestAt: lastAgentRequestAt || null,
+          lastAgentStartedAt: lastAgentStartedAt || null,
           lastAgentReplyAt: lastAgentReplyAt || null,
+          lastTurnMs: (lastAgentStartedAt && lastAgentReplyAt)
+            ? Math.max(0, lastAgentReplyAt - lastAgentStartedAt) : null,
+          lastQueueWaitMs: (lastAgentRequestAt && lastAgentStartedAt)
+            ? Math.max(0, lastAgentStartedAt - lastAgentRequestAt) : null,
+          lastAgentTrace,
           lastAgentError,
           agentStderrTail: agentStderrTail.slice(-1200),
           // Read-only: which optional integrations have credentials present.

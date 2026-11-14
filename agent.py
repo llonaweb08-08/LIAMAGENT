@@ -447,7 +447,7 @@ def screenshot(to, url, sender=None):
         try:
             result = subprocess.run(
                 [sys.executable, "-c", _SCREENSHOT_SCRIPT, safe, path, liam_keys.BROWSER_UA],
-                timeout=_env_int("LIAM_SCREENSHOT_TIMEOUT", 75, 20, 180),
+                timeout=_clamp_timeout(_env_int("LIAM_SCREENSHOT_TIMEOUT", 75, 20, 180)),
                 capture_output=True, text=False, check=False)
         except subprocess.TimeoutExpired as exc:
             raise RuntimeError("screenshot timed out") from exc
@@ -473,8 +473,15 @@ def permission(jid, who, allow, sender=None):
     return wa.permission(jid, who, allow, sender=sender)
 
 def vps_exec(command, timeout=120, cwd="", sender=None, chat="", group=False):
+    try:
+        seconds = int(timeout or 120)
+    except (TypeError, ValueError):
+        seconds = 120
+    left = _remaining_budget()
+    if left is not None:
+        seconds = max(5, min(seconds, int(left)))
     return wa.vps_exec(
-        command, timeout=timeout, cwd=cwd, sender=sender, chat=chat, group=group)
+        command, timeout=seconds, cwd=cwd, sender=sender, chat=chat, group=group)
 
 def report_progress(text, sender=None):
     try:
@@ -518,7 +525,7 @@ def browser_task(script):
         env.setdefault("LIAM_USER_AGENT", liam_keys.BROWSER_UA)
         r = subprocess.run(
             [sys.executable, path], capture_output=True, text=True,
-            timeout=_env_int("LIAM_BROWSER_TIMEOUT", 90, 10, 300), env=env)
+            timeout=_clamp_timeout(_env_int("LIAM_BROWSER_TIMEOUT", 90, 10, 300)), env=env)
         out = ((r.stdout or "") + (r.stderr or "")).strip()
         return out[:8000] or f"exit={r.returncode}"
     except subprocess.TimeoutExpired:
@@ -576,7 +583,7 @@ def email_read(host="", username="", password="", folder="INBOX", limit=5):
         import email
         import imaplib
         port = _env_int("LIAM_EMAIL_PORT", 993, 1, 65535)
-        timeout = _env_int("LIAM_EMAIL_TIMEOUT", 20, 5, 60)
+        timeout = _clamp_timeout(_env_int("LIAM_EMAIL_TIMEOUT", 20, 5, 60))
         limit = max(1, min(20, int(limit or 5)))
         mail = imaplib.IMAP4_SSL(host, port, timeout=timeout)
         mail.login(username, password)
@@ -636,7 +643,7 @@ def create_tool(name, code):
 def web_fetch(url):
     safe = _safe_url(url)
     try:
-        timeout = _env_int("LIAM_FETCH_TIMEOUT", 20, 5, 60)
+        timeout = _clamp_timeout(_env_int("LIAM_FETCH_TIMEOUT", 20, 5, 60))
         with _open_url(safe, timeout=timeout, headers={
             "User-Agent": liam_keys.BROWSER_UA,
             "Accept": "text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.8",
@@ -837,7 +844,7 @@ def shell_exec(command, timeout=30):
             args = shlex.split(text, posix=(os.name != "nt"))
         if not args:
             return "empty command"
-        timeout = _env_int("LIAM_SHELL_TIMEOUT", timeout, 1, 120)
+        timeout = _clamp_timeout(_env_int("LIAM_SHELL_TIMEOUT", timeout, 1, 120))
         result = subprocess.run(
             args, shell=False, capture_output=True, text=True, timeout=timeout)
         output = ((result.stdout or "") + (result.stderr or ""))[:SHELL_OUTPUT_MAX]
@@ -972,7 +979,12 @@ def _mark_exhausted(brain, key, model=None):
 ATTEMPT_TIMEOUT = 35       # seconds per HTTP attempt
 CALL_BUDGET = 70           # total seconds for one assistant step
 MAX_ATTEMPTS = 8           # provider/key attempts per turn
-FALLBACK_ORDER = ["moonmath", "glm", "agnes", "hcn"]
+# Fallback chain: primary first, then only brains that actually answer. MoonMath's
+# "glm" model (MOON_FALLBACK) returns HTTP 404 and Unorouter returns 503, so a
+# slot for either just wastes a turn. HCNSec is slow, so it is tried last.
+FALLBACK_ORDER = ["moonmath", "agnes", "hcn"]
+# Per-brain HTTP cap. A slow provider must not be allowed to eat the budget.
+BRAIN_TIMEOUT = {"agnes": 30, "hcn": 20}
 OFFLINE = os.environ.get("LIAM_OFFLINE") == "1"
 
 def _is_transient(status):
@@ -1041,10 +1053,10 @@ def _attempt_plan(brain):
     if brain == "moonmath":
         plan = []
         for k in keys:
-            if not _key_exhausted("moonmath", k, liam_keys.MOON_MODEL):
-                plan.append(("moonmath", liam_keys.MOON_MODEL, k))
-            if not _key_exhausted("moonmath", k, liam_keys.MOON_FALLBACK):
-                plan.append(("moonmath", liam_keys.MOON_FALLBACK, k))
+            for model in (liam_keys.MOON_MODEL, liam_keys.MOON_FALLBACK):
+                if not model or _key_exhausted("moonmath", k, model):
+                    continue
+                plan.append(("moonmath", model, k))
         seen = set(); out = []
         for item in plan:
             if item in seen: continue
@@ -1090,7 +1102,7 @@ def call_model(messages, sender, brain=None, tools=None, budget=None):
                 try:
                     return _http_post(BRAINS[b]["base"].rstrip("/"), model, key, messages,
                                       tools if use_tools else None,
-                                       min(60 if b == "agnes" else ATTEMPT_TIMEOUT, remaining))
+                                      min(BRAIN_TIMEOUT.get(b, ATTEMPT_TIMEOUT), remaining))
                 except urllib.error.HTTPError as e:
                     status = e.code
                     try: detail = e.read(200).decode("utf-8", "replace").replace("\n", " ")[:160]
@@ -1307,6 +1319,28 @@ HISTORY_TURNS = 5     # user/assistant pairs of short-term memory per chat
 HISTORY_MESSAGES = HISTORY_TURNS * 2
 _HISTORY = {}
 
+# Per-turn diagnostics. The bridge reads this back through /diag so a slow reply
+# can be explained from outside without Render's log stream. Never contains
+# message text - only timings, tool names and counts.
+_LAST_TRACE = {}
+# Wall-clock deadline for the turn in flight. Tools consult it so a single slow
+# browser/vps call cannot run long past the budget the way it used to.
+_DEADLINE = None
+
+def _remaining_budget():
+    """Seconds left in the current turn, or None when no turn is running."""
+    if _DEADLINE is None:
+        return None
+    return _DEADLINE - time.monotonic()
+
+def _clamp_timeout(default):
+    """Never let one tool outlive the turn budget."""
+    value = float(default)
+    left = _remaining_budget()
+    if left is not None:
+        value = min(value, max(2.0, left))
+    return max(1.0, value)
+
 def _stop_requested():
     try: return bool(wa.get_stop())
     except Exception: return False
@@ -1398,18 +1432,34 @@ def run_agent(user_message, sender, is_group, group_jid, mentioned, reply_to):
     cache = {}
     calls_done = 0
     last_text = ""
-    turn_deadline = time.monotonic() + _env_int("LIAM_TURN_BUDGET", 180, 20, 240)
+    steps_done = 0
+    t0 = time.monotonic()
+    turn_deadline = t0 + _env_int("LIAM_TURN_BUDGET", 120, 20, 240)
+    global _DEADLINE, _LAST_TRACE
+    _DEADLINE = turn_deadline
+    trace = {"events": []}
 
     def finish(text):
+        global _DEADLINE, _LAST_TRACE
         text = _clean_reply(text or "") or FALLBACK_TEXT
         _history_add(chat_key, turn, text, sender)
+        _DEADLINE = None
+        trace["totalMs"] = int((time.monotonic() - t0) * 1000)
+        trace["steps"] = steps_done
+        trace["tools"] = sum(1 for e in trace["events"] if e.get("k") == "tool")
+        trace["events"] = trace["events"][-20:]
+        _LAST_TRACE = trace
         return text
 
     for _step in range(MAX_STEPS):
         remaining = turn_deadline - time.monotonic()
         if remaining <= 2:
             break
+        _t = time.monotonic()
         msg = call_model(messages, sender, tools=schemas, budget=min(CALL_BUDGET, remaining))
+        steps_done += 1
+        trace["events"].append({"k": "model", "ms": int((time.monotonic() - _t) * 1000),
+                                "calls": len(msg.get("tool_calls") or [])})
         messages.append(msg)
         text = (msg.get("content") or "").strip()
         if text:
@@ -1420,6 +1470,12 @@ def run_agent(user_message, sender, is_group, group_jid, mentioned, reply_to):
 
         for tc in calls:
             if calls_done >= MAX_TOOL_CALLS:
+                break
+            # The old loop only checked the budget between model steps, so a few
+            # slow tool calls could stretch a single reply to minutes. Stop the
+            # moment the turn is nearly out of time.
+            left = _remaining_budget()
+            if left is not None and left <= 3:
                 break
             fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
             name = str(fn.get("name") or "")
@@ -1440,6 +1496,7 @@ def run_agent(user_message, sender, is_group, group_jid, mentioned, reply_to):
             elif key in cache:
                 result = f"{cache[key]} (already done - not repeated)"
             else:
+                _t = time.monotonic()
                 try:
                     result = str(tool_map[name](**args))
                 except TypeError as e:
@@ -1447,6 +1504,8 @@ def run_agent(user_message, sender, is_group, group_jid, mentioned, reply_to):
                 except Exception as e:
                     _log(f"[tool] {name} failed: {type(e).__name__}: {e}")
                     result = f"tool error: {type(e).__name__} - {str(e)[:200]}"
+                trace["events"].append({"k": "tool", "n": name,
+                                        "ms": int((time.monotonic() - _t) * 1000)})
                 cache[key] = result
             calls_done += 1
             if len(result) > 8000:
@@ -1465,7 +1524,10 @@ def run_agent(user_message, sender, is_group, group_jid, mentioned, reply_to):
     remaining = max(5, min(CALL_BUDGET, turn_deadline - time.monotonic()))
     messages.append({"role": "user",
                      "content": "Stop using tools. Reply to me now in one short message."})
+    _t = time.monotonic()
     final = call_model(messages, sender, tools=None, budget=remaining)
+    trace["events"].append({"k": "model", "ms": int((time.monotonic() - _t) * 1000),
+                            "calls": 0, "final": True})
     return finish((final.get("content") or "").strip() or last_text)
 
 if __name__ == "__main__":
@@ -1488,7 +1550,7 @@ if __name__ == "__main__":
             else:
                 reply = run_agent(line, OWNERS[0], False, "", False, False)
             if not isinstance(reply, str): reply = "" if reply is None else str(reply)
-            print(json.dumps({"reply": reply}), flush=True)
+            print(json.dumps({"reply": reply, "trace": _LAST_TRACE}), flush=True)
         except Exception as e:
             _log(f"[agent] {type(e).__name__}: {e}")
             print(json.dumps({"error": "agent failed - check the console"}), flush=True)

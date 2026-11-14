@@ -75,12 +75,12 @@ services:
         sync: false
 
       # --- Behaviour --------------------------------------------------------
-      # Bridge waits longer than the agent's per-turn budget so a heavy browser
-      # turn is not cut off mid-work.
+      # Bridge waits a little longer than the agent's per-turn budget so a heavy
+      # browser turn is not cut off mid-work, but a stuck turn still ends.
       - key: LIAM_ASK_TIMEOUT_MS
-        value: "240000"
+        value: "180000"
       - key: LIAM_TURN_BUDGET
-        value: "180"
+        value: "120"
       - key: LIAM_BROWSER_TIMEOUT
         value: "90"
       - key: LIAM_SCREENSHOT_TIMEOUT

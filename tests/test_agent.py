@@ -15,6 +15,7 @@ import os
 import re
 import socket
 import tempfile
+import time
 import types
 import unittest
 import urllib.request
@@ -432,6 +433,65 @@ class AgentToolTests(unittest.TestCase):
             "agnes": {"base": "https://x", "model": "m", "keys": [""], "label": "A"},
         }):
             self.assertEqual(agent._attempt_plan("agnes"), [])
+
+    def test_attempt_plan_skips_a_blank_fallback_model(self):
+        fake = {"base": "https://x", "model": "m", "keys": ["k1"], "label": "M"}
+        with mock.patch.dict(agent.BRAINS, {"moonmath": fake}), \
+                mock.patch.object(agent.liam_keys, "MOON_MODEL", "primary"), \
+                mock.patch.object(agent.liam_keys, "MOON_FALLBACK", ""):
+            plan = agent._attempt_plan("moonmath")
+        self.assertEqual(plan, [("moonmath", "primary", "k1")])
+
+    def test_fallback_chain_excludes_dead_providers(self):
+        # glm (MoonMath) 404s and Unorouter 503s, so neither should cost a turn.
+        self.assertEqual(agent.FALLBACK_ORDER[0], "moonmath")
+        self.assertNotIn("glm", agent.FALLBACK_ORDER)
+        self.assertNotIn("unorouter", agent.FALLBACK_ORDER)
+
+    def test_turn_records_a_trace_without_message_text(self):
+        with mock.patch.object(agent, "call_model",
+                               return_value={"role": "assistant", "content": "hi"}):
+            out = agent.run_agent("a very secret sentence", OWNER, False, "", False, False)
+        self.assertEqual(out, "hi")
+        trace = agent._LAST_TRACE
+        self.assertIn("totalMs", trace)
+        self.assertEqual(trace["steps"], 1)
+        self.assertNotIn("secret", json.dumps(trace))
+
+    def test_turn_stops_running_tools_once_the_budget_is_gone(self):
+        ran = []
+
+        def fake_tool(query=""):
+            ran.append(query)
+            agent._DEADLINE = time.monotonic() - 1   # pretend the turn ran out
+            return "result"
+
+        def fake_model(messages, sender, **kwargs):
+            return {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "c1", "function": {"name": "web_search",
+                                          "arguments": json.dumps({"query": "a"})}},
+                {"id": "c2", "function": {"name": "web_search",
+                                          "arguments": json.dumps({"query": "b"})}},
+            ]}
+
+        try:
+            with mock.patch.object(agent, "call_model", side_effect=fake_model), \
+                    mock.patch.dict(agent.TOOLS, {"web_search": fake_tool}):
+                agent.run_agent("hi", OWNER, False, "", False, False)
+        finally:
+            agent._DEADLINE = None
+        self.assertEqual(ran, ["a"])
+
+    def test_clamp_timeout_never_exceeds_the_turn_deadline(self):
+        try:
+            agent._DEADLINE = None
+            self.assertEqual(agent._clamp_timeout(90), 90.0)
+            agent._DEADLINE = time.monotonic() + 5
+            self.assertLessEqual(agent._clamp_timeout(90), 5.5)
+            agent._DEADLINE = time.monotonic() - 10
+            self.assertEqual(agent._clamp_timeout(90), 2.0)
+        finally:
+            agent._DEADLINE = None
 
     def test_offline_mode_short_circuits_without_network(self):
         with mock.patch.object(agent, "OFFLINE", True), \
