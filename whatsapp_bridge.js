@@ -1164,8 +1164,19 @@ function handleConnectionClose(socket, status, detail) {
   }
   closeCount += 1;
   if (closeCount > 3) {
-    setWaState("error", "WhatsApp keeps disconnecting");
-    autoReset("WhatsApp keeps disconnecting");
+    // A burst of transient server-side closes (e.g. "428 Connection Terminated
+    // by Server") must not destroy a linked login. Wiping it here forced a full
+    // re-pair for a hiccup a plain reconnect would have fixed. Only recycle the
+    // socket and keep the saved credentials; wipe only when never linked.
+    if (hasLinkMarker() && profileHasCredentials()) {
+      setWaState("disconnected", "WhatsApp keeps disconnecting; reconnecting with the saved login");
+      noteWaEvent("reconnect_loop", "repeated disconnects (login kept)");
+      resetWhatsApp("WhatsApp keeps disconnecting", { wipe: false })
+        .catch((e) => console.log("warn: auto reset failed:", String(e)));
+    } else {
+      setWaState("error", "WhatsApp keeps disconnecting");
+      autoReset("WhatsApp keeps disconnecting");
+    }
     return;
   }
   setWaState("disconnected", "connection dropped; reconnecting");
