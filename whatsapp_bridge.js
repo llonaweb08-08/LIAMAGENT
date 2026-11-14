@@ -668,6 +668,45 @@ const wa = {
   },
 };
 
+// WhatsApp shows "typing..." only while a presence update is kept alive, and a
+// blue tick only after readMessages. Sending both the moment we decide to answer
+// makes a slow turn feel responsive instead of like dead air.
+const typingTimers = new Map();
+function markReadAndTyping(jid, msg) {
+  const target = jidForSend(jid);
+  try {
+    if (sock && msg && msg.key && sock.readMessages) {
+      Promise.resolve(sock.readMessages([msg.key])).catch(() => {});
+    }
+  } catch (e) {}
+  const ping = () => {
+    try {
+      if (sock && sock.sendPresenceUpdate) {
+        Promise.resolve(sock.sendPresenceUpdate("composing", target)).catch(() => {});
+      }
+    } catch (e) {}
+  };
+  ping();
+  if (!typingTimers.has(target)) {
+    const timer = setInterval(ping, 10000);
+    if (typeof timer.unref === "function") timer.unref();
+    typingTimers.set(target, timer);
+  }
+}
+function stopTyping(jid) {
+  const target = jidForSend(jid);
+  const timer = typingTimers.get(target);
+  if (timer) {
+    try { clearInterval(timer); } catch (e) {}
+    typingTimers.delete(target);
+  }
+  try {
+    if (sock && sock.sendPresenceUpdate) {
+      Promise.resolve(sock.sendPresenceUpdate("paused", target)).catch(() => {});
+    }
+  } catch (e) {}
+}
+
 function askLiam(user, phone, isGroup, groupJid, mentioned, replyTo) {
   lastAgentRequestAt = Date.now();
   lastAgentError = "";
@@ -931,6 +970,7 @@ async function handleApprovalCommand(text, phone, chat, isGroup) {
     TEMP[p.jid] = TEMP[p.jid] || {};
     TEMP[p.jid][p.phone] = Date.now();
     try { await wa.sendMessage(p.jid, `okay, I'll reply to ${p.phone} for the next 3 hours.`); } catch (e) {}
+    markReadAndTyping(p.jid, p.quoted);
     try {
       const reply = await askLiam(p.text, p.phone, true, p.jid, true, false);
       const sent = await sendLong(p.jid, reply, p.quoted ? { quoted: p.quoted } : undefined);
@@ -939,6 +979,7 @@ async function handleApprovalCommand(text, phone, chat, isGroup) {
       console.log("warn: approved reply failed:", String(e));
       try { await sendLong(p.jid, SERVER_DOWN_TEXT, p.quoted ? { quoted: p.quoted } : undefined); } catch (e2) {}
     }
+    stopTyping(p.jid);
     if (chat !== p.jid) { try { await wa.sendMessage(chat, `okay — allowed ${p.phone} for 3 hours.`); } catch (e) {} }
     return true;
   }
@@ -1343,16 +1384,19 @@ async function handleIncomingMessage(msg) {
         lastInboundError = "sender is not an owner/admin and DMs are closed";
         return;
       }
+      markReadAndTyping(from, msg);
       let reply;
       try {
         reply = await askLiam(text, phone, false, "", false, false);
       } catch (e) {
         console.log(`\n💀 agent failed for DM ${phone}: ${String(e)}`);
         try { await sendLong(from, SERVER_DOWN_TEXT); } catch (e2) {}
+        stopTyping(from);
         return;
       }
       console.log(`\n📩 ${phone}: ${text}\n💬 Liam: ${reply}\n`);
       await sendLong(from, reply);
+      stopTyping(from);
       return;
     }
 
@@ -1393,18 +1437,21 @@ async function handleIncomingMessage(msg) {
       }
     }
 
+    markReadAndTyping(from, msg);
     let reply;
     try {
       reply = await askLiam(text, phone, true, from, mentioned, replyingToLiam);
     } catch (e) {
       console.log(`\n💀 agent failed in group ${from}: ${String(e)}`);
       try { await sendLong(from, SERVER_DOWN_TEXT, { quoted: msg }); } catch (e2) {}
+      stopTyping(from);
       return;
     }
     console.log(`\n📩 [${from}] ${who} ${phone}: ${text}\n💬 Liam: ${reply}\n`);
     // In a group, answer the exact message that triggered her with a WhatsApp
     // quoted reply instead of dropping a bare line into the chat.
     const sent = await sendLong(from, reply, { quoted: msg });
+    stopTyping(from);
     rememberLiamMessage(from, messageId(sent));
   } catch (e) {
     lastInboundError = String(e && e.message ? e.message : e).slice(0, 400);
@@ -2503,5 +2550,5 @@ module.exports = {
   dmAllowed, setDmOpen, rememberKnownMember, knownMembers,
   cancelPairing, resetWhatsApp, connectSocket, closeSocket, handleIncomingMessage,
   messageId, jidForSend, socketUserId, friendlyWaError,
-  SERVER_DOWN_TEXT, startKeepAlive,
+  SERVER_DOWN_TEXT, startKeepAlive, markReadAndTyping, stopTyping,
 };

@@ -51,6 +51,8 @@ fs.writeFileSync(path.join(baileysStubDir, 'index.js'), [
   '  }',
   '  async groupMetadata() { return { participants: [] }; }',
   '  async groupLeave(jid) { this.leftGroups.push(jid); }',
+  '  async readMessages(keys) { this.read = (this.read || []).concat(keys || []); }',
+  '  async sendPresenceUpdate(type, jid) { (this.presence = this.presence || []).push({ type, jid }); }',
   '  end() {}',
   '}',
   'function makeWASocket(config) { return new FakeSocket(config); }',
@@ -382,6 +384,17 @@ test('bridge endpoint security and actions', async (t) => {
     // No public URL in the test process, so the keep-alive must be a safe no-op.
     bridge.startKeepAlive();
     bridge.startKeepAlive();
+  });
+
+  await t.test('signals read + typing while answering', async () => {
+    fake.presence = [];
+    fake.read = [];
+    bridge.markReadAndTyping(OWNER, { key: { id: 'READ-1' } });
+    bridge.stopTyping(OWNER);
+    assert.ok(fake.read.some((k) => k.id === 'READ-1'), 'message should be marked read');
+    const types = fake.presence.map((p) => p.type);
+    assert.ok(types.includes('composing'), 'should show typing');
+    assert.equal(types.at(-1), 'paused', 'typing must stop after the reply');
   });
 
   await t.test('protects pairing pages with the pairing token', async () => {
