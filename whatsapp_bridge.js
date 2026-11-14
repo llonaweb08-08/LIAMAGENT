@@ -406,6 +406,44 @@ let lastInboundFromType = "";
 let lastOutboundAt = 0;
 let lastSendTargetType = "";
 let lastSendError = "";
+// The last few outbound message ids and their delivery acknowledgements. A send
+// that "succeeds" but never arrives shows up here as a missing/never-advanced
+// ack, which tells a delivery problem apart from a routing one.
+const recentSends = [];
+const outboundAcks = new Map();
+const ACK_NAMES = { 0: "error", 1: "pending", 2: "server", 3: "delivered", 4: "read", 5: "played" };
+function ackName(status) {
+  const n = Number(status);
+  return Number.isFinite(n) ? (ACK_NAMES[n] || String(n)) : "";
+}
+function recordSend(id, to) {
+  if (!id) return;
+  recentSends.push({ id, to, at: Date.now() });
+  while (recentSends.length > 5) recentSends.shift();
+}
+function recordAcks(updates) {
+  for (const item of Array.isArray(updates) ? updates : []) {
+    const id = item && item.key && item.key.id;
+    const status = item && item.update && item.update.status;
+    if (!id || status === undefined || status === null) continue;
+    const prior = outboundAcks.get(id) || { to: jidType(item.key && item.key.remoteJid) };
+    outboundAcks.set(id, { status: ackName(status), at: Date.now(), to: prior.to || "" });
+  }
+  if (outboundAcks.size > 40) {
+    for (const key of outboundAcks.keys()) {
+      if (outboundAcks.size <= 40) break;
+      outboundAcks.delete(key);
+    }
+  }
+}
+function recentSendReport() {
+  return recentSends.slice(-5).map((s) => ({
+    id: s.id,
+    to: s.to,
+    at: s.at,
+    ack: outboundAcks.get(s.id) || null,
+  }));
+}
 let lastAgentRequestAt = 0;
 let lastAgentStartedAt = 0;
 let lastAgentReplyAt = 0;
@@ -808,6 +846,7 @@ const wa = {
         const sent = await sock.sendMessage(target, payload, options);
         lastOutboundAt = Date.now();
         lastSendError = "";
+        recordSend(messageId(sent), lastSendTargetType);
         return sent;
       } catch (e) {
         lastErr = e;
@@ -1407,6 +1446,20 @@ async function connectSocket(reason) {
       if (!event || event.type !== "notify" || !Array.isArray(event.messages)) return;
       for (const message of event.messages) handleIncomingMessage(message);
     });
+    // Delivery acknowledgements for our own outbound messages, so a reply that
+    // WhatsApp accepts but never delivers is visible instead of silent.
+    socket.ev.on("messages.update", (updates) => { try { recordAcks(updates); } catch (e) {} });
+    socket.ev.on("message-receipt.update", (updates) => {
+      try {
+        for (const item of Array.isArray(updates) ? updates : []) {
+          const id = item && item.key && item.key.id;
+          if (!id) continue;
+          const receipt = (item && item.receipt) || {};
+          const status = receipt.readTimestamp || receipt.playedTimestamp ? 4 : 3;
+          recordAcks([{ key: item.key, update: { status } }]);
+        }
+      } catch (e) {}
+    });
     // Contact events carry the LID -> phone mapping permissions depend on.
     const remember = (list) => { try { rememberLidContacts(list); } catch (e) {} };
     socket.ev.on("contacts.upsert", remember);
@@ -1577,7 +1630,8 @@ async function handleIncomingMessage(msg) {
         return;
       }
       console.log(`\n📩 ${phone}: ${text}\n💬 Liam: ${reply}\n`);
-      await sendLong(dmTarget, reply);
+      const sent = await sendLong(dmTarget, reply);
+      console.log(`   ↳ reply accepted by WhatsApp (${jidType(dmTarget)}, id ${messageId(sent) || "?"})`);
       stopTyping(dmTarget);
       return;
     }
@@ -1633,6 +1687,7 @@ async function handleIncomingMessage(msg) {
     // In a group, answer the exact message that triggered her with a WhatsApp
     // quoted reply instead of dropping a bare line into the chat.
     const sent = await sendLong(from, reply, { quoted: msg });
+    console.log(`   ↳ reply accepted by WhatsApp (${jidType(from)}, id ${messageId(sent) || "?"})`);
     stopTyping(from);
     rememberLiamMessage(from, messageId(sent));
   } catch (e) {
@@ -2479,6 +2534,7 @@ const server = http.createServer(async (req, res) => {
           lastOutboundAt: lastOutboundAt || null,
           lastSendTargetType,
           lastSendError,
+          recentSends: recentSendReport(),
           lastAgentRequestAt: lastAgentRequestAt || null,
           lastAgentStartedAt: lastAgentStartedAt || null,
           lastAgentReplyAt: lastAgentReplyAt || null,
@@ -2691,6 +2747,33 @@ const server = http.createServer(async (req, res) => {
             return sendJson(res, 200, {
               ...base,
               sendProbe: { ok: false, to: maskPhone(to), error: String(e && e.message ? e.message : e).slice(0, 400) },
+            });
+          }
+        }
+        if (probe === "sendack") {
+          // Send a real message and wait for WhatsApp's delivery receipt. A
+          // reply that is accepted but never gets past "server" ack is exactly
+          // the "she answered but I never got it" symptom.
+          const to = String(url.searchParams.get("to") || OWNERS[0]).replace(/\D/g, "");
+          const wait = Math.min(30000, Math.max(0, Number.parseInt(url.searchParams.get("wait") || "10000", 10) || 10000));
+          try {
+            const sent = await wa.sendMessage(to, "delivery check from Liam");
+            const id = messageId(sent);
+            let ack = null;
+            const deadline = Date.now() + wait;
+            while (Date.now() < deadline) {
+              ack = outboundAcks.get(id) || null;
+              if (ack && (ack.status === "delivered" || ack.status === "read" || ack.status === "played")) break;
+              await sleep(500);
+            }
+            return sendJson(res, 200, {
+              ...base,
+              sendAckProbe: { ok: true, to: maskPhone(to), id: id || "sent", waitedMs: wait, ack },
+            });
+          } catch (e) {
+            return sendJson(res, 200, {
+              ...base,
+              sendAckProbe: { ok: false, to: maskPhone(to), error: String(e && e.message ? e.message : e).slice(0, 400) },
             });
           }
         }
