@@ -414,6 +414,45 @@ function pythonBin() {
   return process.platform === "win32" ? "python" : "python3";
 }
 
+// Run debug_probe.py and parse its JSON. Used by /diag?probe=brains so we can
+// check each provider key on the machine that actually holds the real keys.
+function runProbeScript(args, timeoutMs) {
+  return new Promise((resolve) => {
+    // Tests drive the HTTP surface without spawning Python.
+    if (String(process.env.LIAM_DISABLE_AGENT || "") === "1") {
+      return resolve({ error: "disabled in tests" });
+    }
+    let bin;
+    try { bin = pythonBin(); }
+    catch (e) { return resolve({ error: "no python: " + String(e) }); }
+    let proc;
+    try {
+      proc = spawn(bin, ["-X", "utf8", "debug_probe.py", ...args], {
+        cwd: BASE_DIR,
+        env: { ...process.env, PYTHONUTF8: "1", PYTHONIOENCODING: "utf-8" },
+      });
+    } catch (e) { return resolve({ error: String(e) }); }
+    let out = "", err = "";
+    let done = false;
+    const finish = (value) => { if (!done) { done = true; resolve(value); } };
+    const timer = setTimeout(() => {
+      try { proc.kill(); } catch (e) {}
+      finish({ error: "probe timed out", stderr: err.slice(-400) });
+    }, timeoutMs);
+    proc.stdout.on("data", (d) => { out += d; });
+    proc.stderr.on("data", (d) => { err += d; });
+    proc.on("error", (e) => { clearTimeout(timer); finish({ error: String(e) }); });
+    proc.on("close", () => {
+      clearTimeout(timer);
+      try { finish({ json: JSON.parse(out) }); }
+      catch (e) {
+        finish({ error: "unparseable output",
+                 stderr: err.slice(-400), stdout: out.slice(-400) });
+      }
+    });
+  });
+}
+
 function startAgent() {
   // Tests drive the HTTP surface without spawning Python.
   if (String(process.env.LIAM_DISABLE_AGENT || "") === "1") return null;
@@ -2273,6 +2312,14 @@ const server = http.createServer(async (req, res) => {
               emailProbe: { ok: false, error: String(e && e.message ? e.message : e).slice(0, 600) },
             });
           }
+        }
+        if (probe === "brains") {
+          // Per-key provider check. Runs on this host so it sees the real keys.
+          // Defaults to MoonMath (the rotating pool); pass &brain=agnes for
+          // another provider. Never returns key values, only index + reason.
+          const brain = String(url.searchParams.get("brain") || "moonmath").trim();
+          const result = await runProbeScript([brain, "--keys", "--json"], 120000);
+          return sendJson(res, 200, { ...base, brainProbe: { brain, ...result } });
         }
         if (probe === "1") {
           try {

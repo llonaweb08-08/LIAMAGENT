@@ -442,6 +442,66 @@ class AgentToolTests(unittest.TestCase):
             plan = agent._attempt_plan("moonmath")
         self.assertEqual(plan, [("moonmath", "primary", "k1")])
 
+    def test_attempt_plan_tries_every_key_before_the_fallback_model(self):
+        # All three keys must get a shot at the primary model before the
+        # fallback model is used, so a dead fallback cannot starve key 2/3.
+        fake = {"base": "https://x", "model": "m", "keys": ["k1", "k2", "k3"], "label": "M"}
+        try:
+            agent._EXHAUSTED.clear()
+            with mock.patch.dict(agent.BRAINS, {"moonmath": fake}), \
+                    mock.patch.object(agent.liam_keys, "MOON_MODEL", "primary"), \
+                    mock.patch.object(agent.liam_keys, "MOON_FALLBACK", "backup"):
+                plan = agent._attempt_plan("moonmath")
+        finally:
+            agent._EXHAUSTED.clear()
+        self.assertEqual(plan, [
+            ("moonmath", "primary", "k1"),
+            ("moonmath", "primary", "k2"),
+            ("moonmath", "primary", "k3"),
+            ("moonmath", "backup", "k1"),
+            ("moonmath", "backup", "k2"),
+            ("moonmath", "backup", "k3"),
+        ])
+
+    def test_a_timed_out_key_is_not_retried(self):
+        fake = {"base": "https://x", "model": "m", "keys": ["k1", "k2"], "label": "M"}
+        seen = []
+
+        def fake_post(base, model, key, messages, tools=None, timeout=None):
+            seen.append(key)
+            if key == "k1":
+                raise TimeoutError("read timed out")
+            return {"role": "assistant", "content": "ok"}
+
+        try:
+            agent._EXHAUSTED.clear()
+            with mock.patch.dict(agent.BRAINS, {"moonmath": fake}), \
+                    mock.patch.object(agent.liam_keys, "MOON_MODEL", "primary"), \
+                    mock.patch.object(agent.liam_keys, "MOON_FALLBACK", ""), \
+                    mock.patch.object(agent, "_http_post", side_effect=fake_post):
+                msg = agent.call_model([{"role": "user", "content": "hi"}], OWNER)
+        finally:
+            agent._EXHAUSTED.clear()
+        self.assertEqual(seen, ["k1", "k2"])
+        self.assertEqual(msg["_brain"], "moonmath")
+        self.assertEqual(msg["_model"], "primary")
+
+    def test_debug_probe_reports_each_key_without_leaking_values(self):
+        import debug_probe
+        fake = {"base": "https://x", "model": "m", "keys": ["secret-a", "secret-b"], "label": "M"}
+
+        def fake_probe(base, model, key, timeout=8):
+            return (key == "secret-b"), ("" if key == "secret-b" else "HTTP 402")
+
+        with mock.patch.dict(agent.BRAINS, {"moonmath": fake}), \
+                mock.patch.object(agent, "_probe", side_effect=fake_probe):
+            rows = debug_probe.per_key("moonmath")
+        self.assertEqual([r["index"] for r in rows], [0, 1])
+        self.assertFalse(rows[0]["ok"])
+        self.assertEqual(rows[0]["reason"], "HTTP 402")
+        self.assertTrue(rows[1]["ok"])
+        self.assertNotIn("secret", json.dumps(rows))
+
     def test_fallback_chain_excludes_dead_providers(self):
         # glm (MoonMath) 404s and Unorouter 503s, so neither should cost a turn.
         self.assertEqual(agent.FALLBACK_ORDER[0], "moonmath")
@@ -469,8 +529,6 @@ class AgentToolTests(unittest.TestCase):
             self.assertEqual(msg["_brain"], "none")
             self.assertTrue(agent._key_exhausted(
                 "moonmath", "k1", agent.liam_keys.MOON_MODEL))
-            self.assertTrue(agent._key_exhausted(
-                "moonmath", "k1", agent.liam_keys.MOON_FALLBACK))
         finally:
             agent._EXHAUSTED.clear()
 

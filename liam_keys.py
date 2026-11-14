@@ -40,7 +40,10 @@ def _keys(name):
 MOON_KEYS = _keys("MOON_KEYS")
 MOON_BASE = os.environ.get("MOON_BASE", "https://zro.moonmath.ai/v1")
 MOON_MODEL = os.environ.get("MOON_MODEL", "deepseek-v4.1-flash")
-MOON_FALLBACK = os.environ.get("MOON_FALLBACK", "glm-5.3-flash")
+# The old "glm-5.3-flash" fallback now returns HTTP 402/404 (dead), so no
+# fallback model is configured by default. An empty value simply means each
+# MoonMath key is tried once on MOON_MODEL, then the chain moves on.
+MOON_FALLBACK = os.environ.get("MOON_FALLBACK", "")
 
 # --- Unorouter API keys (rotated per request) ---
 UNO_KEYS = _keys("UNO_KEYS")

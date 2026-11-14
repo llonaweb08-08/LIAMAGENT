@@ -1053,10 +1053,15 @@ def _attempt_plan(brain):
     p = BRAINS[brain]
     keys = [k for k in p["keys"] if k]
     if brain == "moonmath":
+        # Keys first, then models: every key gets a shot at the primary model
+        # before any key is tried on the fallback model. The other order lets a
+        # slow or dead fallback burn the whole budget before key 2 is reached.
         plan = []
-        for k in keys:
-            for model in (liam_keys.MOON_MODEL, liam_keys.MOON_FALLBACK):
-                if not model or _key_exhausted("moonmath", k, model):
+        for model in (liam_keys.MOON_MODEL, liam_keys.MOON_FALLBACK):
+            if not model:
+                continue
+            for k in keys:
+                if _key_exhausted("moonmath", k, model):
                     continue
                 plan.append(("moonmath", model, k))
         seen = set(); out = []
@@ -1134,7 +1139,10 @@ def call_model(messages, sender, brain=None, tools=None, budget=None):
                 except Exception as e:
                     last_err = f"{b}/{model} {type(e).__name__}: {str(e)[:80]}"
                     _log(f"[brain] {last_err}")
-                    if retry == 0 and deadline - time.monotonic() > 3:
+                    # A hung socket will hang again: never retry the same key
+                    # after a timeout, move on to the next key/provider instead.
+                    timed_out = isinstance(e, (socket.timeout, TimeoutError))
+                    if not timed_out and retry == 0 and deadline - time.monotonic() > 3:
                         time.sleep(0.5)
                         continue
                     break
