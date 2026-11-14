@@ -437,6 +437,13 @@ function noteAckNode(node) {
       from: jidType(a.from),
     });
     while (ackNodeSamples.length > 12) ackNodeSamples.shift();
+    // 463 = the server refused a 1:1 message (reach-out time-lock / missing
+    // privacy token). Re-read the lock so the block is visible and respected.
+    if (String(a.error || "") === "463") {
+      lastSendError = "WhatsApp refused the message (error 463: reach-out time-lock or missing privacy token)";
+      console.log(`warn: WhatsApp refused an outgoing message with error 463${a.from ? ` (to ${jidType(a.from)})` : ""}`);
+      void refreshReachoutLock();
+    }
   } catch (e) {}
 }
 function watchSocketWire(socket) {
@@ -458,6 +465,36 @@ function watchSocketWire(socket) {
       return origSend(...args);
     };
   } catch (e) {}
+}
+
+// WhatsApp can put a number under a reach-out time-lock, which blocks every
+// companion device (this one included) from sending for a set period. A send
+// still "succeeds" locally but comes back as ack error 463, so the reply looks
+// sent and never arrives. Track the server's own view of that lock so it is
+// visible, and so we stop hammering a blocked number.
+let reachoutLock = null;
+function reachoutLockActive() {
+  if (!reachoutLock || !reachoutLock.isActive) return false;
+  // If the announced end time has passed, try sending again; a fresh 463 will
+  // set the lock again if WhatsApp has extended it.
+  if (reachoutLock.endsAt && Date.parse(reachoutLock.endsAt) <= Date.now()) return false;
+  return true;
+}
+async function refreshReachoutLock() {
+  try {
+    if (!sock || typeof sock.fetchAccountReachoutTimelock !== "function") return;
+    const info = await sock.fetchAccountReachoutTimelock();
+    reachoutLock = info ? {
+      isActive: !!info.isActive,
+      enforcementType: info.enforcementType || null,
+      endsAt: info.timeEnforcementEnds ? new Date(info.timeEnforcementEnds).toISOString() : null,
+      checkedAt: Date.now(),
+    } : null;
+    if (reachoutLock && reachoutLock.isActive) {
+      console.log(`warn: WhatsApp is blocking outgoing messages (${reachoutLock.enforcementType || "restriction"})`
+        + (reachoutLock.endsAt ? ` until ${reachoutLock.endsAt}` : ""));
+    }
+  } catch (e) { /* keep the last known value on a failed check */ }
 }
 const ACK_NAMES = { 0: "error", 1: "pending", 2: "server", 3: "delivered", 4: "read", 5: "played" };
 function ackName(status) {
@@ -885,6 +922,16 @@ const wa = {
     const payload = typeof content === "string" ? { text: content } : content;
     const target = jidForSend(jid);
     lastSendTargetType = jidType(target);
+    // While WhatsApp is time-locking the number, every send is refused with 463.
+    // Do not spend the reach-out budget on messages that cannot arrive; hold the
+    // reply until the lock lifts (re-checked in the background).
+    if (reachoutLockActive()) {
+      lastSendError = "WhatsApp is temporarily blocking outgoing messages"
+        + (reachoutLock.endsAt ? ` until ${reachoutLock.endsAt}` : "");
+      const held = new Error(lastSendError);
+      held.reachoutLocked = true;
+      throw held;
+    }
     let lastErr = null;
     for (let attempt = 1; attempt <= 2; attempt += 1) {
       const ready = await waitForSocketReady(attempt === 1 ? 15000 : 20000);
@@ -1433,6 +1480,7 @@ function onConnectionUpdate(socket, update) {
     authAt = Date.now();
     noteWaEvent("open");
     handleReady();
+    void refreshReachoutLock();
     return;
   }
   if (connection === "close") {
@@ -2247,6 +2295,10 @@ function statusPayload() {
     pairingEnabled: true,
     pendingGroupPermissions: pendingPerms.size,
     pendingToolApprovals: pendingTools.size,
+    // WhatsApp's own reach-out time-lock: when active, replies cannot be
+    // delivered no matter what, and it is not a fault of this process.
+    sendingBlocked: reachoutLockActive(),
+    sendingBlockedUntil: reachoutLock && reachoutLock.isActive ? reachoutLock.endsAt : null,
   };
 }
 
@@ -2450,6 +2502,15 @@ function startKeepAlive() {
   console.log(`info: keep-alive self-ping every ${Math.round(intervalMs / 1000)}s -> ${PUBLIC_URL}/health`);
 }
 
+// Re-check the WhatsApp reach-out time-lock every few minutes so the block is
+// noticed soon after it lifts and so sends resume without a restart.
+let reachoutTimer = null;
+function startReachoutWatch() {
+  if (reachoutTimer) return;
+  reachoutTimer = setInterval(() => { void refreshReachoutLock(); }, 5 * 60 * 1000);
+  if (typeof reachoutTimer.unref === "function") reachoutTimer.unref();
+}
+
 function friendlyWaError(message) {
   const text = String(message || "");
   if (/429|rate[- ]?overlimit|too many|overlimit/i.test(text)) {
@@ -2639,6 +2700,7 @@ const server = http.createServer(async (req, res) => {
           // Connection history (open/close/reconnect codes) with no message
           // text, so a flapping socket is visible while linked.
           events: waEvents.slice(-15),
+          reachoutLock,
         };
         const probe = url.searchParams.get("probe");
         // Optional runtime Baileys log level, so a protocol bug can be watched
@@ -3266,6 +3328,7 @@ async function boot() {
   await initializeWhatsApp("startup");
   startMemoryGuard();
   startKeepAlive();
+  startReachoutWatch();
 }
 
 // Render sends SIGTERM before stopping a free instance. Save the profile and
