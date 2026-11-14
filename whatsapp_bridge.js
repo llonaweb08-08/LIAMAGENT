@@ -577,9 +577,13 @@ function rememberLidContacts(contacts) {
   let changed = false;
   for (const contact of contacts) {
     if (!contact) continue;
-    const lid = String(contact.lid || "");
-    const phone = barePhone(contact.id || contact.jid || "");
-    if (!lid.includes("@lid") || !phone) continue;
+    // A contact carries the phone number in `jid` (or `id`) and the anonymous
+    // identity in `lid`/`id`. Prefer whichever field actually holds a phone
+    // number, because `id` is often the LID these days.
+    const phone = barePhone(contact.jid) || barePhone(contact.phoneNumber)
+      || barePhone(contact.id);
+    const lid = String(contact.lid || (isLidJid(contact.id) ? contact.id : ""));
+    if (!isLidJid(lid) || !phone) continue;
     const lidBare = bareId(lid);
     if (!lidBare || lidContacts.has(lidBare)) continue;
     lidContacts.set(lidBare, phone);
@@ -589,10 +593,13 @@ function rememberLidContacts(contacts) {
   if (changed) saveLidMap();
 }
 
-// Group participants carry both identities. Prefer the phone-number one.
+// Group participants carry both identities. Prefer the phone-number one. In
+// Baileys the phone number is `jid`/`phoneNumber`; `id` and `lid` may both be
+// the anonymous LID, so they are tried last.
 function pnFromParticipant(participant) {
   if (!participant) return "";
-  for (const candidate of [participant.phoneNumber, participant.id, participant.lid]) {
+  for (const candidate of [participant.jid, participant.phoneNumber,
+                           participant.id, participant.lid]) {
     const value = candidate && typeof candidate === "object"
       ? (candidate.id || candidate._serialized || candidate.user || "")
       : candidate;
@@ -648,7 +655,8 @@ async function resolvePhone(id, message) {
         const lid = participant && participant.lid ? bareId(participant.lid) : "";
         const phone = pnFromParticipant(participant);
         if (!phone) continue;
-        if (lid === base || bareId(participant.id) === base || phone === base) {
+        if (lid === base || bareId(participant.id) === base
+            || bareId(participant.jid) === base || phone === base) {
           lidCache.set(base, phone);
           saveLidMap();
           return phone;
@@ -2514,6 +2522,38 @@ const server = http.createServer(async (req, res) => {
             });
           }
         }
+        if (probe === "groups") {
+          // Which groups Liam is in, how they address members (pn vs lid), and
+          // the shape of each participant identity field. No phone numbers are
+          // returned - only the domain suffix - so this is safe as a diagnostic.
+          try {
+            const all = sock && typeof sock.groupFetchAllParticipating === "function"
+              ? await sock.groupFetchAllParticipating() : {};
+            const shape = (value) => {
+              const s = String(value || "");
+              const at = s.indexOf("@");
+              return at >= 0 ? s.slice(at) : (s ? "(plain)" : "");
+            };
+            const groups = Object.values(all || {}).map((g) => ({
+              subject: String(g.subject || "").slice(0, 60),
+              mode: g.addressingMode || "",
+              members: Array.isArray(g.participants) ? g.participants.length : 0,
+              sample: (Array.isArray(g.participants) ? g.participants.slice(0, 3) : []).map((p) => ({
+                id: shape(p && p.id),
+                jid: shape(p && p.jid),
+                lid: shape(p && p.lid),
+                phoneNumber: shape(p && p.phoneNumber),
+                admin: (p && (p.admin || p.isAdmin)) || null,
+              })),
+            }));
+            return sendJson(res, 200, { ...base, groupsProbe: { count: groups.length, groups } });
+          } catch (e) {
+            return sendJson(res, 200, {
+              ...base,
+              groupsProbe: { error: String(e && e.message ? e.message : e).slice(0, 400) },
+            });
+          }
+        }
         if (probe === "email") {
           try {
             const reply = await withTimeout(
@@ -2529,6 +2569,14 @@ const server = http.createServer(async (req, res) => {
               emailProbe: { ok: false, error: String(e && e.message ? e.message : e).slice(0, 600) },
             });
           }
+        }
+        if (probe === "browser") {
+          // Run the agent's real browser_task tool (which now runs Chromium on
+          // the VM) and report what it printed. This exercises the exact path
+          // the tool uses, without sending a WhatsApp message.
+          const target = String(url.searchParams.get("url") || "https://example.com").trim();
+          const result = await runProbeScript(["--browser", target], 150000);
+          return sendJson(res, 200, { ...base, browserProbe: { target, ...result } });
         }
         if (probe === "brains") {
           // Per-key provider check. Runs on this host so it sees the real keys.
@@ -2826,4 +2874,5 @@ module.exports = {
   cancelPairing, resetWhatsApp, connectSocket, closeSocket, handleIncomingMessage,
   messageId, jidForSend, socketUserId, friendlyWaError,
   SERVER_DOWN_TEXT, startKeepAlive, markReadAndTyping, stopTyping,
+  pnFromParticipant, rememberLidContacts, lidContacts, resolvePhone,
 };

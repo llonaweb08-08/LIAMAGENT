@@ -14,6 +14,8 @@ printed - only their position (0, 1, 2 ...) and whether each one answered.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import json
 
 import agent
@@ -56,7 +58,26 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--keys", action="store_true",
                         help="report each configured key separately (index + reason only)")
     parser.add_argument("--json", action="store_true", dest="as_json", help="print JSON")
+    parser.add_argument("--browser", metavar="URL",
+                        help="run the real browser_task tool against URL and print JSON")
     args = parser.parse_args(argv)
+
+    if args.browser:
+        # Exercise the production browser tool exactly as a chat turn would,
+        # including any VM offload. Capture stray prints so stdout stays JSON.
+        script = (
+            "page.goto(%r)\n"
+            "print('TITLE', page.title())\n"
+            "print('URL', page.url)\n" % args.browser
+        )
+        buffer = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buffer):
+                out = agent.browser_task(script)
+            print(json.dumps({"ok": True, "out": str(out)[:2000]}))
+        except Exception as e:
+            print(json.dumps({"ok": False, "error": f"{type(e).__name__}: {e}"}))
+        return 0
 
     names = args.brains or list(agent.BRAINS)
     unknown = [name for name in names if name not in agent.BRAINS]

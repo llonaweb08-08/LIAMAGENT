@@ -532,4 +532,33 @@ test('bridge endpoint security and actions', async (t) => {
     assert.equal(response.status, 400);
     assert.match(response.json.msg, /too many/);
   });
+
+  await t.test('resolves anonymous group senders to phone numbers', async () => {
+    // A participant's phone number lives in `jid`/`phoneNumber`; `id`/`lid` may
+    // both be the anonymous LID. Getting this wrong drops every group message
+    // with "could not resolve sender to a phone number".
+    assert.equal(
+      bridge.pnFromParticipant({ id: '100000000000001@lid', jid: '2348000000001@s.whatsapp.net' }),
+      '2348000000001',
+    );
+    assert.equal(bridge.pnFromParticipant({ id: '2348000000002@s.whatsapp.net' }), '2348000000002');
+    assert.equal(bridge.pnFromParticipant({ id: '100000000000003@lid' }), '');
+    assert.equal(bridge.pnFromParticipant(null), '');
+
+    bridge.rememberLidContacts([
+      { id: '100000000000004@lid', jid: '2348000000004@s.whatsapp.net' },
+      { id: '2348000000005@s.whatsapp.net', lid: '100000000000005@lid' },
+    ]);
+    assert.equal(bridge.lidContacts.get('100000000000004'), '2348000000004');
+    assert.equal(bridge.lidContacts.get('100000000000005'), '2348000000005');
+
+    const sock = bridge.getSock();
+    sock.groupMetadata = async () => ({
+      participants: [
+        { id: '100000000000006@lid', jid: '2348000000006@s.whatsapp.net', admin: null },
+      ],
+    });
+    const phone = await bridge.resolvePhone('100000000000006@lid', { key: { remoteJid: GROUP } });
+    assert.equal(phone, '2348000000006');
+  });
 });
