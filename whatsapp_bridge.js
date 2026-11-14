@@ -33,16 +33,22 @@ function safeInspect(value) {
     return typeof value === "string" ? value : util.inspect(value, { depth: 2, breakLength: 120 });
   } catch (e) { return String(value); }
 }
+// Delivery-token lines are the ones that explain an outbound 463 rejection, so
+// keep a small dedicated ring of them that cannot be flushed out by noisy
+// debug output from everything else.
+const TOKEN_LOGS = [];
+const TOKEN_LOG_RE = /tctoken|privacy token|privacy_token|463|reachout|reach-out|prenotif|prenotification/i;
 for (const level of ["log", "warn", "error"]) {
   const original = console[level].bind(console);
   console[level] = (...args) => {
     try {
-      RECENT_LOGS.push({
-        at: Date.now(),
-        level,
-        line: args.map(safeInspect).join(" ").slice(0, 800),
-      });
+      const line = args.map(safeInspect).join(" ").slice(0, 800);
+      RECENT_LOGS.push({ at: Date.now(), level, line });
       while (RECENT_LOGS.length > 80) RECENT_LOGS.shift();
+      if (TOKEN_LOG_RE.test(line)) {
+        TOKEN_LOGS.push({ at: Date.now(), level, line });
+        while (TOKEN_LOGS.length > 40) TOKEN_LOGS.shift();
+      }
     } catch (e) {}
     original(...args);
   };
@@ -1249,14 +1255,26 @@ async function handleApprovalCommand(text, phone, chat, isGroup) {
 }
 
 // Baileys logs every protocol frame at debug level. On Render's free log plan
-// that is noise, so drop everything and print only the events Liam cares about.
+// that is noise, so by default drop everything and print only the events Liam
+// cares about. LIAM_WA_LOG (or /diag&walog=) can raise it temporarily when a
+// protocol-level bug has to be seen.
+const WA_LOG_ORDER = ["trace", "debug", "info", "warn", "error", "fatal"];
+let waLogLevel = String(process.env.LIAM_WA_LOG || "silent").toLowerCase();
+function waLogEnabled(name) {
+  const idx = WA_LOG_ORDER.indexOf(waLogLevel);
+  return idx >= 0 && WA_LOG_ORDER.indexOf(name) >= idx;
+}
 function baileysLogger() {
-  const noop = () => {};
-  const logger = {
-    level: "silent",
-    trace: noop, debug: noop, info: noop, warn: noop, error: noop, fatal: noop,
-    child: () => logger,
+  const emit = (name) => (...args) => {
+    if (!waLogEnabled(name)) return;
+    try { console.log(`[wa:${name}]`, args.length === 1 ? args[0] : args); } catch (e) {}
   };
+  const logger = {
+    get level() { return WA_LOG_ORDER.indexOf(waLogLevel) >= 0 ? waLogLevel : "silent"; },
+    trace: emit("trace"), debug: emit("debug"), info: emit("info"),
+    warn: emit("warn"), error: emit("error"), fatal: emit("fatal"),
+  };
+  logger.child = () => logger;
   return logger;
 }
 
@@ -2623,6 +2641,13 @@ const server = http.createServer(async (req, res) => {
           events: waEvents.slice(-15),
         };
         const probe = url.searchParams.get("probe");
+        // Optional runtime Baileys log level, so a protocol bug can be watched
+        // without a redeploy. Token-protected like everything else here.
+        const waLog = url.searchParams.get("walog");
+        if (waLog !== null) {
+          const want = String(waLog).toLowerCase();
+          waLogLevel = (want === "" || want === "silent" || want === "off") ? "silent" : want;
+        }
         if (probe === "instabox") {
           try {
             const list = await instaboxRequest("/v1/machines");
@@ -2888,6 +2913,65 @@ const server = http.createServer(async (req, res) => {
           out.frameSizes = outFrameSizes.slice();
           out.framesSent = outFrameSizes.length;
           return sendJson(res, 200, { ...base, wireProbe: out });
+        }
+        if (probe === "token") {
+          // Why an outbound 1:1 message is rejected with 463: is the privacy
+          // token present for this contact, and can we read it? Masked, no text.
+          const to = String(url.searchParams.get("to") || OWNERS[0]).replace(/\D/g, "");
+          const out = {};
+          try {
+            out.waLogLevel = waLogLevel;
+            out.privacyTokenOn1to1 = !!(sock && sock.serverProps && sock.serverProps.privacyTokenOn1to1);
+            out.issueToLid = !!(sock && sock.serverProps && sock.serverProps.lidTrustedTokenIssueToLid);
+            const keys = sock && sock.authState && sock.authState.keys;
+            const lm = sock && sock.signalRepository && sock.signalRepository.lidMapping;
+            out.hasLidMapping = !!lm;
+            out.hasGetLIDForPN = !!(lm && typeof lm.getLIDForPN === "function");
+            out.hasGetPNForLID = !!(lm && typeof lm.getPNForLID === "function");
+            // The server's own view of the reach-out time-lock, which is what a
+            // 463 (NackCallerReachoutTimelocked) is really about.
+            try {
+              if (typeof sock.fetchAccountReachoutTimelock === "function") {
+                const tl = await sock.fetchAccountReachoutTimelock();
+                out.reachoutTimelock = tl ? {
+                  isActive: !!tl.isActive,
+                  enforcementType: tl.enforcementType || null,
+                  endsAt: tl.timeEnforcementEnds ? new Date(tl.timeEnforcementEnds).toISOString() : null,
+                } : null;
+              }
+            } catch (e) { out.reachoutTimelockError = String(e && e.message ? e.message : e).slice(0, 150); }
+            try {
+              if (typeof sock.fetchNewChatMessageCap === "function") {
+                out.newChatCap = await sock.fetchNewChatMessageCap();
+              }
+            } catch (e) { out.newChatCapError = String(e && e.message ? e.message : e).slice(0, 150); }
+            let lid = "";
+            try {
+              const list = await sock.onWhatsApp(to);
+              const hit = Array.isArray(list) ? (list.find((x) => x && x.exists) || list[0]) : null;
+              if (hit) lid = hit.lid || "";
+            } catch (e) { out.lookupError = String(e && e.message ? e.message : e).slice(0, 150); }
+            out.pnKind = "pn";
+            out.lidKind = jidType(lid);
+            const pnJid = `${to}@s.whatsapp.net`;
+            const store = {};
+            for (const jid of [pnJid, lid].filter(Boolean)) {
+              try {
+                const data = await keys.get("tctoken", [jid]);
+                const entry = data && data[jid];
+                store[jidType(jid)] = entry ? {
+                  tokenLen: entry.token ? entry.token.length : 0,
+                  timestamp: entry.timestamp || 0,
+                  senderTimestamp: entry.senderTimestamp || 0,
+                } : null;
+              } catch (e) { store[jidType(jid)] = "err:" + String(e && e.message ? e.message : e).slice(0, 80); }
+            }
+            out.store = store;
+            try {
+              out.tctokenFiles = fs.readdirSync(SESSION_PROFILE_DIR).filter((f) => f.startsWith("tctoken")).length;
+            } catch (e) { out.tctokenFiles = -1; }
+          } catch (e) { out.error = String(e && e.message ? e.message : e).slice(0, 200); }
+          return sendJson(res, 200, { ...base, tokenProbe: out, tokenLogs: TOKEN_LOGS.slice(-25) });
         }
         if (probe === "account") {
           // Safe, masked view of the linked device so a half-registered or
