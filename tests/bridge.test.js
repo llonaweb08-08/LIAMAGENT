@@ -503,6 +503,25 @@ test('bridge endpoint security and actions', async (t) => {
     assert.match(response.json.msg, /not configured/);
   });
 
+  await t.test('vps file transport is owner-only and needs InstaBox', async () => {
+    const member = '2348000000000';
+    const denied = await post({ action: 'vps_upload', path: '/tmp/x', data: 'AAAA', sender: member });
+    assert.equal(denied.status, 400);
+    assert.match(denied.json.msg, /only the owner/);
+
+    const badPath = await post({ action: 'vps_upload', path: 'relative', data: 'AAAA', sender: OWNER });
+    assert.equal(badPath.status, 400);
+    assert.match(badPath.json.msg, /absolute/);
+
+    const empty = await post({ action: 'vps_upload', path: '/tmp/x', data: '', sender: OWNER });
+    assert.equal(empty.status, 400);
+    assert.match(empty.json.msg, /empty/);
+
+    const noKey = await post({ action: 'vps_download', path: '/tmp/x', sender: OWNER });
+    assert.equal(noKey.status, 400);
+    assert.match(noKey.json.msg, /not configured/);
+  });
+
   await t.test('rate-limits outbound messages', async () => {
     bridge.outboundLog.length = 0;
     for (let i = 0; i < 20; i += 1) {

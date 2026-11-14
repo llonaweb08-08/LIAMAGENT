@@ -350,6 +350,14 @@ function isLiamMessage(jid, id) {
 const pendingPerms = new Map();  // id -> { id, jid, phone, text, ts }
 const pendingTools = new Map();  // id -> { id, action, payload, actor, chat, isGroup, ts }
 const ASK_TIMEOUT_MS = Math.max(15000, Number.parseInt(process.env.LIAM_ASK_TIMEOUT_MS || "240000", 10));
+// Baileys pings WhatsApp every interval, and gives up on a silent socket after
+// interval + 5s. WhatsApp drops the stream (428) when we cannot answer in time,
+// which is what happens when a heavy job (headless Chromium, a backup) blocks
+// the event loop on this small box. A shorter interval keeps our pings inside
+// WhatsApp's window, so a single missed beat is not fatal. Configurable so it
+// can be tuned without a code change.
+const WA_KEEPALIVE_MS = Math.min(120000, Math.max(15000,
+  Number.parseInt(process.env.LIAM_WA_KEEPALIVE_MS || "25000", 10) || 25000));
 // Shown to the person when the agent cannot answer (crash, provider outage or
 // timeout). A silent failure looks like Liam ignoring them, which is worse.
 const SERVER_DOWN_TEXT = String(
@@ -1272,7 +1280,7 @@ async function connectSocket(reason) {
       // stores nothing, so returning undefined is the honest answer.
       getMessage: async () => undefined,
       connectTimeoutMs: 60000,
-      keepAliveIntervalMs: 30000,
+      keepAliveIntervalMs: WA_KEEPALIVE_MS,
       defaultQueryTimeoutMs: 60000,
       retryRequestDelayMs: 2000,
     });
@@ -1659,6 +1667,81 @@ async function instaboxExec(command, timeoutSeconds = 120, cwd = "") {
   return textOut.length > 8000 ? textOut.slice(0, 8000) + "\n… [truncated]" : textOut;
 }
 
+// Raw file transfer, used to move browser scripts to the VM and screenshots
+// back. The InstaBox file endpoints are not JSON: a PUT carries the file as its
+// body and the content GET returns the bytes.
+const INSTABOX_FILE_MAX = 8 * 1024 * 1024;
+
+async function instaboxUpload(remotePath, buffer) {
+  const p = String(remotePath || "").trim();
+  if (!p.startsWith("/")) throw new BadRequest("path must be absolute");
+  const data = Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer || "");
+  if (!data.length) throw new BadRequest("file is empty");
+  if (data.length > INSTABOX_FILE_MAX) throw new BadRequest("file is too large to upload");
+  const machine = await instaboxMachineId();
+  await instaboxEnsureRunning(machine);
+  const query = new URLSearchParams({ path: p, parents: "true" }).toString();
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 120000);
+  try {
+    const res = await fetch(`${INSTABOX_API_URL}/v1/machines/${encodeURIComponent(machine)}/files?${query}`, {
+      method: "PUT",
+      headers: {
+        "X-API-Key": INSTABOX_API_KEY,
+        "Authorization": "Bearer " + INSTABOX_API_KEY,
+        "Content-Type": "application/octet-stream",
+      },
+      body: data,
+      signal: controller.signal,
+    });
+    if (!res.ok) {
+      const raw = await res.text().catch(() => "");
+      throw new BadRequest(`InstaBox upload HTTP ${res.status}: ${String(raw).slice(0, 200)}`);
+    }
+    await res.arrayBuffer().catch(() => {});
+    return { ok: true, bytes: data.length };
+  } catch (e) {
+    if (e && e.name === "AbortError") throw new BadRequest("InstaBox upload timed out");
+    if (e instanceof BadRequest) throw e;
+    throw new BadRequest(`InstaBox upload failed: ${typeName(e)}`);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function instaboxDownload(remotePath) {
+  const p = String(remotePath || "").trim();
+  if (!p.startsWith("/")) throw new BadRequest("path must be absolute");
+  const machine = await instaboxMachineId();
+  await instaboxEnsureRunning(machine);
+  const query = new URLSearchParams({ path: p }).toString();
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 120000);
+  try {
+    const res = await fetch(`${INSTABOX_API_URL}/v1/machines/${encodeURIComponent(machine)}/files/content?${query}`, {
+      headers: {
+        "X-API-Key": INSTABOX_API_KEY,
+        "Authorization": "Bearer " + INSTABOX_API_KEY,
+        "Accept": "application/octet-stream",
+      },
+      signal: controller.signal,
+    });
+    if (!res.ok) {
+      const raw = await res.text().catch(() => "");
+      throw new BadRequest(`InstaBox download HTTP ${res.status}: ${String(raw).slice(0, 200)}`);
+    }
+    const buf = Buffer.from(await res.arrayBuffer());
+    if (buf.length > INSTABOX_FILE_MAX) throw new BadRequest("downloaded file is too large");
+    return buf;
+  } catch (e) {
+    if (e && e.name === "AbortError") throw new BadRequest("InstaBox download timed out");
+    if (e instanceof BadRequest) throw e;
+    throw new BadRequest(`InstaBox download failed: ${typeName(e)}`);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 function typeName(e) { return e && e.constructor ? e.constructor.name : "Error"; }
 
 // ---------------------------------------------------------------------------
@@ -1817,6 +1900,23 @@ async function handleAction(d, ctx = {}) {
       throw new BadRequest(`owner approval required (request ${p.id}) — I've asked the owner`);
     }
     return instaboxExec(d.command, d.timeout, d.cwd);
+  }
+
+  if (action === "vps_upload" || action === "vps_download") {
+    // Owner-only file transport for browser work. Liam runs Playwright on the
+    // VM so headless Chromium never runs on (and starves) this container's
+    // WhatsApp socket. These carry the script out and the screenshot back.
+    assertOwner(d);
+    const remotePath = String(d.path || "").trim();
+    if (!remotePath.startsWith("/")) throw new BadRequest("path must be absolute");
+    if (action === "vps_upload") {
+      const data = Buffer.from(String(d.data || ""), "base64");
+      if (!data.length) throw new BadRequest("data is empty");
+      const result = await instaboxUpload(remotePath, data);
+      return `uploaded ${result.bytes} bytes`;
+    }
+    const buf = await instaboxDownload(remotePath);
+    return buf.toString("base64");
   }
 
   throw new BadRequest("unknown action");
@@ -2305,6 +2405,36 @@ const server = http.createServer(async (req, res) => {
             return sendJson(res, 200, {
               ...base,
               instaboxProbe: { ok: false, error: String(e && e.message ? e.message : e).slice(0, 400) },
+            });
+          }
+        }
+        if (probe === "vps") {
+          // Does the free VM have Playwright and a working Chromium? If so the
+          // browser tools can run there instead of on this container.
+          const script = [
+            "import sys",
+            "try:",
+            "    import playwright",
+            "    print('playwright ok')",
+            "except Exception as e:",
+            "    print('playwright missing:', e)",
+            "try:",
+            "    from playwright.sync_api import sync_playwright",
+            "    p = sync_playwright().start()",
+            "    b = p.chromium.launch(headless=True, args=['--no-sandbox'])",
+            "    print('chromium ok')",
+            "    b.close(); p.stop()",
+            "except Exception as e:",
+            "    print('chromium failed:', type(e).__name__, e)",
+          ].join("\n");
+          const heredoc = "python3 - <<'PY'\n" + script + "\nPY";
+          try {
+            const out = await instaboxExec(heredoc, 180);
+            return sendJson(res, 200, { ...base, vpsProbe: { ok: true, out: String(out).slice(0, 1500) } });
+          } catch (e) {
+            return sendJson(res, 200, {
+              ...base,
+              vpsProbe: { ok: false, error: String(e && e.message ? e.message : e).slice(0, 400) },
             });
           }
         }

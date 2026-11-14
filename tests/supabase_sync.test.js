@@ -239,6 +239,19 @@ test('supabase session and database persistence', async (t) => {
     assert.deepEqual(objects.get('session.tar.gz'), keep);
   });
 
+  await t.test('skips an unchanged profile on the next backup', async () => {
+    const base = path.join(TMP, 'unchanged');
+    writeProfile(base);
+    const first = await sync.backupNow(base, undefined, base);
+    assert.equal(first.session.ok, true);
+    assert.equal(typeof sync.sessionSignature(path.join(base, 'liam_session')), 'string');
+    const second = await sync.backupNow(base, undefined, base);
+    assert.equal(second.session.skipped, true);
+    assert.equal(second.session.reason, 'session unchanged');
+    const forced = await sync.backupNow(base, undefined, base, { force: true });
+    assert.equal(forced.session.ok, true);
+  });
+
   await t.test('restores normal files from an archive that also contains a link', async () => {
     const archive = path.join(TMP, 'links.tar.gz');
     writeLinkArchive(archive);

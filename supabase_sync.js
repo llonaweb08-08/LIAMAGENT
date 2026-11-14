@@ -499,17 +499,92 @@ async function backupSession(dataDir, sessionDir) {
 let backupTimer = null;
 let backupRunning = false;
 
+// The periodic backup exists to survive a free-instance restart, not to churn
+// the CPU every cycle. On an idle Liam nothing changes between runs, so we
+// compare a cheap signature and skip the tar/gzip/vacuum work when it matches.
+let lastBackupSig = { session: "", db: "" };
+
+function statSig(file) {
+  try {
+    const s = fs.statSync(file);
+    return `${s.size}:${Math.round(s.mtimeMs)}`;
+  } catch (e) {
+    return "";
+  }
+}
+
+const CACHE_SEGMENTS = new Set(
+  CACHE_EXCLUDES.map((n) => n.split("/").pop().toLowerCase()).filter((n) => !n.includes("*")),
+);
+const CACHE_PREFIXES = CACHE_EXCLUDES
+  .filter((n) => n.endsWith("*"))
+  .map((n) => n.split("/").pop().slice(0, -1).toLowerCase());
+
+// Count files, total size and the newest mtime under a profile, skipping the
+// same caches and locks the archive drops. Walking is far cheaper than the
+// archive it lets us avoid.
+function sessionSignature(dir) {
+  let count = 0;
+  let total = 0;
+  let maxMtime = 0;
+  const walk = (current) => {
+    let entries;
+    try { entries = fs.readdirSync(current, { withFileTypes: true }); }
+    catch (e) { return; }
+    for (const entry of entries) {
+      const lower = entry.name.toLowerCase();
+      if (entry.isDirectory()) {
+        if (CACHE_SEGMENTS.has(lower)) continue;
+        if (CACHE_PREFIXES.some((p) => p && lower.startsWith(p))) continue;
+        walk(path.join(current, entry.name));
+        continue;
+      }
+      if (CHROME_LOCK_NAMES.has(entry.name)) continue;
+      try {
+        const s = fs.statSync(path.join(current, entry.name));
+        count += 1;
+        total += s.size;
+        if (s.mtimeMs > maxMtime) maxMtime = s.mtimeMs;
+      } catch (e) {}
+    }
+  };
+  walk(dir);
+  return `${count}:${total}:${Math.round(maxMtime)}`;
+}
+
 async function backupNow(dataDir, sessionDir, dbDir, options = {}) {
   if (!configured()) return { ok: false, reason: "not configured" };
   if (backupRunning) return { ok: false, reason: "backup already running" };
+  const force = options.force === true;
   backupRunning = true;
   try {
+    const base = baseDir(dataDir);
+    const targetSession = sessionDir || defaultSessionDir(base);
+    const dbFile = defaultDbFile(dbDir || dataDir);
+
     // Before WhatsApp is linked the profile is disposable. Uploading it would
     // overwrite the last good session in Supabase with an empty one.
-    const session = options.session === false
-      ? { ok: false, skipped: true, reason: "session not ready" }
-      : await backupSession(dataDir, sessionDir);
-    const db = await backupDb(dbDir || dataDir);
+    let session;
+    if (options.session === false) {
+      session = { ok: false, skipped: true, reason: "session not ready" };
+    } else {
+      const sig = sessionLooksLinked(targetSession) ? sessionSignature(targetSession) : "";
+      if (!force && sig && sig === lastBackupSig.session) {
+        session = { ok: false, skipped: true, reason: "session unchanged" };
+      } else {
+        session = await backupSession(dataDir, sessionDir);
+        if (session.ok) lastBackupSig.session = sig || sessionSignature(targetSession);
+      }
+    }
+
+    let db;
+    const dbSig = statSig(dbFile);
+    if (!force && dbSig && dbSig === lastBackupSig.db) {
+      db = { ok: false, skipped: true, reason: "db unchanged" };
+    } else {
+      db = await backupDb(dbDir || dataDir);
+      if (db.ok) lastBackupSig.db = dbSig;
+    }
     return { ok: !!(session.ok || db.ok), session, db };
   } finally {
     backupRunning = false;
@@ -538,4 +613,5 @@ module.exports = {
   sanitizeChromeLocks, startPeriodicBackup, stopPeriodicBackup,
   configured, vacuumInto, validateArchive, archiveExcludes, defaultDbFile,
   looksLikeSqlite, unsafeEntry, CACHE_EXCLUDES, sessionLooksLinked,
+  sessionSignature,
 };

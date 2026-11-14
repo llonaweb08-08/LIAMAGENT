@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import base64, ipaddress, json, mimetypes, os, random, re, socket, sqlite3, subprocess, sys, tempfile, time
+import base64, ipaddress, json, mimetypes, os, random, re, shlex, socket, sqlite3, subprocess, sys, tempfile, time
 import urllib.error, urllib.parse, urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
@@ -440,6 +440,15 @@ with sync_playwright() as p:
 
 def screenshot(to, url, sender=None):
     safe = _safe_url(url)
+    if _vps_browser_enabled():
+        try:
+            result = _remote_screenshot(to, safe, sender)
+            _vps_browser_note(True)
+            return result
+        except Exception as e:
+            _vps_browser_note(False)
+            print("warn: remote screenshot failed, using the local browser:",
+                  type(e).__name__, flush=True)
     path = _unique_file(".png")
     try:
         # Re-validate immediately before fetching to shrink the DNS-rebinding window.
@@ -489,38 +498,125 @@ def report_progress(text, sender=None):
     except Exception as e:
         return f"progress report failed: {type(e).__name__}"
 
-def browser_task(script):
+VPS_BROWSER_DIR = os.environ.get("LIAM_VPS_BROWSER_DIR") or "/data/home/liam_browser"
+
+def _browser_script_text(script, extensions=True):
+    """Wrap an agent-written Playwright snippet into a runnable script."""
     ext_dir = os.path.join(BASE_DIR, "browser_extensions")
     args = ["--disable-blink-features=AutomationControlled",
             "--no-sandbox", "--disable-dev-shm-usage"]
-    if os.path.isdir(ext_dir):
+    if extensions and os.path.isdir(ext_dir):
         args += [f"--load-extension={ext_dir}", "--disable-extensions-except=" + ext_dir]
-    preamble = (
-        "import os\n"
-        "from playwright.sync_api import sync_playwright\n"
-        "with sync_playwright() as p:\n"
-        "    browser = p.chromium.launch(headless=True, args=" + repr(args) + ")\n"
-        "    context = browser.new_context(viewport={'width': 1366, 'height': 900}, "
-        "user_agent=os.environ.get('LIAM_USER_AGENT', ''))\n"
-        "    page = context.new_page()\n"
-        "    page.set_default_timeout(15000)\n"
-        "    page.set_default_navigation_timeout(30000)\n"
-        "    try:\n"
-    )
+    out = []
+    out.append("import os\n")
+    out.append("from playwright.sync_api import sync_playwright\n")
+    out.append("with sync_playwright() as p:\n")
+    out.append("    browser = p.chromium.launch(headless=True, args=" + repr(args) + ")\n")
+    out.append("    context = browser.new_context(viewport={'width': 1366, 'height': 900}, "
+               "user_agent=os.environ.get('LIAM_USER_AGENT', ''))\n")
+    out.append("    page = context.new_page()\n")
+    out.append("    page.set_default_timeout(15000)\n")
+    out.append("    page.set_default_navigation_timeout(30000)\n")
+    out.append("    try:\n")
+    for line in str(script or "").splitlines():
+        out.append("        " + line + "\n")
+    out.append("    except Exception as _liam_exc:\n")
+    out.append("        import traceback\n")
+    out.append("        print('BROWSER_TASK_ERROR:', type(_liam_exc).__name__, _liam_exc)\n")
+    out.append("        traceback.print_exc()\n")
+    out.append("    finally:\n")
+    out.append("        context.close()\n")
+    out.append("        browser.close()\n")
+    return "".join(out)
+
+_vps_browser_retry_at = 0.0
+
+def _vps_browser_enabled():
+    """Run Chromium on the InstaBox VM when one is configured.
+
+    Headless Chromium on the free Render box can exhaust its 512 MB and stall the
+    event loop, which makes WhatsApp drop the socket (428). Offloading it keeps
+    this container light enough to answer WhatsApp's keep-alives.
+    """
+    if os.environ.get("LIAM_VPS_BROWSER", "1") == "0":
+        return False
+    if not os.environ.get("INSTABOX_API_KEY"):
+        return False
+    return time.time() >= _vps_browser_retry_at
+
+def _vps_browser_note(ok):
+    # After a failure, stop trying the VM for ten minutes so a VM that is asleep
+    # or lacks a browser does not slow every request with a doomed attempt.
+    global _vps_browser_retry_at
+    _vps_browser_retry_at = 0.0 if ok else time.time() + 600
+
+def _vps_stage(name, text):
+    """Upload a script to the VM and return its absolute path there."""
+    if len(text) > 40000:
+        # The local bridge rejects bodies over 64 KiB; base64 inflates by 4/3.
+        raise ValueError("script is too large to send to the VM")
+    path = VPS_BROWSER_DIR + "/" + name
+    vps_exec("mkdir -p " + VPS_BROWSER_DIR, timeout=30, sender=OWNERS[0])
+    wa.vps_upload(path, base64.b64encode(text.encode("utf-8")).decode("ascii"),
+                  sender=OWNERS[0])
+    return path
+
+def _vps_ok(output):
+    match = re.match(r"\s*exit=(-?\d+)", str(output or ""))
+    return bool(match) and match.group(1) == "0"
+
+def _remote_browser_task(script):
+    path = _vps_stage("task_%s.py" % os.urandom(6).hex(),
+                      _browser_script_text(script, extensions=False))
+    command = "cd %s && LIAM_USER_AGENT=%s python3 %s" % (
+        shlex.quote(VPS_BROWSER_DIR), shlex.quote(liam_keys.BROWSER_UA), shlex.quote(path))
+    output = vps_exec(
+        command, timeout=_clamp_timeout(_env_int("LIAM_BROWSER_TIMEOUT", 90, 10, 300)),
+        sender=OWNERS[0])
+    if not _vps_ok(output):
+        raise RuntimeError("remote browser task failed")
+    return output[:8000]
+
+def _remote_screenshot(to, url, sender):
+    script_path = _vps_stage("shot_%s.py" % os.urandom(6).hex(), _SCREENSHOT_SCRIPT)
+    remote_png = VPS_BROWSER_DIR + "/shot_%s.png" % os.urandom(6).hex()
+    command = "cd %s && python3 %s %s %s %s" % (
+        shlex.quote(VPS_BROWSER_DIR), shlex.quote(script_path), shlex.quote(url),
+        shlex.quote(remote_png), shlex.quote(liam_keys.BROWSER_UA))
+    output = vps_exec(
+        command, timeout=_clamp_timeout(_env_int("LIAM_SCREENSHOT_TIMEOUT", 75, 20, 180)),
+        sender=OWNERS[0])
+    if not _vps_ok(output):
+        raise RuntimeError("remote screenshot failed")
+    data = wa.vps_download(remote_png, sender=OWNERS[0])
+    if not data:
+        raise RuntimeError("remote screenshot was empty")
+    path = _unique_file(".png")
+    try:
+        with open(path, "wb") as handle:
+            handle.write(base64.b64decode(data))
+        if os.path.getsize(path) == 0:
+            raise RuntimeError("remote screenshot was empty")
+        return wa.send_image(to, path, sender=sender)
+    finally:
+        _safe_remove(path)
+
+def browser_task(script, sender=None, chat="", group=False):
+    if _vps_browser_enabled():
+        try:
+            result = _remote_browser_task(script)
+            _vps_browser_note(True)
+            return result
+        except Exception as e:
+            # The VM may be asleep or unreachable; use the local browser instead
+            # of failing the tool.
+            _vps_browser_note(False)
+            print("warn: remote browser task failed, using the local browser:",
+                  type(e).__name__, flush=True)
     path = _unique_file(".py")
     try:
         with open(path, "w", encoding="utf-8") as f:
-            f.write("# extension dir: " + ext_dir + "\n")
-            f.write(preamble)
-            for line in str(script or "").splitlines():
-                f.write("        " + line + "\n")
-            f.write("    except Exception as _liam_exc:\n")
-            f.write("        import traceback\n")
-            f.write("        print('BROWSER_TASK_ERROR:', type(_liam_exc).__name__, _liam_exc)\n")
-            f.write("        traceback.print_exc()\n")
-            f.write("    finally:\n")
-            f.write("        context.close()\n")
-            f.write("        browser.close()\n")
+            f.write(_browser_script_text(script))
         env = dict(os.environ)
         env.setdefault("LIAM_USER_AGENT", liam_keys.BROWSER_UA)
         r = subprocess.run(

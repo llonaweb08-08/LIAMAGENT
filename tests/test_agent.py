@@ -168,6 +168,20 @@ class ToolClientTests(unittest.TestCase):
             "vps_exec", command="id", timeout=600, cwd="/tmp", sender="2347",
             chat="1@g.us", group=True, http_timeout=630)
 
+    def test_vps_file_transport_sends_base64_and_path(self):
+        with mock.patch.object(wa, "_post", return_value="uploaded 3 bytes") as post:
+            self.assertEqual(
+                wa.vps_upload("/data/home/x.py", "AAAA", sender="2347"), "uploaded 3 bytes")
+        post.assert_called_once_with(
+            "vps_upload", path="/data/home/x.py", data="AAAA", sender="2347",
+            chat=None, group=False, http_timeout=120)
+
+        with mock.patch.object(wa, "_post", return_value="QUJD") as post:
+            self.assertEqual(wa.vps_download("/data/home/x.png", sender="2347"), "QUJD")
+        post.assert_called_once_with(
+            "vps_download", path="/data/home/x.png", sender="2347",
+            chat=None, group=False, http_timeout=120)
+
     def test_send_message_sends_sender_context(self):
         with mock.patch.object(wa, "_post", return_value="sent") as post:
             self.assertEqual(wa.send_message("2347", "hi", sender="2347"), "sent")
@@ -211,6 +225,36 @@ class AgentToolTests(unittest.TestCase):
                 owners, admins = agent._load_people()
             self.assertEqual(owners, ["2347000000000"])
             self.assertEqual(admins["2347000000001"]["name"], "A")
+
+    def test_browser_work_prefers_the_vm_and_falls_back_locally(self):
+        agent._vps_browser_note(True)
+        with mock.patch.dict(os.environ, {"INSTABOX_API_KEY": "k", "LIAM_VPS_BROWSER": "1"}):
+            self.assertTrue(agent._vps_browser_enabled())
+            with mock.patch.object(agent, "_remote_browser_task", return_value="remote out") as remote:
+                self.assertEqual(agent.browser_task("print(1)"), "remote out")
+            remote.assert_called_once()
+            with mock.patch.object(agent, "_remote_browser_task", side_effect=RuntimeError("nope")):
+                with mock.patch.object(agent.subprocess, "run") as run:
+                    run.return_value = types.SimpleNamespace(returncode=0, stdout="local out", stderr="")
+                    self.assertEqual(agent.browser_task("print(1)"), "local out")
+            # The failed attempt parks the VM path for a while, so the next call
+            # goes straight to the local browser.
+            self.assertFalse(agent._vps_browser_enabled())
+        agent._vps_browser_note(True)
+
+    def test_browser_offload_is_off_without_a_key_or_when_disabled(self):
+        agent._vps_browser_note(True)
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("INSTABOX_API_KEY", None)
+            self.assertFalse(agent._vps_browser_enabled())
+        with mock.patch.dict(os.environ, {"INSTABOX_API_KEY": "k", "LIAM_VPS_BROWSER": "0"}):
+            self.assertFalse(agent._vps_browser_enabled())
+
+    def test_browser_script_text_wraps_the_snippet(self):
+        text = agent._browser_script_text("page.goto('https://example.com')")
+        self.assertIn("sync_playwright", text)
+        self.assertIn("        page.goto('https://example.com')", text)
+        self.assertIn("browser.close()", text)
 
     def test_all_schemas_are_closed_objects(self):
         for schema in agent.SCHEMAS:

@@ -35,8 +35,12 @@ services:
         value: liam-session
       - key: LIAM_SUPABASE_TIMEOUT_MS
         value: "120000"
+      # Backups are a safety net, not a heartbeat. The writer skips the tar/gzip
+      # and vacuum entirely when nothing changed, so a longer interval costs
+      # almost nothing on an idle Liam and stops the CPU spikes that can starve
+      # the WhatsApp socket.
       - key: LIAM_BACKUP_INTERVAL_MS
-        value: "600000"
+        value: "1800000"
 
       # --- Model providers ---------------------------------------------------
       # Comma-separated lists are accepted for the rotating key pools.
@@ -91,3 +95,19 @@ services:
         value: "600000"
       - key: LIAM_INIT_TIMEOUT_MS
         value: "300000"
+
+      # --- Staying linked ----------------------------------------------------
+      # WhatsApp drops the socket (428) when this container cannot answer its
+      # keep-alives - which is what a memory spike or a stalled event loop looks
+      # like from WhatsApp's side. Recycle the WhatsApp socket (keeping the
+      # login) before the 512 MiB limit is hit, and ping a little more often so
+      # one missed beat is not fatal.
+      - key: LIAM_MEM_LIMIT_MB
+        value: "400"
+      - key: LIAM_WA_KEEPALIVE_MS
+        value: "25000"
+      # Run headless Chromium on the InstaBox VM instead of this container, so
+      # browser tools never starve the WhatsApp connection. Falls back to the
+      # local browser automatically if the VM is unreachable.
+      - key: LIAM_VPS_BROWSER
+        value: "1"

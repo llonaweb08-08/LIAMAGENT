@@ -123,6 +123,22 @@ def vps_exec(command: str, timeout: int = 120, cwd: str = "",
         http_timeout=max(30, seconds + 30))
 
 
+def vps_upload(path: str, data: str, sender: str | None = None,
+               chat: str | None = None, group: bool = False) -> str:
+    """Copy base64 bytes to an absolute path on the InstaBox VM (owner only)."""
+    return _post(
+        "vps_upload", path=path, data=data, sender=sender, chat=chat,
+        group=bool(group), http_timeout=120)
+
+
+def vps_download(path: str, sender: str | None = None,
+                 chat: str | None = None, group: bool = False) -> str:
+    """Read an absolute path on the InstaBox VM as base64 (owner only)."""
+    return _post(
+        "vps_download", path=path, sender=sender, chat=chat,
+        group=bool(group), http_timeout=120)
+
+
 def _atomic_write(path: str, value: str) -> None:
     directory = os.path.dirname(path) or "."
     os.makedirs(directory, exist_ok=True)
