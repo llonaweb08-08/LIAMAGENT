@@ -1530,6 +1530,11 @@ const INSTABOX_API_KEY = String(process.env.INSTABOX_API_KEY || "").trim();
 // created from the agent-browser template if the workspace has none yet.
 let INSTABOX_MACHINE_ID = String(process.env.INSTABOX_MACHINE_ID || "").trim();
 const INSTABOX_API_URL = String(process.env.INSTABOX_API_URL || "https://api.instabox.sh").replace(/\/+$/, "").replace(/\/v1$/, "");
+// Where the VM's Playwright package lives. InstaBox exec runs as root, and
+// Python ignores the user site-packages for root, so a plain `pip install`
+// lands somewhere the interpreter will not import. Installing with --target
+// and putting this directory on PYTHONPATH is reliable either way.
+const INSTABOX_PYLIB_DIR = String(process.env.INSTABOX_PYLIB_DIR || "/data/home/liam_pylibs");
 
 function instaboxIdempotency(prefix) {
   const rand = (typeof crypto !== "undefined" && crypto.randomUUID)
@@ -2438,21 +2443,22 @@ const server = http.createServer(async (req, res) => {
             "        print('found:', hit)",
             "print('disk', run('df', '-h', '/data/home'))",
           ].join("\n");
-          const heredoc = "python3 - <<'PY'\n" + script + "\nPY";
+          const heredoc = "PYTHONPATH=" + INSTABOX_PYLIB_DIR + " python3 - <<'PY'\n" + script + "\nPY";
           try {
             const out = await instaboxExec(heredoc, 180);
             const result = { ok: true, out: String(out).slice(0, 3000) };
             if (String(url.searchParams.get("install") || "") === "1") {
               // One-time provisioning: add the Playwright Python package. The
               // template already ships Chromium, so no browser download is
-              // needed - the scripts launch the system binary.
+              // needed - the scripts launch the system binary. Install into an
+              // explicit --target directory because root ignores user site.
               const installScript = [
                 "import subprocess",
                 "def run(*a):",
                 "    p = subprocess.run(a, capture_output=True, text=True)",
                 "    return (p.stdout + p.stderr).strip()",
                 "print('installing playwright...')",
-                "print(run('python3', '-m', 'pip', 'install', '--quiet', '--disable-pip-version-check', '--break-system-packages', 'playwright')[-1200:])",
+                "print(run('python3', '-m', 'pip', 'install', '--quiet', '--disable-pip-version-check', '--break-system-packages', '--target', '" + INSTABOX_PYLIB_DIR + "', 'playwright')[-1200:])",
                 "try:",
                 "    import playwright",
                 "    print('playwright module is now importable')",
@@ -2460,7 +2466,7 @@ const server = http.createServer(async (req, res) => {
                 "    print('still missing:', e)",
               ].join("\n");
               try {
-                const inst = await instaboxExec("python3 - <<'PY'\n" + installScript + "\nPY", 420);
+                const inst = await instaboxExec("PYTHONPATH=" + INSTABOX_PYLIB_DIR + " python3 - <<'PY'\n" + installScript + "\nPY", 420);
                 result.install = String(inst).slice(0, 2000);
               } catch (e) {
                 result.install = "install failed: " + String(e && e.message ? e.message : e).slice(0, 300);
@@ -2490,7 +2496,8 @@ const server = http.createServer(async (req, res) => {
               try {
                 await instaboxUpload(scriptPath, Buffer.from(shotScript, "utf8"));
                 const quoted = "'" + shotUrl.replace(/'/g, "'\\''") + "'";
-                const chromeEnv = 'export LIAM_CHROMIUM_PATH="$(command -v chromium '
+                const chromeEnv = 'export PYTHONPATH=' + INSTABOX_PYLIB_DIR
+                  + '; export LIAM_CHROMIUM_PATH="$(command -v chromium '
                   + '|| command -v chromium-browser || command -v google-chrome || true)"; ';
                 const cmd = chromeEnv + "python3 " + scriptPath + " " + quoted
                   + " /data/home/liam_browser/probe_shot.png";

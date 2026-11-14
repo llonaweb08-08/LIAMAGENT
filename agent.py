@@ -503,6 +503,10 @@ def report_progress(text, sender=None):
         return f"progress report failed: {type(e).__name__}"
 
 VPS_BROWSER_DIR = os.environ.get("LIAM_VPS_BROWSER_DIR") or "/data/home/liam_browser"
+# Where the VM's Playwright package was installed. InstaBox exec runs as root,
+# and Python ignores user site-packages for root, so the package is installed
+# with `pip --target` and imported by putting this directory on PYTHONPATH.
+VPS_PYLIB_DIR = os.environ.get("LIAM_VPS_PYLIB_DIR") or "/data/home/liam_pylibs"
 
 def _browser_script_text(script, extensions=True):
     """Wrap an agent-written Playwright snippet into a runnable script."""
@@ -574,15 +578,17 @@ def _vps_ok(output):
     return bool(match) and match.group(1) == "0"
 
 # The agent-browser template ships Chromium but not Playwright's own browser, so
-# point Playwright at the system binary before running anything.
-_CHROMIUM_ENV = ("LIAM_CHROMIUM_PATH=$(command -v chromium || command -v chromium-browser "
-                 "|| command -v google-chrome || command -v google-chrome-stable || true)")
+# point Playwright at the system binary before running anything. PYTHONPATH
+# makes the --target Playwright install importable.
+_VPS_ENV = ("export PYTHONPATH=%s; export LIAM_CHROMIUM_PATH=$(command -v chromium "
+            "|| command -v chromium-browser || command -v google-chrome "
+            "|| command -v google-chrome-stable || true); " % VPS_PYLIB_DIR)
 
 def _remote_browser_task(script):
     path = _vps_stage("task_%s.py" % os.urandom(6).hex(),
                       _browser_script_text(script, extensions=False))
-    command = "cd %s && %s LIAM_USER_AGENT=%s python3 %s" % (
-        shlex.quote(VPS_BROWSER_DIR), _CHROMIUM_ENV,
+    command = "cd %s && %sLIAM_USER_AGENT=%s python3 %s" % (
+        shlex.quote(VPS_BROWSER_DIR), _VPS_ENV,
         shlex.quote(liam_keys.BROWSER_UA), shlex.quote(path))
     output = vps_exec(
         command, timeout=_clamp_timeout(_env_int("LIAM_BROWSER_TIMEOUT", 90, 10, 300)),
@@ -594,8 +600,8 @@ def _remote_browser_task(script):
 def _remote_screenshot(to, url, sender):
     script_path = _vps_stage("shot_%s.py" % os.urandom(6).hex(), _SCREENSHOT_SCRIPT)
     remote_png = VPS_BROWSER_DIR + "/shot_%s.png" % os.urandom(6).hex()
-    command = "cd %s && %s python3 %s %s %s %s" % (
-        shlex.quote(VPS_BROWSER_DIR), _CHROMIUM_ENV, shlex.quote(script_path),
+    command = "cd %s && %spython3 %s %s %s %s" % (
+        shlex.quote(VPS_BROWSER_DIR), _VPS_ENV, shlex.quote(script_path),
         shlex.quote(url), shlex.quote(remote_png), shlex.quote(liam_keys.BROWSER_UA))
     output = vps_exec(
         command, timeout=_clamp_timeout(_env_int("LIAM_SCREENSHOT_TIMEOUT", 75, 20, 180)),
