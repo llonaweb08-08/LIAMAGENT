@@ -22,6 +22,31 @@ const fs = require("fs");
 const os = require("os");
 const http = require("http");
 const crypto = require("crypto");
+const util = require("util");
+
+// Keep the last few console lines in memory so /diag?probe=logs can show what
+// the bridge actually saw. Capped, never persisted, and only returned when the
+// token-protected logs probe is asked for (the lines can contain message text).
+const RECENT_LOGS = [];
+function safeInspect(value) {
+  try {
+    return typeof value === "string" ? value : util.inspect(value, { depth: 2, breakLength: 120 });
+  } catch (e) { return String(value); }
+}
+for (const level of ["log", "warn", "error"]) {
+  const original = console[level].bind(console);
+  console[level] = (...args) => {
+    try {
+      RECENT_LOGS.push({
+        at: Date.now(),
+        level,
+        line: args.map(safeInspect).join(" ").slice(0, 800),
+      });
+      while (RECENT_LOGS.length > 80) RECENT_LOGS.shift();
+    } catch (e) {}
+    original(...args);
+  };
+}
 let sync;
 try { sync = require("./supabase_sync"); }
 catch (e) { sync = { restoreSession: async()=>({restored:false}), restoreDb: async()=>({restored:false}), backupSession: async()=>({ok:false}), backupDb: async()=>({ok:false}), backupNow: async()=>({ok:false}), sanitizeChromeLocks: ()=>0, startPeriodicBackup: ()=>null, stopPeriodicBackup: ()=>{}, configured: ()=>false }; }
@@ -377,7 +402,10 @@ let lastInboundAt = 0;
 let lastInboundKind = "";
 let lastInboundPhone = "";
 let lastInboundError = "";
+let lastInboundFromType = "";
 let lastOutboundAt = 0;
+let lastSendTargetType = "";
+let lastSendError = "";
 let lastAgentRequestAt = 0;
 let lastAgentStartedAt = 0;
 let lastAgentReplyAt = 0;
@@ -702,6 +730,19 @@ function jidForSend(value) {
   return raw;
 }
 
+// The domain of a JID, without the phone number. Used only by /diag so a
+// routing problem (a reply aimed at the wrong kind of address) is visible
+// without leaking anyone's number.
+function jidType(value) {
+  const raw = String(value || "");
+  if (raw.endsWith("@g.us")) return "g.us";
+  if (raw.endsWith("@lid")) return "lid";
+  if (raw.endsWith("@s.whatsapp.net")) return "pn";
+  if (raw.endsWith("@broadcast")) return "broadcast";
+  if (raw.endsWith("@newsletter")) return "newsletter";
+  return raw ? "other" : "";
+}
+
 function messageId(sent) {
   try { return sent && sent.key && sent.key.id ? String(sent.key.id) : null; } catch (e) { return null; }
 }
@@ -713,9 +754,17 @@ const wa = {
     // Baileys requires an object with `text`; unlike whatsapp-web.js it throws
     // "Cannot use 'in' operator to search for 'text'" when given a plain string.
     const payload = typeof content === "string" ? { text: content } : content;
-    const sent = await sock.sendMessage(jidForSend(jid), payload, options);
-    lastOutboundAt = Date.now();
-    return sent;
+    const target = jidForSend(jid);
+    lastSendTargetType = jidType(target);
+    try {
+      const sent = await sock.sendMessage(target, payload, options);
+      lastOutboundAt = Date.now();
+      lastSendError = "";
+      return sent;
+    } catch (e) {
+      lastSendError = String(e && e.message ? e.message : e).slice(0, 300);
+      throw e;
+    }
   },
   async groupMetadata(jid) {
     if (!sock) throw new Error("WhatsApp is not connected");
@@ -1410,6 +1459,7 @@ async function handleIncomingMessage(msg) {
     lastInboundAt = Date.now();
     lastInboundKind = from.endsWith("@g.us") ? "group" : "dm";
     lastInboundError = "";
+    lastInboundFromType = jidType(from);
 
     const content = normalizeMessageContent(msg.message);
     if (!content) return;
@@ -2363,8 +2413,11 @@ const server = http.createServer(async (req, res) => {
           lastInboundAt: lastInboundAt || null,
           lastInboundKind,
           lastInboundPhone: maskPhone(lastInboundPhone),
+          lastInboundFromType,
           lastInboundError,
           lastOutboundAt: lastOutboundAt || null,
+          lastSendTargetType,
+          lastSendError,
           lastAgentRequestAt: lastAgentRequestAt || null,
           lastAgentStartedAt: lastAgentStartedAt || null,
           lastAgentReplyAt: lastAgentReplyAt || null,
@@ -2551,6 +2604,29 @@ const server = http.createServer(async (req, res) => {
             return sendJson(res, 200, {
               ...base,
               groupsProbe: { error: String(e && e.message ? e.message : e).slice(0, 400) },
+            });
+          }
+        }
+        if (probe === "logs") {
+          // The last console lines, so a delivery problem is visible without
+          // dashboard access. Token-protected, and can contain message text.
+          return sendJson(res, 200, { ...base, logs: RECENT_LOGS.slice(-50) });
+        }
+        if (probe === "send") {
+          // Send one real message to the owner and report whether WhatsApp
+          // accepted it. This isolates an outbound-delivery problem from the
+          // inbound/agent path.
+          const to = String(url.searchParams.get("to") || OWNERS[0]).replace(/\D/g, "");
+          try {
+            const sent = await wa.sendMessage(to, "diagnostic ping from Liam");
+            return sendJson(res, 200, {
+              ...base,
+              sendProbe: { ok: true, to: maskPhone(to), id: messageId(sent) || "sent" },
+            });
+          } catch (e) {
+            return sendJson(res, 200, {
+              ...base,
+              sendProbe: { ok: false, to: maskPhone(to), error: String(e && e.message ? e.message : e).slice(0, 400) },
             });
           }
         }
