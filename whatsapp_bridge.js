@@ -414,6 +414,45 @@ const outboundAcks = new Map();
 const ackSamples = [];
 let messagesUpdateCount = 0;
 let receiptUpdateCount = 0;
+// Raw wire evidence, so a send that is accepted but never delivered can be told
+// apart from a send that never leaves the socket at all.
+let ackNodeCount = 0;
+const ackNodeSamples = [];
+const outFrameSizes = [];
+function noteAckNode(node) {
+  ackNodeCount += 1;
+  try {
+    const a = (node && node.attrs) || {};
+    ackNodeSamples.push({
+      cls: a.class || "",
+      err: a.error || "",
+      type: a.type || "",
+      id: String(a.id || "").slice(-6),
+      from: jidType(a.from),
+    });
+    while (ackNodeSamples.length > 12) ackNodeSamples.shift();
+  } catch (e) {}
+}
+function watchSocketWire(socket) {
+  try {
+    const ws = socket && socket.ws;
+    if (!ws || ws.__liamWired) return;
+    ws.__liamWired = true;
+    // Every server acknowledgement node, not only the bad ones Baileys surfaces.
+    ws.on("CB:ack", noteAckNode);
+    // Outgoing frame sizes: a real encrypted message is hundreds of bytes; a
+    // stanza with no participant nodes is only a handful.
+    const origSend = ws.send.bind(ws);
+    ws.send = (...args) => {
+      try {
+        const data = args[0];
+        outFrameSizes.push(data && (data.length || data.byteLength || 0));
+        while (outFrameSizes.length > 20) outFrameSizes.shift();
+      } catch (e) {}
+      return origSend(...args);
+    };
+  } catch (e) {}
+}
 const ACK_NAMES = { 0: "error", 1: "pending", 2: "server", 3: "delivered", 4: "read", 5: "played" };
 function ackName(status) {
   const n = Number(status);
@@ -1445,6 +1484,7 @@ async function connectSocket(reason) {
     readyHandled = false;
     registered = false;
     sockReadyForPairing = false;
+    watchSocketWire(socket);
     socket.ev.on("creds.update", saveCreds);
     socket.ev.on("connection.update", (update) => onConnectionUpdate(socket, update));
     socket.ev.on("messages.upsert", (event) => {
@@ -2545,6 +2585,7 @@ const server = http.createServer(async (req, res) => {
           lastSendError,
           recentSends: recentSendReport(),
           ackDebug: { messagesUpdateCount, receiptUpdateCount, samples: ackSamples.slice(-5) },
+          wire: { ackNodeCount, ackSamples: ackNodeSamples.slice(-5), frameSizes: outFrameSizes.slice(-8) },
           lastAgentRequestAt: lastAgentRequestAt || null,
           lastAgentStartedAt: lastAgentStartedAt || null,
           lastAgentReplyAt: lastAgentReplyAt || null,
@@ -2826,6 +2867,27 @@ const server = http.createServer(async (req, res) => {
             out.error = String(e && e.message ? e.message : e).slice(0, 300);
             return sendJson(res, 200, { ...base, deliverProbe: out });
           }
+        }
+        if (probe === "wire") {
+          // The strongest single test: send one message and capture what
+          // actually crossed the socket. Frame sizes show whether an encrypted
+          // payload was produced, and the ack nodes show what WhatsApp replied.
+          const to = String(url.searchParams.get("to") || OWNERS[0]).replace(/\D/g, "");
+          const wait = Math.min(30000, Math.max(0, Number.parseInt(url.searchParams.get("wait") || "8000", 10) || 8000));
+          ackNodeCount = 0;
+          ackNodeSamples.length = 0;
+          outFrameSizes.length = 0;
+          const out = { to: maskPhone(to) };
+          try {
+            const sent = await wa.sendMessage(to, "wire check from Liam");
+            out.id = messageId(sent) || "sent";
+          } catch (e) { out.error = String(e && e.message ? e.message : e).slice(0, 300); }
+          await sleep(wait);
+          out.ackNodeCount = ackNodeCount;
+          out.ackSamples = ackNodeSamples.slice();
+          out.frameSizes = outFrameSizes.slice();
+          out.framesSent = outFrameSizes.length;
+          return sendJson(res, 200, { ...base, wireProbe: out });
         }
         if (probe === "account") {
           // Safe, masked view of the linked device so a half-registered or
