@@ -243,6 +243,16 @@ class AgentToolTests(unittest.TestCase):
         for name in agent.OWNER_ONLY_TOOLS:
             self.assertIn("only the owner", tools[name]())
 
+    def test_system_prompt_tells_liam_about_her_gmail(self):
+        with mock.patch.dict(os.environ, {"LIAM_EMAIL_USER": "liamagent4q@gmail.com"}):
+            text = agent._system_prompt(OWNER, False, False, False)
+        self.assertIn("liamagent4q@gmail.com", text)
+        self.assertIn("email_read", text)
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("LIAM_EMAIL_USER", None)
+            text = agent._system_prompt(OWNER, False, False, False)
+        self.assertIn("no mailbox configured", text)
+
     def test_leave_uses_the_current_group(self):
         jid = "120363000000000000@g.us"
         with mock.patch.object(agent.wa, "leave_group", return_value="left") as leave:

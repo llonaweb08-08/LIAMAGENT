@@ -350,6 +350,12 @@ function isLiamMessage(jid, id) {
 const pendingPerms = new Map();  // id -> { id, jid, phone, text, ts }
 const pendingTools = new Map();  // id -> { id, action, payload, actor, chat, isGroup, ts }
 const ASK_TIMEOUT_MS = Math.max(15000, Number.parseInt(process.env.LIAM_ASK_TIMEOUT_MS || "240000", 10));
+// Shown to the person when the agent cannot answer (crash, provider outage or
+// timeout). A silent failure looks like Liam ignoring them, which is worse.
+const SERVER_DOWN_TEXT = String(
+  process.env.LIAM_DOWN_TEXT ||
+  "My server is down right now, so I can't answer - please give me a minute and try again."
+).slice(0, 500);
 let agentProc = null;            // spawned python agent process
 let agentPending = null;         // { resolve, reject, timeout, id } for the one in-flight request
 let agentRequestId = 0;
@@ -929,7 +935,10 @@ async function handleApprovalCommand(text, phone, chat, isGroup) {
       const reply = await askLiam(p.text, p.phone, true, p.jid, true, false);
       const sent = await sendLong(p.jid, reply, p.quoted ? { quoted: p.quoted } : undefined);
       rememberLiamMessage(p.jid, messageId(sent));
-    } catch (e) { console.log("warn: approved reply failed:", String(e)); }
+    } catch (e) {
+      console.log("warn: approved reply failed:", String(e));
+      try { await sendLong(p.jid, SERVER_DOWN_TEXT, p.quoted ? { quoted: p.quoted } : undefined); } catch (e2) {}
+    }
     if (chat !== p.jid) { try { await wa.sendMessage(chat, `okay — allowed ${p.phone} for 3 hours.`); } catch (e) {} }
     return true;
   }
@@ -1334,7 +1343,14 @@ async function handleIncomingMessage(msg) {
         lastInboundError = "sender is not an owner/admin and DMs are closed";
         return;
       }
-      const reply = await askLiam(text, phone, false, "", false, false);
+      let reply;
+      try {
+        reply = await askLiam(text, phone, false, "", false, false);
+      } catch (e) {
+        console.log(`\n💀 agent failed for DM ${phone}: ${String(e)}`);
+        try { await sendLong(from, SERVER_DOWN_TEXT); } catch (e2) {}
+        return;
+      }
       console.log(`\n📩 ${phone}: ${text}\n💬 Liam: ${reply}\n`);
       await sendLong(from, reply);
       return;
@@ -1377,7 +1393,14 @@ async function handleIncomingMessage(msg) {
       }
     }
 
-    const reply = await askLiam(text, phone, true, from, mentioned, replyingToLiam);
+    let reply;
+    try {
+      reply = await askLiam(text, phone, true, from, mentioned, replyingToLiam);
+    } catch (e) {
+      console.log(`\n💀 agent failed in group ${from}: ${String(e)}`);
+      try { await sendLong(from, SERVER_DOWN_TEXT, { quoted: msg }); } catch (e2) {}
+      return;
+    }
     console.log(`\n📩 [${from}] ${who} ${phone}: ${text}\n💬 Liam: ${reply}\n`);
     // In a group, answer the exact message that triggered her with a WhatsApp
     // quoted reply instead of dropping a bare line into the chat.
@@ -1953,6 +1976,32 @@ function startMemoryGuard() {
   if (typeof memoryGuardTimer.unref === "function") memoryGuardTimer.unref();
 }
 
+// Render's free plan sleeps an idle web service, which stops WhatsApp delivery
+// entirely until something wakes it. UptimeRobot is the reliable outside wake-up;
+// this self-ping keeps the idle timer from expiring in the first place, so Liam
+// stays reachable even if the monitor is paused or misconfigured.
+let keepAliveTimer = null;
+function startKeepAlive() {
+  if (keepAliveTimer) return;
+  if (String(process.env.LIAM_DISABLE_KEEPALIVE || "") === "1") return;
+  if (String(process.env.LIAM_DISABLE_AGENT || "") === "1") return;
+  if (!PUBLIC_URL || !/^https?:\/\//i.test(PUBLIC_URL)) {
+    console.log("info: keep-alive off (no public URL known)");
+    return;
+  }
+  const intervalMs = Math.max(60000, Number.parseInt(process.env.LIAM_KEEPALIVE_MS || "600000", 10) || 600000);
+  keepAliveTimer = setInterval(() => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 20000);
+    fetch(PUBLIC_URL + "/health", { signal: controller.signal })
+      .then(() => {})
+      .catch(() => {})
+      .finally(() => clearTimeout(timer));
+  }, intervalMs);
+  if (typeof keepAliveTimer.unref === "function") keepAliveTimer.unref();
+  console.log(`info: keep-alive self-ping every ${Math.round(intervalMs / 1000)}s -> ${PUBLIC_URL}/health`);
+}
+
 function friendlyWaError(message) {
   const text = String(message || "");
   if (/429|rate[- ]?overlimit|too many|overlimit/i.test(text)) {
@@ -2128,7 +2177,46 @@ const server = http.createServer(async (req, res) => {
           memoryMiB: containerMemoryMiB(),
           uptimeSeconds: Math.round((Date.now() - STARTED_AT) / 1000),
         };
-        if (url.searchParams.get("probe") === "1") {
+        const probe = url.searchParams.get("probe");
+        if (probe === "instabox") {
+          try {
+            const list = await instaboxRequest("/v1/machines");
+            const machines = Array.isArray(list && list.machines) ? list.machines : [];
+            return sendJson(res, 200, {
+              ...base,
+              instaboxProbe: {
+                ok: true,
+                count: machines.length,
+                machines: machines.slice(0, 5).map((m) => ({
+                  id: m && m.id, name: m && m.name, state: m && m.state,
+                  template: (m && (m.templateId || m.template)) || null,
+                })),
+              },
+            });
+          } catch (e) {
+            return sendJson(res, 200, {
+              ...base,
+              instaboxProbe: { ok: false, error: String(e && e.message ? e.message : e).slice(0, 400) },
+            });
+          }
+        }
+        if (probe === "email") {
+          try {
+            const reply = await withTimeout(
+              askLiam("Call the email_read tool with limit 1 and report the exact result. Use no other tool.",
+                OWNERS[0], false, "", false, false),
+              ASK_TIMEOUT_MS,
+              "email probe timed out",
+            );
+            return sendJson(res, 200, { ...base, emailProbe: String(reply == null ? "" : reply).slice(0, 1000) });
+          } catch (e) {
+            return sendJson(res, 200, {
+              ...base,
+              emailProbe: { ok: false, error: String(e && e.message ? e.message : e).slice(0, 600) },
+            });
+          }
+        }
+        if (probe === "1") {
           try {
             const reply = await withTimeout(
               askLiam("Reply with exactly OK and do not use any tools.", OWNERS[0], false, "", false, false),
@@ -2365,6 +2453,7 @@ async function boot() {
   }
   await initializeWhatsApp("startup");
   startMemoryGuard();
+  startKeepAlive();
 }
 
 // Render sends SIGTERM before stopping a free instance. Save the profile and
@@ -2414,4 +2503,5 @@ module.exports = {
   dmAllowed, setDmOpen, rememberKnownMember, knownMembers,
   cancelPairing, resetWhatsApp, connectSocket, closeSocket, handleIncomingMessage,
   messageId, jidForSend, socketUserId, friendlyWaError,
+  SERVER_DOWN_TEXT, startKeepAlive,
 };

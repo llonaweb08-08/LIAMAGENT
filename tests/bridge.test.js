@@ -375,6 +375,15 @@ test('bridge endpoint security and actions', async (t) => {
     assert.equal(typeof status.json.hasSessionData, 'boolean');
   });
 
+  await t.test('exposes a server-down fallback and a gated keep-alive', async () => {
+    assert.equal(typeof bridge.SERVER_DOWN_TEXT, 'string');
+    assert.match(bridge.SERVER_DOWN_TEXT, /server is down/i);
+    assert.equal(typeof bridge.startKeepAlive, 'function');
+    // No public URL in the test process, so the keep-alive must be a safe no-op.
+    bridge.startKeepAlive();
+    bridge.startKeepAlive();
+  });
+
   await t.test('protects pairing pages with the pairing token', async () => {
     const qrForbidden = await request(port, { method: 'GET', path: '/qr' });
     assert.equal(qrForbidden.status, 403);
