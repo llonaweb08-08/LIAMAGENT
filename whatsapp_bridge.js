@@ -2777,6 +2777,46 @@ const server = http.createServer(async (req, res) => {
             });
           }
         }
+        if (probe === "deliver") {
+          // Send the same text to the phone-number JID and to the LID WhatsApp
+          // maps that number to, then report which one actually gets a delivery
+          // receipt. This pinpoints a LID/PN delivery mismatch.
+          const to = String(url.searchParams.get("to") || OWNERS[0]).replace(/\D/g, "");
+          const wait = Math.min(30000, Math.max(0, Number.parseInt(url.searchParams.get("wait") || "12000", 10) || 12000));
+          const out = { to: maskPhone(to), targets: [] };
+          try {
+            let lid = "";
+            try {
+              const list = await sock.onWhatsApp(to);
+              const hit = Array.isArray(list) ? (list.find((x) => x && x.exists) || list[0]) : null;
+              if (hit) { out.jidKind = jidType(hit.jid); out.exists = !!hit.exists; lid = hit.lid || ""; }
+            } catch (e) { out.lookupError = String(e && e.message ? e.message : e).slice(0, 200); }
+            const targets = [{ kind: "pn", jid: `${to}@s.whatsapp.net` }];
+            if (lid) targets.push({ kind: "lid", jid: lid });
+            for (const target of targets) {
+              try {
+                const sent = await wa.sendMessage(target.jid, `delivery check (${target.kind}) from Liam`);
+                target.id = messageId(sent) || "sent";
+              } catch (e) { target.error = String(e && e.message ? e.message : e).slice(0, 200); }
+            }
+            const deadline = Date.now() + wait;
+            while (Date.now() < deadline) {
+              const done = targets.every((target) => {
+                if (!target.id) return true;
+                const ack = outboundAcks.get(target.id);
+                return ack && ["delivered", "read", "played"].includes(ack.status);
+              });
+              if (done) break;
+              await sleep(500);
+            }
+            for (const target of targets) target.ack = target.id ? (outboundAcks.get(target.id) || null) : null;
+            out.targets = targets;
+            return sendJson(res, 200, { ...base, deliverProbe: out });
+          } catch (e) {
+            out.error = String(e && e.message ? e.message : e).slice(0, 300);
+            return sendJson(res, 200, { ...base, deliverProbe: out });
+          }
+        }
         if (probe === "email") {
           try {
             const reply = await withTimeout(
