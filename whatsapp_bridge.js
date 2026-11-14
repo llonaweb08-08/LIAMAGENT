@@ -747,24 +747,80 @@ function messageId(sent) {
   try { return sent && sent.key && sent.key.id ? String(sent.key.id) : null; } catch (e) { return null; }
 }
 
+// A socket can be "registered" and still be mid-reconnect: WhatsApp closed the
+// old stream (e.g. 440 "conflict" during a deploy) and Baileys has not finished
+// the new handshake. A reply written in that window used to throw
+// "Connection Closed" and never arrive, even though the agent had already
+// produced it. These helpers let a send wait for a live socket and retry once.
+function socketUsable() {
+  if (!sock) return false;
+  const ws = sock.ws;
+  // No underlying WebSocket object (only the test stub): the bridge's own
+  // ready flag is all we can trust.
+  if (!ws) return true;
+  try {
+    if (ws.isClosed || ws.isClosing) return false;
+    if (typeof ws.isOpen === "boolean" && !ws.isOpen) return false;
+  } catch (e) { return false; }
+  // The WebSocket is open; require the WhatsApp handshake to be complete too.
+  return !!registered;
+}
+
+function waitForSocketReady(timeoutMs) {
+  if (socketUsable()) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    const deadline = Date.now() + Math.max(0, timeoutMs);
+    const tick = () => {
+      if (socketUsable()) return resolve(true);
+      if (Date.now() >= deadline) return resolve(false);
+      const timer = setTimeout(tick, 400);
+      if (typeof timer.unref === "function") timer.unref();
+    };
+    tick();
+  });
+}
+
+// Errors that mean "the socket went away", not "the message itself is bad".
+// Only these are worth retrying once the reconnect finishes. A plain timeout is
+// deliberately excluded: it is ambiguous, and retrying could duplicate a message
+// that actually reached WhatsApp.
+function isConnectionGoneError(message) {
+  return /connection closed|not connected|socket closed|stream errored|connection terminated|connection lost|econnreset|closed by remote/i
+    .test(String(message || ""));
+}
+
 const wa = {
   get connected() { return !!(sock && registered); },
   async sendMessage(jid, content, options) {
-    if (!sock) throw new Error("WhatsApp is not connected");
     // Baileys requires an object with `text`; unlike whatsapp-web.js it throws
     // "Cannot use 'in' operator to search for 'text'" when given a plain string.
     const payload = typeof content === "string" ? { text: content } : content;
     const target = jidForSend(jid);
     lastSendTargetType = jidType(target);
-    try {
-      const sent = await sock.sendMessage(target, payload, options);
-      lastOutboundAt = Date.now();
-      lastSendError = "";
-      return sent;
-    } catch (e) {
-      lastSendError = String(e && e.message ? e.message : e).slice(0, 300);
-      throw e;
+    let lastErr = null;
+    for (let attempt = 1; attempt <= 2; attempt += 1) {
+      const ready = await waitForSocketReady(attempt === 1 ? 15000 : 20000);
+      if (!ready) {
+        lastErr = new Error("WhatsApp is not connected");
+        break;
+      }
+      try {
+        const sent = await sock.sendMessage(target, payload, options);
+        lastOutboundAt = Date.now();
+        lastSendError = "";
+        return sent;
+      } catch (e) {
+        lastErr = e;
+        const msg = String(e && e.message ? e.message : e);
+        if (attempt < 2 && isConnectionGoneError(msg)) {
+          console.log(`warn: send to ${lastSendTargetType} failed (${msg.slice(0, 80)}); waiting for reconnect and retrying`);
+          continue;
+        }
+        break;
+      }
     }
+    lastSendError = String(lastErr && lastErr.message ? lastErr.message : lastErr).slice(0, 300);
+    throw lastErr || new Error("WhatsApp is not connected");
   },
   async groupMetadata(jid) {
     if (!sock) throw new Error("WhatsApp is not connected");
@@ -1488,6 +1544,11 @@ async function handleIncomingMessage(msg) {
     if (await handleApprovalCommand(text, phone, from, isGroup)) return;
 
     if (!isGroup) {
+      // A direct message can arrive addressed by an anonymous LID instead of a
+      // phone number. Replying to the LID can look like it succeeded while never
+      // being delivered; the phone-number JID always delivers, and the number is
+      // already resolved for this sender.
+      const dmTarget = (from.endsWith("@lid") && phone) ? `${phone}@s.whatsapp.net` : from;
       // .allowdm: owners + admins + known group members. .disallowdm: owners + admins.
       if (!OWNERS.includes(phone) && (text === ".allowdm" || text === ".disallowdm")) return;
       if (OWNERS.includes(phone) && (text === ".allowdm" || text === ".disallowdm")) {
@@ -1496,7 +1557,7 @@ async function handleIncomingMessage(msg) {
           ? "okay babe, DMs are open to owners, admins and people I already know from groups"
           : "okay babe, DMs are closed again — only you, Precious and Temi can reach me now";
         console.log(`\n📩 [toggle] ${phone}\n💬 Liam: ${reply}\n`);
-        await sendLong(from, reply);
+        await sendLong(dmTarget, reply);
         return;
       }
       const allowed = dmAllowed(phone);
@@ -1505,19 +1566,19 @@ async function handleIncomingMessage(msg) {
         lastInboundError = "sender is not an owner/admin and DMs are closed";
         return;
       }
-      markReadAndTyping(from, msg);
+      markReadAndTyping(dmTarget, msg);
       let reply;
       try {
         reply = await askLiam(text, phone, false, "", false, false);
       } catch (e) {
         console.log(`\n💀 agent failed for DM ${phone}: ${String(e)}`);
-        try { await sendLong(from, SERVER_DOWN_TEXT); } catch (e2) {}
-        stopTyping(from);
+        try { await sendLong(dmTarget, SERVER_DOWN_TEXT); } catch (e2) {}
+        stopTyping(dmTarget);
         return;
       }
       console.log(`\n📩 ${phone}: ${text}\n💬 Liam: ${reply}\n`);
-      await sendLong(from, reply);
-      stopTyping(from);
+      await sendLong(dmTarget, reply);
+      stopTyping(dmTarget);
       return;
     }
 
@@ -2450,6 +2511,9 @@ const server = http.createServer(async (req, res) => {
           },
           memoryMiB: containerMemoryMiB(),
           uptimeSeconds: Math.round((Date.now() - STARTED_AT) / 1000),
+          // Connection history (open/close/reconnect codes) with no message
+          // text, so a flapping socket is visible while linked.
+          events: waEvents.slice(-15),
         };
         const probe = url.searchParams.get("probe");
         if (probe === "instabox") {

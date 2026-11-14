@@ -562,3 +562,37 @@ test('bridge endpoint security and actions', async (t) => {
     assert.equal(phone, '2348000000006');
   });
 });
+
+test('a reply survives a socket that is briefly closed', async (t) => {
+  await t.test('retries once after a connection-closed error', async () => {
+    const original = fake.sendMessage.bind(fake);
+    let calls = 0;
+    fake.sendMessage = async (...args) => {
+      calls += 1;
+      if (calls === 1) throw new Error('Connection Closed');
+      return original(...args);
+    };
+    try {
+      const sent = await bridge.wa.sendMessage('2347035634340', 'hello');
+      assert.equal(calls, 2, 'the send should be retried exactly once');
+      assert.ok(sent && sent.key && sent.key.id, 'the retry should return a real receipt');
+    } finally {
+      fake.sendMessage = original;
+    }
+  });
+
+  await t.test('does not retry a payload error', async () => {
+    const original = fake.sendMessage.bind(fake);
+    let calls = 0;
+    fake.sendMessage = async () => {
+      calls += 1;
+      throw new Error('message is too long');
+    };
+    try {
+      await assert.rejects(() => bridge.wa.sendMessage('2347035634340', 'hello'), /too long/);
+      assert.equal(calls, 1, 'a bad payload must not be retried');
+    } finally {
+      fake.sendMessage = original;
+    }
+  });
+});
