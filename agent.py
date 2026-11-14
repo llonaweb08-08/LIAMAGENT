@@ -964,15 +964,17 @@ def _exhaust_key(brain, key, model=None):
     return (str(brain), str(key or ""), str(model or ""))
 
 def _key_exhausted(brain, key, model=None):
-    ts = _EXHAUSTED.get(_exhaust_key(brain, key, model))
-    if not ts: return False
-    if time.time() - ts > 86400:
+    expiry = _EXHAUSTED.get(_exhaust_key(brain, key, model))
+    if not expiry: return False
+    if time.time() > expiry:
         _EXHAUSTED.pop(_exhaust_key(brain, key, model), None)
         return False
     return True
 
-def _mark_exhausted(brain, key, model=None):
-    _EXHAUSTED[_exhaust_key(brain, key, model)] = time.time()
+def _mark_exhausted(brain, key, model=None, ttl=86400):
+    # Store the expiry, not the start, so a short cooldown (e.g. a provider that
+    # is simply out of free quota today) can be retried sooner than a full day.
+    _EXHAUSTED[_exhaust_key(brain, key, model)] = time.time() + max(30, float(ttl))
     while len(_EXHAUSTED) > 2000:
         try: del _EXHAUSTED[next(iter(_EXHAUSTED))]
         except Exception: break
@@ -984,7 +986,7 @@ MAX_ATTEMPTS = 8           # provider/key attempts per turn
 # slot for either just wastes a turn. HCNSec is slow, so it is tried last.
 FALLBACK_ORDER = ["moonmath", "agnes", "hcn"]
 # Per-brain HTTP cap. A slow provider must not be allowed to eat the budget.
-BRAIN_TIMEOUT = {"agnes": 30, "hcn": 20}
+BRAIN_TIMEOUT = {"moonmath": 20, "glm": 15, "agnes": 30, "hcn": 20}
 OFFLINE = os.environ.get("LIAM_OFFLINE") == "1"
 
 def _is_transient(status):
@@ -1077,7 +1079,7 @@ def _attempt_plan(brain):
 
 def call_model(messages, sender, brain=None, tools=None, budget=None):
     if OFFLINE:
-        return {"role": "assistant", "content": "offline test reply"}
+        return {"role": "assistant", "content": "offline test reply", "_brain": "offline"}
     brain = _normalize_brain(brain) or get_brain()
     admin_only = _is_admin(sender) and not _is_owner(sender)
     if admin_only:
@@ -1100,9 +1102,12 @@ def call_model(messages, sender, brain=None, tools=None, budget=None):
                 if remaining <= 1:
                     break
                 try:
-                    return _http_post(BRAINS[b]["base"].rstrip("/"), model, key, messages,
-                                      tools if use_tools else None,
-                                      min(BRAIN_TIMEOUT.get(b, ATTEMPT_TIMEOUT), remaining))
+                    out = _http_post(BRAINS[b]["base"].rstrip("/"), model, key, messages,
+                                     tools if use_tools else None,
+                                     min(BRAIN_TIMEOUT.get(b, ATTEMPT_TIMEOUT), remaining))
+                    out["_brain"] = b
+                    out["_model"] = model
+                    return out
                 except urllib.error.HTTPError as e:
                     status = e.code
                     try: detail = e.read(200).decode("utf-8", "replace").replace("\n", " ")[:160]
@@ -1113,6 +1118,11 @@ def call_model(messages, sender, brain=None, tools=None, budget=None):
                         _mark_exhausted(b, key, model)
                         if b == "unorouter":
                             _mark_exhausted(b, key, None)
+                    elif status == 402:
+                        # "Payment required" - the free quota is used up for the
+                        # day. Skip this key for a while instead of paying the
+                        # round-trip (or a hung socket) on every single turn.
+                        _mark_exhausted(b, key, model, ttl=1800)
                     if status == 400 and use_tools:
                         # Some models reject the tools parameter; retry once without it.
                         use_tools = False
@@ -1132,7 +1142,7 @@ def call_model(messages, sender, brain=None, tools=None, budget=None):
             break
 
     _log(f"[brain] all providers failed ({last_err})")
-    return {"role": "assistant", "content": FALLBACK_TEXT}
+    return {"role": "assistant", "content": FALLBACK_TEXT, "_brain": "none"}
 
 CONFIG_PATH = os.path.join(BASE_DIR, "liam_config.json")
 
@@ -1458,8 +1468,13 @@ def run_agent(user_message, sender, is_group, group_jid, mentioned, reply_to):
         _t = time.monotonic()
         msg = call_model(messages, sender, tools=schemas, budget=min(CALL_BUDGET, remaining))
         steps_done += 1
+        # _brain/_model are for the trace only; strip them so they are never sent
+        # back to a provider inside the conversation.
+        brain_used = msg.pop("_brain", None)
+        msg.pop("_model", None)
         trace["events"].append({"k": "model", "ms": int((time.monotonic() - _t) * 1000),
-                                "calls": len(msg.get("tool_calls") or [])})
+                                "calls": len(msg.get("tool_calls") or []),
+                                "brain": brain_used})
         messages.append(msg)
         text = (msg.get("content") or "").strip()
         if text:
@@ -1526,8 +1541,10 @@ def run_agent(user_message, sender, is_group, group_jid, mentioned, reply_to):
                      "content": "Stop using tools. Reply to me now in one short message."})
     _t = time.monotonic()
     final = call_model(messages, sender, tools=None, budget=remaining)
+    final_brain = final.pop("_brain", None)
+    final.pop("_model", None)
     trace["events"].append({"k": "model", "ms": int((time.monotonic() - _t) * 1000),
-                            "calls": 0, "final": True})
+                            "calls": 0, "final": True, "brain": final_brain})
     return finish((final.get("content") or "").strip() or last_text)
 
 if __name__ == "__main__":

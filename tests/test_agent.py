@@ -448,6 +448,32 @@ class AgentToolTests(unittest.TestCase):
         self.assertNotIn("glm", agent.FALLBACK_ORDER)
         self.assertNotIn("unorouter", agent.FALLBACK_ORDER)
 
+    def test_exhaustion_cooldown_expires(self):
+        try:
+            agent._EXHAUSTED.clear()
+            agent._mark_exhausted("moonmath", "k", "m", ttl=1800)
+            self.assertTrue(agent._key_exhausted("moonmath", "k", "m"))
+            agent._EXHAUSTED[agent._exhaust_key("moonmath", "k", "m")] = time.time() - 1
+            self.assertFalse(agent._key_exhausted("moonmath", "k", "m"))
+        finally:
+            agent._EXHAUSTED.clear()
+
+    def test_payment_required_cools_the_provider_down(self):
+        fake = {"base": "https://x", "model": "m", "keys": ["k1"], "label": "M"}
+        err = agent.urllib.error.HTTPError("u", 402, "Payment Required", {}, io.BytesIO(b"{}"))
+        try:
+            agent._EXHAUSTED.clear()
+            with mock.patch.dict(agent.BRAINS, {"moonmath": fake}), \
+                    mock.patch.object(agent, "_http_post", side_effect=err):
+                msg = agent.call_model([{"role": "user", "content": "hi"}], OWNER)
+            self.assertEqual(msg["_brain"], "none")
+            self.assertTrue(agent._key_exhausted(
+                "moonmath", "k1", agent.liam_keys.MOON_MODEL))
+            self.assertTrue(agent._key_exhausted(
+                "moonmath", "k1", agent.liam_keys.MOON_FALLBACK))
+        finally:
+            agent._EXHAUSTED.clear()
+
     def test_turn_records_a_trace_without_message_text(self):
         with mock.patch.object(agent, "call_model",
                                return_value={"role": "assistant", "content": "hi"}):
