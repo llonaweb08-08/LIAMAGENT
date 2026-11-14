@@ -1322,6 +1322,38 @@ def _resolve_memory_user(value: object, sender: object) -> str:
             return phone
     return _norm_user(sender)
 
+def _person_phone(value: object) -> str:
+    """Turn a person's name (as the owner says it) into their WhatsApp number.
+
+    Without this, "DM Temi" hands the literal word "Temi" to WhatsApp, which
+    cannot deliver it - Liam looked like she did not have Temi's number."""
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    digits = "".join(ch for ch in raw if ch.isdigit())
+    if digits and len(digits) >= 7 and not any(ch.isalpha() for ch in raw):
+        return digits
+    s = _norm_user(raw)
+    for phone, info in ADMS.items():
+        names = {_norm_user(info.get("name")), _norm_user(info.get("is"))}
+        names |= {_norm_user(n) for n in (info.get("she_calls") or [])}
+        if s in names:
+            return phone
+    return ""
+
+def _people_block(sender_is_owner: bool) -> str:
+    """Tell the owner's Liam the numbers of the people she is allowed to DM.
+
+    Only the owner sees this: send_dm and the other send tools are owner-only,
+    and phone numbers must never be shown to members."""
+    if not sender_is_owner:
+        return ""
+    lines = ["", "PEOPLE YOU KNOW (their WhatsApp numbers, for send_dm only - never show a number to anyone, ever):"]
+    for phone, info in ADMS.items():
+        lines.append(f"- {info.get('name')} ({info.get('is')}) is {phone}")
+    lines.append("- the owner is the person you are already talking to")
+    return "\n".join(lines)
+
 TOOLS = {
     "remember": remember,
     "recall": recall,
@@ -1413,11 +1445,13 @@ def _tools_for(sender, chat_jid="", is_group=False):
 
     # The model does not know the current chat's number, so every send tool
     # defaults to the chat Liam is already in when 'to' is omitted or vague.
+    # It also resolves a person's name ("Temi") to their number, so the owner
+    # can just say "DM Temi".
     def _recipient(to):
         value = str(to or "").strip()
         if value and value.lower() not in (
                 "me", "self", "here", "this chat", "current chat", "this group", "the group"):
-            return value
+            return _person_phone(value) or value
         return chat_jid if (is_group and chat_jid) else me
 
     # Memory is scoped to whoever is actually talking; owners can name a known person.
@@ -1521,6 +1555,7 @@ def _system_prompt(sender, is_group, mentioned, reply_to, group_jid=""):
     if s in OWNERS:
         pet = random.choice(PETNAMES)
         text += f"\nRight now you're talking to THE OWNER ({pet}). Use a pet name for him - he's the one you love."
+        text += _people_block(True)
     elif s in ADMS:
         a = ADMS[s]
         text += (f"\nRight now you're talking to {a['name']} - {a['is']}. "

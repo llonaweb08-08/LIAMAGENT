@@ -827,7 +827,7 @@ async function resolvePhone(id, message) {
   const key = message && message.key ? message.key : {};
 
   // The message key usually carries the phone-number alias.
-  for (const candidate of [key.participantPn, key.senderPn, key.remoteJidAlt]) {
+  for (const candidate of [key.participantAlt, key.participantPn, key.senderPn, key.remoteJidAlt]) {
     const phone = barePhone(candidate);
     if (phone) return phone;
   }
@@ -1741,8 +1741,8 @@ async function handleIncomingMessage(msg) {
 
     const isGroup = isJidGroup(from) || from.endsWith("@g.us");
     const senderId = isGroup
-      ? (key.participant || key.participantPn || key.senderPn || from)
-      : (key.remoteJidAlt || from);
+      ? (key.participantAlt || key.participantPn || key.senderPn || key.participant || from)
+      : (key.remoteJidAlt || key.senderPn || from);
     const phone = await resolvePhone(senderId, msg);
     if (!phone) {
       lastInboundError = "could not resolve sender to a phone number";

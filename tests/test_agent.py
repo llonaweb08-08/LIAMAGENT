@@ -226,6 +226,21 @@ class AgentToolTests(unittest.TestCase):
             self.assertEqual(owners, ["2347000000000"])
             self.assertEqual(admins["2347000000001"]["name"], "A")
 
+    def test_person_phone_resolves_a_known_name_to_her_number(self):
+        info = agent.ADMS[ADMIN]
+        for name in [info["name"], info["is"], *info["she_calls"]]:
+            self.assertEqual(agent._person_phone(name), ADMIN, f"failed for {name!r}")
+        self.assertEqual(agent._person_phone(ADMIN), ADMIN)
+        self.assertEqual(agent._person_phone("+" + ADMIN), ADMIN)
+        self.assertEqual(agent._person_phone("someone unknown"), "")
+
+    def test_owner_is_told_the_people_numbers_but_members_are_not(self):
+        owner_prompt = agent._system_prompt(OWNER, False, False, None)
+        self.assertIn(ADMIN, owner_prompt)
+        member_prompt = agent._system_prompt(MEMBER, False, False, None)
+        self.assertNotIn(ADMIN, member_prompt)
+        self.assertEqual(agent._people_block(False), "")
+
     def test_browser_work_prefers_the_vm_and_falls_back_locally(self):
         agent._vps_browser_note(True)
         with mock.patch.dict(os.environ, {"INSTABOX_API_KEY": "k", "LIAM_VPS_BROWSER": "1"}):
