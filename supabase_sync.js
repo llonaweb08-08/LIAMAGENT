@@ -4,16 +4,24 @@ const { execFile } = require("child_process");
 const { Readable, Transform } = require("stream");
 const { pipeline } = require("stream/promises");
 
+// A mistyped numeric env var (e.g. "5m") makes Number.parseInt return NaN, and
+// NaN in Math.max stays NaN - which turns a timeout into an instant abort or a
+// backup interval into a tight loop. envInt() always falls back to the default.
+function envInt(name, fallback, min, max) {
+  const parsed = Number.parseInt(process.env[name], 10);
+  let value = Number.isFinite(parsed) ? parsed : fallback;
+  if (min !== undefined) value = Math.max(min, value);
+  if (max !== undefined) value = Math.min(max, value);
+  return value;
+}
+
 const SUPABASE_URL = (process.env.SUPABASE_URL || "").replace(/\/+$/, "");
 const SUPABASE_SECRET_KEY = process.env.SUPABASE_SECRET_KEY || "";
 const SUPABASE_BUCKET = process.env.SUPABASE_STORAGE_BUCKET || "liam-session";
 const SESSION_ARCHIVE = "session.tar.gz";
 const DB_ARCHIVE = "liam_memory.db";
-const FETCH_TIMEOUT_MS = Number.parseInt(process.env.LIAM_SUPABASE_TIMEOUT_MS || "120000", 10);
-const MAX_ARCHIVE_BYTES = Math.max(
-  16 * 1024 * 1024,
-  Number.parseInt(process.env.LIAM_MAX_ARCHIVE_BYTES || String(300 * 1024 * 1024), 10),
-);
+const FETCH_TIMEOUT_MS = envInt("LIAM_SUPABASE_TIMEOUT_MS", 120000, 5000);
+const MAX_ARCHIVE_BYTES = envInt("LIAM_MAX_ARCHIVE_BYTES", 300 * 1024 * 1024, 16 * 1024 * 1024);
 const MAX_DB_BYTES = 200 * 1024 * 1024;
 const MAX_ARCHIVE_ENTRIES = 250000;
 const CHROME_LOCK_NAMES = new Set([
@@ -593,7 +601,7 @@ async function backupNow(dataDir, sessionDir, dbDir, options = {}) {
 
 function startPeriodicBackup(dataDir, sessionDir, dbDir) {
   if (backupTimer) return backupTimer;
-  const intervalMs = Math.max(60_000, Number.parseInt(process.env.LIAM_BACKUP_INTERVAL_MS || "600000", 10));
+  const intervalMs = envInt("LIAM_BACKUP_INTERVAL_MS", 600000, 60000);
   const run = async () => {
     try { await backupNow(dataDir, sessionDir, dbDir); }
     catch (e) { console.log("warn: periodic backup failed:", String(e)); }

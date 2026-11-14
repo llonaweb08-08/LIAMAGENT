@@ -87,12 +87,24 @@ const MAX_BODY = 64 * 1024;
 const MAX_MEDIA = 25 * 1024 * 1024;
 const OUTBOUND_WINDOW = 60 * 1000;
 const OUTBOUND_MAX = 20;
-const PERMISSION_TTL_MS = Math.max(60_000, Number.parseInt(process.env.LIAM_GROUP_PERMISSION_MS || String(3 * 60 * 60 * 1000), 10));
-const PENDING_TTL_MS = Math.max(60_000, Number.parseInt(process.env.LIAM_PENDING_TTL_MS || String(30 * 60 * 1000), 10));
-const TOOL_APPROVAL_TTL_MS = Math.max(60_000, Number.parseInt(process.env.LIAM_TOOL_APPROVAL_MS || String(10 * 60 * 1000), 10));
+
+// A mistyped numeric env var (e.g. "10m") makes Number.parseInt return NaN, and
+// NaN in Math.max stays NaN. That silently breaks a timer or a comparison, so
+// every configurable number goes through envInt() and falls back to the default.
+function envInt(name, fallback, min, max) {
+  const parsed = Number.parseInt(process.env[name], 10);
+  let value = Number.isFinite(parsed) ? parsed : fallback;
+  if (min !== undefined) value = Math.max(min, value);
+  if (max !== undefined) value = Math.min(max, value);
+  return value;
+}
+
+const PERMISSION_TTL_MS = envInt("LIAM_GROUP_PERMISSION_MS", 3 * 60 * 60 * 1000, 60_000);
+const PENDING_TTL_MS = envInt("LIAM_PENDING_TTL_MS", 30 * 60 * 1000, 60_000);
+const TOOL_APPROVAL_TTL_MS = envInt("LIAM_TOOL_APPROVAL_MS", 10 * 60 * 1000, 60_000);
 // Minimum gap between two pairing-code requests. WhatsApp blocks a number that
 // asks repeatedly, and each request restarts that block.
-const PAIRING_COOLDOWN_MS = Math.max(60_000, Number.parseInt(process.env.LIAM_PAIRING_COOLDOWN_MS || "120000", 10));
+const PAIRING_COOLDOWN_MS = envInt("LIAM_PAIRING_COOLDOWN_MS", 120000, 60_000);
 const MAX_PENDING = 40;
 
 function resolvePort() {
@@ -380,15 +392,14 @@ function isLiamMessage(jid, id) {
 }
 const pendingPerms = new Map();  // id -> { id, jid, phone, text, ts }
 const pendingTools = new Map();  // id -> { id, action, payload, actor, chat, isGroup, ts }
-const ASK_TIMEOUT_MS = Math.max(15000, Number.parseInt(process.env.LIAM_ASK_TIMEOUT_MS || "240000", 10));
+const ASK_TIMEOUT_MS = envInt("LIAM_ASK_TIMEOUT_MS", 240000, 15000);
 // Baileys pings WhatsApp every interval, and gives up on a silent socket after
 // interval + 5s. WhatsApp drops the stream (428) when we cannot answer in time,
 // which is what happens when a heavy job (headless Chromium, a backup) blocks
 // the event loop on this small box. A shorter interval keeps our pings inside
 // WhatsApp's window, so a single missed beat is not fatal. Configurable so it
 // can be tuned without a code change.
-const WA_KEEPALIVE_MS = Math.min(120000, Math.max(15000,
-  Number.parseInt(process.env.LIAM_WA_KEEPALIVE_MS || "25000", 10) || 25000));
+const WA_KEEPALIVE_MS = envInt("LIAM_WA_KEEPALIVE_MS", 25000, 15000, 120000);
 // Shown to the person when the agent cannot answer (crash, provider outage or
 // timeout). A silent failure looks like Liam ignoring them, which is worse.
 const SERVER_DOWN_TEXT = String(
@@ -1207,9 +1218,17 @@ async function createToolApproval(action, payload, actor, ctx = {}) {
   return p;
 }
 
+function humanWindow(ms) {
+  const minutes = Math.max(1, Math.round(ms / 60000));
+  if (minutes < 60) return `${minutes} minute${minutes === 1 ? "" : "s"}`;
+  const hours = Math.round((minutes / 60) * 10) / 10;
+  if (Number.isInteger(hours)) return `${hours} hour${hours === 1 ? "" : "s"}`;
+  return `${hours} hours`;
+}
+
 function permissionPromptText(p) {
   return [
-    "Group permission needed (3 hours).",
+    `Group permission needed (${humanWindow(PERMISSION_TTL_MS)}).`,
     `${p.phone} wants Liam to reply in this group.`,
     `Request ${p.id}.`,
     `Reply: yes ${p.id} / no ${p.id}`,
@@ -1316,7 +1335,7 @@ async function handleApprovalCommand(text, phone, chat, isGroup) {
     }
     TEMP[p.jid] = TEMP[p.jid] || {};
     TEMP[p.jid][p.phone] = Date.now();
-    try { await wa.sendMessage(p.jid, `okay, I'll reply to ${p.phone} for the next 3 hours.`); } catch (e) {}
+    try { await wa.sendMessage(p.jid, `okay, I'll reply to ${p.phone} for the next ${humanWindow(PERMISSION_TTL_MS)}.`); } catch (e) {}
     markReadAndTyping(p.jid, p.quoted);
     try {
       const reply = await askLiam(p.text, p.phone, true, p.jid, true, false);
@@ -1327,7 +1346,7 @@ async function handleApprovalCommand(text, phone, chat, isGroup) {
       try { await sendLong(p.jid, SERVER_DOWN_TEXT, p.quoted ? { quoted: p.quoted } : undefined); } catch (e2) {}
     }
     stopTyping(p.jid);
-    if (chat !== p.jid) { try { await wa.sendMessage(chat, `okay — allowed ${p.phone} for 3 hours.`); } catch (e) {} }
+    if (chat !== p.jid) { try { await wa.sendMessage(chat, `okay — allowed ${p.phone} for ${humanWindow(PERMISSION_TTL_MS)}.`); } catch (e) {} }
     return true;
   }
 
@@ -2519,7 +2538,7 @@ function startMemoryGuard() {
   // Opt-in only: a boot peak can still happen, and recycling during a login
   // would cancel the link. Set LIAM_MEM_LIMIT_MB to a value below the plan limit
   // to enable an early socket recycle.
-  const limit = Number.parseInt(process.env.LIAM_MEM_LIMIT_MB || "0", 10);
+  const limit = envInt("LIAM_MEM_LIMIT_MB", 0, 0);
   if (!Number.isFinite(limit) || limit < 300) return;
   memoryGuardTimer = setInterval(() => {
     const used = containerMemoryMiB();
@@ -2549,7 +2568,7 @@ function startKeepAlive() {
     console.log("info: keep-alive off (no public URL known)");
     return;
   }
-  const intervalMs = Math.max(60000, Number.parseInt(process.env.LIAM_KEEPALIVE_MS || "600000", 10) || 600000);
+  const intervalMs = envInt("LIAM_KEEPALIVE_MS", 600000, 60000);
   keepAliveTimer = setInterval(() => {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 20000);
@@ -3223,19 +3242,23 @@ const server = http.createServer(async (req, res) => {
 
   if (req.method === "POST" && pathname === "/pair") {
     (async () => {
+      let bodyToken = "";
       try {
         const raw = await readBody(req, 8 * 1024);
         let data = {};
         const type = String(req.headers["content-type"] || "");
         if (/application\/json/i.test(type)) data = JSON.parse(raw || "{}");
         else data = Object.fromEntries(new URLSearchParams(raw || ""));
-        const token = String(data.token || url.searchParams.get("token") || "");
+        bodyToken = String(data.token || "");
+        const token = bodyToken || String(url.searchParams.get("token") || "");
         if (!pairTokenOk(token)) return sendHtml(res, 403, pageShell("Forbidden", "<h1>Forbidden</h1>"));
         const phone = String(data.phone || "");
         const code = await requestPairing(phone);
         sendHtml(res, 200, pairPage(token, { phone, code, requestedAt: lastPairAt }));
       } catch (e) {
-        const token = String(url.searchParams.get("token") || "");
+        // The body was already read above, so reuse its token instead of
+        // re-reading the request (which is not possible) or ignoring it.
+        const token = bodyToken || String(url.searchParams.get("token") || "");
         if (!pairTokenOk(token)) return sendHtml(res, 403, pageShell("Forbidden", "<h1>Forbidden</h1>"));
         sendHtml(res, 400, pairPage(token, { error: e instanceof BadRequest ? e.message : "pairing failed" }));
       }

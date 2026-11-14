@@ -169,7 +169,6 @@ def _brain_block():
         f"CURRENT BRAIN: {get_brain()}",
         "BRAIN MAP (only the owner can swap):",
         f"- moonmath: {liam_keys.MOON_MODEL} - most powerful, censored",
-        f"- glm: {liam_keys.MOON_FALLBACK} - MoonMath fallback when the main model errors",
         "- unorouter: rotates across the configured Unorouter models for non-tool chat",
         f"- agnes: {liam_keys.AGNES_MODEL} - the only brain that answers Temi and Precious; the owner can switch to it too",
         f"- hcn: {liam_keys.HCN_MODEL} - tool-capable HCNSec fallback",
@@ -199,7 +198,7 @@ SCHEMAS = [
  {"type":"function","function":{"name":"leave_group","description":"Owner only: leave the group this conversation is in","parameters":{"type":"object","properties":{},"additionalProperties":False}}},
  {"type":"function","function":{"name":"stop_task","description":"Owner only: stop whatever you're doing right now","parameters":{"type":"object","properties":{},"additionalProperties":False}}},
  {"type":"function","function":{"name":"permission","description":"Owner only: allow or deny a group member","parameters":{"type":"object","properties":{"jid":{"type":"string"},"who":{"type":"string"},"allow":{"type":"boolean"}},"required":["jid","who","allow"],"additionalProperties":False}}},
- {"type":"function","function":{"name":"switch_brain","description":"Owner only: switch the brain for the next reply","parameters":{"type":"object","properties":{"brain":{"type":"string","enum":["moonmath","glm","unorouter","agnes","hcn"]}},"required":["brain"],"additionalProperties":False}}},
+ {"type":"function","function":{"name":"switch_brain","description":"Owner only: switch the brain for the next reply","parameters":{"type":"object","properties":{"brain":{"type":"string","enum":["moonmath","unorouter","agnes","hcn"]}},"required":["brain"],"additionalProperties":False}}},
  {"type":"function","function":{"name":"check_status","description":"Owner only: check if each model is alive or dead","parameters":{"type":"object","properties":{},"additionalProperties":False}}},
  {"type":"function","function":{"name":"check_tokens","description":"Owner only: report the configured brains and key counts","parameters":{"type":"object","properties":{},"additionalProperties":False}}},
   {"type":"function","function":{"name":"shell_exec","description":"Owner only: run a local shell command on the Liam host (not the pentest VM)","parameters":{"type":"object","properties":{"command":{"type":"string"},"timeout":{"type":"integer"}},"required":["command"],"additionalProperties":False}}},
@@ -973,20 +972,18 @@ def shell_exec(command, timeout=30):
 
 BRAIN_STATE = os.path.join(DATA_DIR, "brain_state")
 LEGACY_BRAIN_STATE = os.path.join(BASE_DIR, ".brain_state")
+# There is deliberately no "glm" brain: it mapped to liam_keys.MOON_FALLBACK,
+# which returns HTTP 404/402. Offering it let the owner "switch" to a brain that
+# failed every turn, so it was removed rather than kept as a broken alias.
 BRAINS = {
     "moonmath":  {"base": liam_keys.MOON_BASE,  "model": liam_keys.MOON_MODEL,    "keys": list(liam_keys.MOON_KEYS), "label": "MoonMath DeepSeek"},
-    "glm":       {"base": liam_keys.MOON_BASE,  "model": liam_keys.MOON_FALLBACK, "keys": list(liam_keys.MOON_KEYS), "label": "MoonMath GLM"},
     "unorouter": {"base": liam_keys.UNO_BASE,   "model": liam_keys.UNO_MODELS[0], "keys": list(liam_keys.UNO_KEYS),  "label": "Unorouter"},
     "agnes":     {"base": liam_keys.AGNES_BASE, "model": liam_keys.AGNES_MODEL,   "keys": [liam_keys.AGNES_KEY],     "label": "Agnes"},
     "hcn":       {"base": liam_keys.HCN_BASE,   "model": liam_keys.HCN_MODEL,     "keys": [liam_keys.HCN_KEY],       "label": "HCNSec DeepSeek"},
 }
-# Only models that actually support tool calls are used for the tool-calling loop.
-UNO_TOOL_MODELS = ["claude-haiku-4-5-20251001:free", "bielik-11b-v3.0-instruct:free",
-                    "qwen3.6-35b-a3b:free", "gpt-4o:free",
-                    "deepseek-r1-distill-llama-70b:free"]
 _BRAIN_ALIASES = {
     "moonmath": "moonmath", "moon": "moonmath", "deepseek": "moonmath", "deepseek v4": "moonmath",
-    "glm": "glm", "glm 5 3": "glm", "agnes": "agnes", "ag": "agnes", "agnes 3": "agnes",
+    "agnes": "agnes", "ag": "agnes", "agnes 3": "agnes",
     "unorouter": "unorouter", "uno": "unorouter", "router": "unorouter",
     "hcn": "hcn", "hcnsec": "hcn", "hcn sec": "hcn",
     # Legacy names from old brain_state files and prompts.
@@ -1023,7 +1020,7 @@ def switch_brain(brain, sender=None):
     try:
         b = set_brain(brain)
     except ValueError:
-        return f"unknown brain '{brain}' - pick moonmath, glm, unorouter, agnes or hcn"
+        return f"unknown brain '{brain}' - pick moonmath, unorouter, agnes or hcn"
     return f"switched to {b}"
 
 def _probe(base, model, key, timeout=8):
@@ -1074,18 +1071,27 @@ def check_tokens():
         lines.append(f"- {p['label']}: {len([k for k in p['keys'] if k])} configured key slot(s), model {p['model']}")
     return "\n".join(lines)
 
-# _BRAIN_ALIASES = { ... } follows
 _EXHAUSTED = {}  # key: (brain, key, model|None) -> unix timestamp
 def _exhaust_key(brain, key, model=None):
     return (str(brain), str(key or ""), str(model or ""))
 
-def _key_exhausted(brain, key, model=None):
-    expiry = _EXHAUSTED.get(_exhaust_key(brain, key, model))
-    if not expiry: return False
+def _exhausted_at(brain, key, model=None):
+    k = _exhaust_key(brain, key, model)
+    expiry = _EXHAUSTED.get(k)
+    if not expiry:
+        return False
     if time.time() > expiry:
-        _EXHAUSTED.pop(_exhaust_key(brain, key, model), None)
+        _EXHAUSTED.pop(k, None)
         return False
     return True
+
+def _key_exhausted(brain, key, model=None):
+    # A per-model mark (e.g. a 402 on one model) only blocks that model. A
+    # wildcard mark (model=None, set when Unorouter rate-limits a whole key)
+    # blocks every model on that key, so consult it for a model-specific check.
+    if _exhausted_at(brain, key, model):
+        return True
+    return model is not None and _exhausted_at(brain, key, None)
 
 def _mark_exhausted(brain, key, model=None, ttl=86400):
     # Store the expiry, not the start, so a short cooldown (e.g. a provider that
@@ -1102,7 +1108,7 @@ MAX_ATTEMPTS = 8           # provider/key attempts per turn
 # slot for either just wastes a turn. HCNSec is slow, so it is tried last.
 FALLBACK_ORDER = ["moonmath", "agnes", "hcn"]
 # Per-brain HTTP cap. A slow provider must not be allowed to eat the budget.
-BRAIN_TIMEOUT = {"moonmath": 20, "glm": 15, "agnes": 30, "hcn": 20}
+BRAIN_TIMEOUT = {"moonmath": 20, "agnes": 30, "hcn": 20}
 OFFLINE = os.environ.get("LIAM_OFFLINE") == "1"
 
 def _is_transient(status):
@@ -1189,7 +1195,7 @@ def _attempt_plan(brain):
         if not keys:
             return []
         plan = []
-        for i, m in enumerate(UNO_TOOL_MODELS):
+        for i, m in enumerate(liam_keys.UNO_MODELS):
             key = keys[i % len(keys)] if keys else ""
             if _key_exhausted("unorouter", key, m):
                 continue
@@ -1239,11 +1245,15 @@ def call_model(messages, sender, brain=None, tools=None, budget=None):
                         _mark_exhausted(b, key, model)
                         if b == "unorouter":
                             _mark_exhausted(b, key, None)
+                        # A rate limit never clears in the 0.8s we used to sleep
+                        # before retrying the same key. Mark it and move on.
+                        break
                     elif status == 402:
                         # "Payment required" - the free quota is used up for the
                         # day. Skip this key for a while instead of paying the
                         # round-trip (or a hung socket) on every single turn.
                         _mark_exhausted(b, key, model, ttl=1800)
+                        break
                     if status == 400 and use_tools:
                         # Some models reject the tools parameter; retry once without it.
                         use_tools = False
@@ -1608,10 +1618,17 @@ def run_agent(user_message, sender, is_group, group_jid, mentioned, reply_to):
     _DEADLINE = turn_deadline
     trace = {"events": []}
 
-    def finish(text):
+    def finish(text, store=True):
         global _DEADLINE, _LAST_TRACE
-        text = _clean_reply(text or "") or FALLBACK_TEXT
-        _history_add(chat_key, turn, text, sender)
+        cleaned = _clean_reply(text or "")
+        # An empty reply, or the "my brain's not responding" outage line, is not
+        # something Liam actually said. Storing it would make her "remember"
+        # being broken and confuse the next turn's context, so skip history.
+        if not cleaned:
+            store = False
+        text = cleaned or FALLBACK_TEXT
+        if store:
+            _history_add(chat_key, turn, text, sender)
         _DEADLINE = None
         trace["totalMs"] = int((time.monotonic() - t0) * 1000)
         trace["steps"] = steps_done
@@ -1640,7 +1657,7 @@ def run_agent(user_message, sender, is_group, group_jid, mentioned, reply_to):
             last_text = text
         calls = msg.get("tool_calls") or []
         if not calls:
-            return finish(text)
+            return finish(text, store=(brain_used != "none"))
 
         for tc in calls:
             if calls_done >= MAX_TOOL_CALLS:
@@ -1682,8 +1699,8 @@ def run_agent(user_message, sender, is_group, group_jid, mentioned, reply_to):
                                         "ms": int((time.monotonic() - _t) * 1000)})
                 cache[key] = result
             calls_done += 1
-            if len(result) > 8000:
-                result = result[:8000] + "\n… [truncated]"
+            if len(result) > TOOL_RESULT_MAX:
+                result = result[:TOOL_RESULT_MAX] + "\n… [truncated]"
             messages.append({"role": "tool", "tool_call_id": call_id,
                              "name": name or "unknown", "content": result})
             if _stop_requested():
@@ -1704,7 +1721,8 @@ def run_agent(user_message, sender, is_group, group_jid, mentioned, reply_to):
     final.pop("_model", None)
     trace["events"].append({"k": "model", "ms": int((time.monotonic() - _t) * 1000),
                             "calls": 0, "final": True, "brain": final_brain})
-    return finish((final.get("content") or "").strip() or last_text)
+    return finish((final.get("content") or "").strip() or last_text,
+                  store=(final_brain != "none"))
 
 if __name__ == "__main__":
     print(json.dumps({"ready": True}), flush=True)
