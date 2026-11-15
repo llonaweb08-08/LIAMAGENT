@@ -14,6 +14,7 @@ const { after, test } = require('node:test');
 const PYTHON = process.env.LIAM_PYTHON || (process.platform === 'win32' ? 'python' : 'python3');
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'liam-sync-test-'));
 const objects = new Map();
+let failNextUpload = 0;
 let server;
 let sync;
 
@@ -39,6 +40,12 @@ function startMockSupabase() {
         const chunks = [];
         req.on('data', (chunk) => chunks.push(chunk));
         req.on('end', () => {
+          if (failNextUpload > 0) {
+            failNextUpload -= 1;
+            res.writeHead(503, { 'Content-Type': 'text/plain' });
+            res.end('temporarily unavailable');
+            return;
+          }
           objects.set(name, Buffer.concat(chunks));
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end('{}');
@@ -316,6 +323,26 @@ test('supabase session and database persistence', async (t) => {
     assert.equal(result.restored, false);
     assert.match(String(result.error || ''), /not a SQLite database/);
     assert.deepEqual(fs.readFileSync(dbFile), before);
+  });
+
+  await t.test('round-trips a small JSON state object', async () => {
+    const base = path.join(TMP, 'state');
+    fs.mkdirSync(base, { recursive: true });
+    const value = { v: 1, savedAt: 123, temp: { 'g@g.us': { '2348000000000': 456 } } };
+    const up = await sync.uploadState(base, 'bridge_state.json', value);
+    assert.equal(up.ok, true);
+    const down = await sync.downloadState('bridge_state.json');
+    assert.equal(down.restored, true);
+    assert.deepEqual(down.value, value);
+  });
+
+  await t.test('retries a transient upload failure once', async () => {
+    const base = path.join(TMP, 'state-retry');
+    fs.mkdirSync(base, { recursive: true });
+    failNextUpload = 1;
+    const up = await sync.uploadState(base, 'retry.json', { a: 1 });
+    assert.equal(up.ok, true, 'the retry should succeed');
+    assert.equal(failNextUpload, 0, 'exactly one retry was consumed');
   });
 
   await t.test('reports not configured without credentials', () => {

@@ -15,6 +15,10 @@ function envInt(name, fallback, min, max) {
   return value;
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 const SUPABASE_URL = (process.env.SUPABASE_URL || "").replace(/\/+$/, "");
 const SUPABASE_SECRET_KEY = process.env.SUPABASE_SECRET_KEY || "";
 const SUPABASE_BUCKET = process.env.SUPABASE_STORAGE_BUCKET || "liam-session";
@@ -171,32 +175,96 @@ async function downloadToFile(res, dest, maxBytes) {
   }
 }
 
-async function uploadPath(objectName, file, contentType) {
-  await ensureBucket();
-  const stat = fs.statSync(file);
-  const urlPath = "/storage/v1/object/" + encodeURIComponent(SUPABASE_BUCKET) + "/" + encodeURIComponent(objectName);
-  const attempt = async (body, headers) => supabaseFetch(urlPath, {
+async function uploadOnce(urlPath, file, contentType, stat) {
+  const attempt = async (body) => supabaseFetch(urlPath, {
     method: "POST",
-    headers: Object.assign({
+    headers: {
       "Content-Type": contentType,
       "x-upsert": "true",
       "Content-Length": String(stat.size),
-    }, headers || {}),
+    },
     body,
     ...(body && typeof body.pipe === "function" ? { duplex: "half" } : {}),
   });
-  let res = null;
   try {
-    res = await attempt(fs.createReadStream(file));
+    return await attempt(fs.createReadStream(file));
   } catch (e) {
     // Some HTTP stacks refuse streamed bodies; fall back to a buffer when it
     // is safe (the DB is small; sessions are only buffered under 300 MB).
     if (stat.size > MAX_ARCHIVE_BYTES) throw e;
-    res = await attempt(fs.readFileSync(file));
+    return await attempt(fs.readFileSync(file));
+  }
+}
+
+// A dropped connection, a 5xx, or a 429 is transient. Without a retry a single
+// blip lost a whole backup cycle, and the next one is up to 30 minutes away, so
+// the last good copy could be stale for a long time. A permanent failure (auth,
+// too large) is returned at once and not retried.
+function transientUpload(res) {
+  return !res || res.status === 429 || res.status >= 500;
+}
+
+async function uploadPath(objectName, file, contentType) {
+  await ensureBucket();
+  const stat = fs.statSync(file);
+  const urlPath = "/storage/v1/object/" + encodeURIComponent(SUPABASE_BUCKET) + "/" + encodeURIComponent(objectName);
+  let res = null;
+  try {
+    res = await uploadOnce(urlPath, file, contentType, stat);
+  } catch (e) {
+    if (stat.size > MAX_ARCHIVE_BYTES) throw e;
+    res = null;
+  }
+  if (!res || !res.ok) {
+    if (transientUpload(res)) {
+      await sleep(1500);
+      try {
+        res = await uploadOnce(urlPath, file, contentType, stat);
+      } catch (e) {
+        if (!res) throw e;
+      }
+    }
   }
   if (res && res.ok) return { ok: true };
   const reason = res ? `status ${res.status}` : "no response";
   return { ok: false, reason };
+}
+
+// Small JSON blobs (currently the bridge's held replies and group permissions)
+// ride to Supabase the same way the session and DB do. On Render's free plan the
+// disk is wiped on every redeploy, so Supabase is the only copy that survives.
+const MAX_STATE_BYTES = 8 * 1024 * 1024;
+
+async function uploadState(dataDir, objectName, value) {
+  if (!configured()) return { ok: false, reason: "not configured" };
+  const base = baseDir(dataDir);
+  const tmp = path.join(base, objectName + ".upload.tmp");
+  try {
+    fs.mkdirSync(base, { recursive: true });
+    fs.writeFileSync(tmp, JSON.stringify(value), { mode: 0o600 });
+    return await uploadPath(objectName, tmp, "application/json");
+  } catch (e) {
+    return { ok: false, error: String(e && e.message ? e.message : e) };
+  } finally {
+    try { fs.rmSync(tmp, { force: true }); } catch (e) {}
+  }
+}
+
+async function downloadState(objectName) {
+  if (!configured()) return { restored: false, reason: "not configured" };
+  try {
+    const res = await supabaseFetch("/storage/v1/object/" + encodeURIComponent(SUPABASE_BUCKET) + "/" + encodeURIComponent(objectName));
+    if (!res || !res.ok) return { restored: false, reason: res ? `status ${res.status}` : "no response" };
+    const declared = Number(res.headers && res.headers.get ? res.headers.get("content-length") : 0);
+    if (Number.isFinite(declared) && declared > MAX_STATE_BYTES) {
+      return { restored: false, reason: "state object too large" };
+    }
+    const text = await res.text();
+    if (text.length > MAX_STATE_BYTES) return { restored: false, reason: "state object too large" };
+    return { restored: true, value: JSON.parse(text) };
+  } catch (e) {
+    return { restored: false, error: String(e && e.message ? e.message : e) };
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -621,5 +689,5 @@ module.exports = {
   sanitizeChromeLocks, startPeriodicBackup, stopPeriodicBackup,
   configured, vacuumInto, validateArchive, archiveExcludes, defaultDbFile,
   looksLikeSqlite, unsafeEntry, CACHE_EXCLUDES, sessionLooksLinked,
-  sessionSignature,
+  sessionSignature, uploadState, downloadState,
 };

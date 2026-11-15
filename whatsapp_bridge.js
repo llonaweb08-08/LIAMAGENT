@@ -55,7 +55,7 @@ for (const level of ["log", "warn", "error"]) {
 }
 let sync;
 try { sync = require("./supabase_sync"); }
-catch (e) { sync = { restoreSession: async()=>({restored:false}), restoreDb: async()=>({restored:false}), backupSession: async()=>({ok:false}), backupDb: async()=>({ok:false}), backupNow: async()=>({ok:false}), sanitizeChromeLocks: ()=>0, startPeriodicBackup: ()=>null, stopPeriodicBackup: ()=>{}, configured: ()=>false }; }
+catch (e) { sync = { restoreSession: async()=>({restored:false}), restoreDb: async()=>({restored:false}), backupSession: async()=>({ok:false}), backupDb: async()=>({ok:false}), backupNow: async()=>({ok:false}), sanitizeChromeLocks: ()=>0, startPeriodicBackup: ()=>null, stopPeriodicBackup: ()=>{}, configured: ()=>false, uploadState: async()=>({ok:false}), downloadState: async()=>({restored:false}) }; }
 
 process.on("unhandledRejection", (r) => {
   noteWaEvent("unhandledRejection", String(r && r.message ? r.message : r).slice(0, 180));
@@ -522,6 +522,7 @@ function holdReply(target, text, options) {
   try {
     heldReplies.push({ target, text, options, at: Date.now() });
     while (heldReplies.length > HELD_REPLY_MAX) heldReplies.shift();
+    scheduleBridgeStateSave();
     console.log(`warn: holding a reply for ${jidType(target)} until WhatsApp stops blocking sends`);
   } catch (e) {}
 }
@@ -545,8 +546,108 @@ async function flushHeldReplies() {
     }
   } finally {
     flushingHeldReplies = false;
+    scheduleBridgeStateSave();
   }
 }
+
+// ---------------------------------------------------------------------------
+// Small persistent state: held replies, group permissions, pending approvals
+// ---------------------------------------------------------------------------
+// On Render's free plan the disk is wiped on every redeploy, so a copy in
+// Supabase is the only thing that actually survives a restart. The local file
+// is written first (cheap, and survives an in-place process restart) and the
+// small JSON object is pushed to Supabase on a short debounce and on shutdown.
+const BRIDGE_STATE_OBJECT = "bridge_state.json";
+const BRIDGE_STATE_FILE = path.join(DATA_DIR, "bridge_state.json");
+let bridgeStateSaveTimer = null;
+
+function bridgeStateSnapshot() {
+  return {
+    v: 1,
+    savedAt: Date.now(),
+    // Deep-enough copy: the caller may mutate TEMP before the debounced upload,
+    // and the snapshot must reflect the state at the moment it was taken.
+    temp: Object.fromEntries(Object.entries(TEMP).map(([jid, map]) => [jid, { ...map }])),
+    perms: [...pendingPerms.values()].map((p) => ({
+      id: p.id, jid: p.jid, phone: p.phone, text: p.text, ts: p.ts,
+      promptedText: p.promptedText, promptCount: p.promptCount,
+    })),
+    tools: [...pendingTools.values()].map((t) => ({
+      id: t.id, action: t.action, payload: t.payload, actor: t.actor,
+      chat: t.chat, isGroup: t.isGroup, ts: t.ts,
+    })),
+    // The quoted message is intentionally dropped: it is a live Baileys object
+    // that cannot be safely rehydrated after a restart, and delivering the text
+    // matters more than the quote.
+    held: heldReplies.map((h) => ({ target: h.target, text: h.text, at: h.at })),
+  };
+}
+
+function applyBridgeState(state) {
+  if (!state || typeof state !== "object") return;
+  if (state.temp && typeof state.temp === "object") {
+    for (const [jid, map] of Object.entries(state.temp)) {
+      if (map && typeof map === "object") TEMP[jid] = { ...map };
+    }
+  }
+  for (const p of Array.isArray(state.perms) ? state.perms : []) {
+    if (p && p.id && typeof p.jid === "string" && typeof p.text === "string") {
+      pendingPerms.set(p.id, { ...p, quoted: null });
+    }
+  }
+  for (const t of Array.isArray(state.tools) ? state.tools : []) {
+    if (t && t.id && t.payload && typeof t.action === "string") pendingTools.set(t.id, t);
+  }
+  const now = Date.now();
+  for (const h of Array.isArray(state.held) ? state.held : []) {
+    if (!h || !h.target || typeof h.text !== "string") continue;
+    if (now - Number(h.at || 0) > HELD_REPLY_TTL_MS) continue;
+    heldReplies.push({ target: h.target, text: h.text, options: undefined, at: Number(h.at) || now });
+  }
+  while (heldReplies.length > HELD_REPLY_MAX) heldReplies.shift();
+  trimPending(pendingPerms);
+  trimPending(pendingTools);
+  sweepTemp(now); // drop anything that expired while we were down
+}
+
+function saveBridgeStateLocal() {
+  try { writeFileAtomic(BRIDGE_STATE_FILE, JSON.stringify(bridgeStateSnapshot())); } catch (e) {}
+}
+
+// Debounced so a burst of changes (an approval that also flushes replies) makes
+// one local write and one Supabase upload, not several.
+function scheduleBridgeStateSave() {
+  if (bridgeStateSaveTimer) return;
+  bridgeStateSaveTimer = setTimeout(() => {
+    bridgeStateSaveTimer = null;
+    saveBridgeStateLocal();
+    try {
+      if (sync.uploadState) {
+        sync.uploadState(DATA_DIR, BRIDGE_STATE_OBJECT, bridgeStateSnapshot())
+          .then(() => {}, () => {});
+      }
+    } catch (e) {}
+  }, 4000);
+  if (typeof bridgeStateSaveTimer.unref === "function") bridgeStateSaveTimer.unref();
+}
+
+async function loadBridgeState() {
+  let local = null;
+  try { local = JSON.parse(fs.readFileSync(BRIDGE_STATE_FILE, "utf8")); } catch (e) {}
+  let remote = null;
+  try {
+    if (sync.downloadState) {
+      const res = await sync.downloadState(BRIDGE_STATE_OBJECT);
+      if (res && res.restored) remote = res.value;
+    }
+  } catch (e) {}
+  // Prefer whichever copy is newer, so a failed upload cannot roll state back.
+  let state = null;
+  if (local && remote) state = Number(local.savedAt || 0) >= Number(remote.savedAt || 0) ? local : remote;
+  else state = local || remote;
+  if (state) applyBridgeState(state);
+}
+
 const ACK_NAMES = { 0: "error", 1: "pending", 2: "server", 3: "delivered", 4: "read", 5: "played" };
 function ackName(status) {
   const n = Number(status);
@@ -1104,15 +1205,17 @@ function askLiam(user, phone, isGroup, groupJid, mentioned, replyTo, opts = {}) 
 // Group permissions (3 hours per member per group) and one-time tool approvals
 // ---------------------------------------------------------------------------
 function sweepTemp(now = Date.now()) {
+  let changed = false;
   for (const jid of Object.keys(TEMP)) {
     for (const n of Object.keys(TEMP[jid] || {})) {
       const stamp = TEMP[jid][n];
-      if (!stamp || now - Math.abs(stamp) > PERMISSION_TTL_MS) delete TEMP[jid][n];
+      if (!stamp || now - Math.abs(stamp) > PERMISSION_TTL_MS) { delete TEMP[jid][n]; changed = true; }
     }
-    if (TEMP[jid] && !Object.keys(TEMP[jid]).length) delete TEMP[jid];
+    if (TEMP[jid] && !Object.keys(TEMP[jid]).length) { delete TEMP[jid]; changed = true; }
   }
-  for (const [id, p] of pendingPerms) if (!p || now - p.ts > PENDING_TTL_MS) pendingPerms.delete(id);
-  for (const [id, p] of pendingTools) if (!p || now - p.ts > TOOL_APPROVAL_TTL_MS) pendingTools.delete(id);
+  for (const [id, p] of pendingPerms) if (!p || now - p.ts > PENDING_TTL_MS) { pendingPerms.delete(id); changed = true; }
+  for (const [id, p] of pendingTools) if (!p || now - p.ts > TOOL_APPROVAL_TTL_MS) { pendingTools.delete(id); changed = true; }
+  if (changed) scheduleBridgeStateSave();
 }
 const sweepTimer = setInterval(() => sweepTemp(), 60000);
 if (typeof sweepTimer.unref === "function") sweepTimer.unref();
@@ -1217,6 +1320,7 @@ async function createToolApproval(action, payload, actor, ctx = {}) {
     pendingTools.delete(id);
     throw new BadRequest("no owner is reachable for approval");
   }
+  scheduleBridgeStateSave();
   return p;
 }
 
@@ -1255,6 +1359,7 @@ async function createPermissionRequest(jid, phone, text, quoted) {
         p.promptCount = (p.promptCount || 1) + 1;
         await sendApprovalPrompt(permissionPromptText(p), jid);
       }
+      scheduleBridgeStateSave();
       return p;
     }
   }
@@ -1274,6 +1379,7 @@ async function createPermissionRequest(jid, phone, text, quoted) {
     pendingPerms.delete(id);
     return null;
   }
+  scheduleBridgeStateSave();
   return p;
 }
 
@@ -1281,6 +1387,7 @@ async function executeToolApproval(id, ownerChat) {
   const p = pendingTools.get(id);
   if (!p) return "that approval request has expired or was already used";
   pendingTools.delete(id);
+  scheduleBridgeStateSave();
   if (Date.now() - p.ts > TOOL_APPROVAL_TTL_MS) return "that approval request has expired";
   try {
     const result = await handleAction({ ...p.payload, approved: true }, { approved: true });
@@ -1316,6 +1423,7 @@ async function handleApprovalCommand(text, phone, chat, isGroup) {
       await executeToolApproval(toolId, chat);
     } else {
       pendingTools.delete(toolId);
+      scheduleBridgeStateSave();
       try { await wa.sendMessage(chat, `🚫 denied ${toolId} (${p ? p.action : "tool"}).`); } catch (e) {}
     }
     return true;
@@ -1352,12 +1460,14 @@ async function handleApprovalCommand(text, phone, chat, isGroup) {
     if (!allow) {
       TEMP[p.jid] = TEMP[p.jid] || {};
       TEMP[p.jid][p.phone] = -Date.now();
+      scheduleBridgeStateSave();
       try { await wa.sendMessage(p.jid, `okay, I won't reply to ${p.phone} in this group.`); } catch (e) {}
       if (chat !== p.jid) { try { await wa.sendMessage(chat, `okay — denied ${p.id}.`); } catch (e) {} }
       return true;
     }
     TEMP[p.jid] = TEMP[p.jid] || {};
     TEMP[p.jid][p.phone] = Date.now();
+    scheduleBridgeStateSave();
     try { await wa.sendMessage(p.jid, `okay, I'll reply to ${p.phone} for the next ${humanWindow(PERMISSION_TTL_MS)}.`); } catch (e) {}
     markReadAndTyping(p.jid, p.quoted);
     try {
@@ -3445,6 +3555,10 @@ async function boot() {
     console.log("warn: restore phase failed:", String(e));
   }
 
+  // Held replies, group permissions and pending approvals come back too, so a
+  // redeploy during a WhatsApp send-block does not lose them.
+  try { await loadBridgeState(); } catch (e) { console.log("warn: bridge state restore failed:", String(e)); }
+
   const markerPresent = hasLinkMarker();
   const credsPresent = profileHasCredentials();
   if (!markerPresent || !credsPresent) {
@@ -3494,6 +3608,12 @@ async function shutdown(signal) {
   } catch (e) { console.log("warn: WhatsApp shutdown failed:", String(e)); }
   try { await sync.backupNow(DATA_DIR, SESSION_DIR, DATA_DIR, { session: sessionReady }); }
   catch (e) { console.log("warn: shutdown backup failed:", String(e)); }
+  // Push the small state (held replies, permissions) before exiting, so a
+  // redeploy during a send-block does not drop what we are still holding.
+  try { saveBridgeStateLocal(); } catch (e) {}
+  try {
+    if (sync.uploadState) await sync.uploadState(DATA_DIR, BRIDGE_STATE_OBJECT, bridgeStateSnapshot());
+  } catch (e) {}
   clearTimeout(deadline);
   process.exit(0);
 }
@@ -3522,4 +3642,6 @@ module.exports = {
   SERVER_DOWN_TEXT, startKeepAlive, markReadAndTyping, stopTyping,
   pnFromParticipant, rememberLidContacts, lidContacts, resolvePhone,
   messageText, mediaPlaceholder,
+  loadBridgeState, saveBridgeStateLocal, applyBridgeState, bridgeStateSnapshot,
+  scheduleBridgeStateSave, heldReplies,
 };

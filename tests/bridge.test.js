@@ -618,6 +618,77 @@ test('bridge endpoint security and actions', async (t) => {
     assert.equal(bridge.mediaPlaceholder({ conversation: 'hi' }, 'conversation'), '');
     assert.equal(bridge.mediaPlaceholder(null, 'imageMessage'), '');
   });
+
+  await t.test('bridge state survives a snapshot and re-apply', () => {
+    bridge.pendingPerms.clear();
+    bridge.pendingTools.clear();
+    bridge.heldReplies.length = 0;
+    const group = '2348000000000-9@g.us';
+    const member = '2348333333333';
+    bridge.TEMP[group] = { [member]: Date.now() };
+    bridge.pendingPerms.set('p1', {
+      id: 'p1', jid: group, phone: member, text: 'hi', ts: Date.now(),
+      promptedText: 'hi', promptCount: 1,
+    });
+    bridge.pendingTools.set('t1', {
+      id: 't1', action: 'vps_exec', payload: { command: 'id' }, actor: member,
+      chat: group, isGroup: true, ts: Date.now(),
+    });
+    bridge.heldReplies.push({ target: member + '@s.whatsapp.net', text: 'held', options: { quoted: {} }, at: Date.now() });
+
+    const snap = bridge.bridgeStateSnapshot();
+    assert.equal(snap.v, 1);
+    assert.equal(snap.perms.length, 1);
+    assert.equal(snap.tools.length, 1);
+    assert.equal(snap.held.length, 1);
+    assert.equal(snap.held[0].options, undefined, 'the live quoted object is not persisted');
+    assert.ok(snap.temp[group][member] > 0);
+
+    // Apply onto a clean slate, as a fresh process would.
+    bridge.pendingPerms.clear();
+    bridge.pendingTools.clear();
+    bridge.heldReplies.length = 0;
+    delete bridge.TEMP[group];
+    bridge.applyBridgeState(snap);
+
+    assert.equal(bridge.pendingPerms.has('p1'), true);
+    assert.equal(bridge.pendingTools.has('t1'), true);
+    assert.equal(bridge.TEMP[group][member] > 0, true);
+    assert.equal(bridge.heldReplies.length, 1);
+    assert.equal(bridge.heldReplies[0].text, 'held');
+    bridge.pendingPerms.clear();
+    bridge.pendingTools.clear();
+    bridge.heldReplies.length = 0;
+    delete bridge.TEMP[group];
+  });
+
+  await t.test('drops held replies that expired while Liam was down', () => {
+    const now = Date.now();
+    bridge.heldReplies.length = 0;
+    bridge.applyBridgeState({
+      savedAt: now,
+      held: [
+        { target: '2348000000000@s.whatsapp.net', text: 'fresh', at: now },
+        { target: '2348000000000@s.whatsapp.net', text: 'stale', at: now - (4 * 60 * 60 * 1000) },
+      ],
+    });
+    assert.equal(bridge.heldReplies.length, 1);
+    assert.equal(bridge.heldReplies[0].text, 'fresh');
+    bridge.heldReplies.length = 0;
+  });
+
+  await t.test('loadBridgeState restores the local copy when Supabase is off', async () => {
+    const group = '2348000000000-8@g.us';
+    bridge.pendingPerms.clear();
+    bridge.pendingTools.clear();
+    delete bridge.TEMP[group];
+    bridge.TEMP[group] = { '2348444444444': Date.now() };
+    bridge.saveBridgeStateLocal();
+    delete bridge.TEMP[group];
+    await bridge.loadBridgeState();
+    assert.equal(bridge.TEMP[group]['2348444444444'] > 0, true);
+    delete bridge.TEMP[group];
+  });
 });
 
 test('a reply survives a socket that is briefly closed', async (t) => {
