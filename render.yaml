@@ -23,6 +23,11 @@ services:
       # across deploys; the pairing URL is printed in the deploy logs.
       - key: LIAM_PAIR_TOKEN
         generateValue: true
+      # Baileys log level: silent (default), error, warn, info, debug or trace.
+      # Set it in the dashboard (e.g. to debug a connection) without render.yaml
+      # resetting it back on the next deploy.
+      - key: LIAM_WA_LOG
+        sync: false
 
       # --- Supabase persistence (required for a usable free deployment) ------
       # Set these in the Render dashboard. The bucket is created automatically
@@ -76,6 +81,18 @@ services:
       - key: LIAM_EMAIL_USER
         value: liamagent4q@gmail.com
       - key: LIAM_EMAIL_PASSWORD
+        sync: false
+      - key: LIAM_EMAIL_FOLDER
+        value: INBOX
+
+      # --- Group and DM policy ----------------------------------------------
+      # Dashboard-managed (sync: false) so a deploy never silently changes who
+      # can reach Liam. LIAM_DM_OPEN=1 opens DMs to everyone Liam has seen in a
+      # group; 0 (default) keeps DMs to owners/admins. LIAM_DM_ALLOWLIST adds
+      # extra numbers (comma-separated) on top of that.
+      - key: LIAM_DM_OPEN
+        sync: false
+      - key: LIAM_DM_ALLOWLIST
         sync: false
 
       # --- Behaviour --------------------------------------------------------

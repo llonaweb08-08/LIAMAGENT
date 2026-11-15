@@ -58,10 +58,12 @@ SERPER_API_KEY = ""
 `MOON_KEYS` and `UNO_KEYS` accept a list or a comma-separated string when
 supplied through the environment.
 
-The model chain is **MoonMath -> GLM -> Agnes -> HCN**. Only these
-tool-capable providers run the tool loop. Unorouter remains available as an
-explicit chat-only brain and is never used implicitly. Hugging Face is no
-longer used because the public router rejected the configured models.
+The model chain is **MoonMath -> Agnes -> HCN**. Only these tool-capable
+providers run the tool loop. (The old GLM step was removed: `MOON_FALLBACK` is
+empty by default because `glm-5.3-flash` now returns HTTP 404.) Unorouter
+remains available as an explicit chat-only brain and is never used implicitly.
+Hugging Face is no longer used because the public router rejected the
+configured models.
 
 `liam_config.json` is shared by Python and Node and defines `owners` (phone
 numbers in international format, digits only) and `admins` (name, relation,
@@ -145,9 +147,16 @@ When `SUPABASE_URL` and `SUPABASE_SECRET_KEY` are set:
 - New archives are built with links dereferenced and are validated **before**
   upload. A bad archive can never replace the last good cloud copy.
 - A backup runs three seconds after WhatsApp becomes ready, every
-  `LIAM_BACKUP_INTERVAL_MS` (10 minutes by default), and on graceful shutdown.
-  Nothing is uploaded before `ready`, so an unlinked profile cannot overwrite a
-  linked session.
+  `LIAM_BACKUP_INTERVAL_MS` (30 minutes on Render; the code default is 10
+  minutes), and on graceful shutdown. A transient upload failure is retried
+  once, so a single network blip does not lose the whole cycle. Nothing is
+  uploaded before `ready`, so an unlinked profile cannot overwrite a linked
+  session.
+- The bridge's small runtime state - replies held while WhatsApp is blocking
+  sends, group permissions, and waiting tool approvals - is saved to a local
+  file and to a `bridge_state.json` object in the same bucket, then restored on
+  boot (the newer of the two copies wins). This is what makes those survive a
+  Render redeploy.
 
 Run `npm run seed:supabase` only if you already have a **Baileys**-linked
 profile on another machine and want to reuse it. A Chromium/`whatsapp-web.js`
@@ -234,11 +243,13 @@ steps, are in [docs/DEPLOY_RENDER.md](docs/DEPLOY_RENDER.md).
 - A Playwright screenshot or browser task can still exceed 512 MB because the
   Python agent creates its own Chromium. Keep browser work sequential and avoid
   large screenshots; the WhatsApp bridge itself uses only a few tens of MB.
-- Group permissions and pending approvals are in memory. After a restart,
-  members are asked again and approvals must be re-requested. `dm_open` lives
-  on the ephemeral disk unless `LIAM_DM_OPEN` is set.
-- `@whiskeysockets/baileys` is pinned to the stable 6.7.x line rather than the
-  7.0 release candidate. Re-check `npm audit` when a 7.x stable release ships;
+- Group permissions, pending approvals, and held replies now survive a restart
+  (they ride to Supabase as `bridge_state.json`). A held reply that is released
+  after a restart is delivered as a normal message rather than a quoted reply,
+  because the original quoted message cannot be rebuilt from a saved file.
+  `dm_open` lives on the ephemeral disk unless `LIAM_DM_OPEN` is set.
+- `@whiskeysockets/baileys` is pinned to the `7.0.0-rc14` release candidate.
+  Re-check `npm audit` and the socket behaviour when a 7.x stable release ships;
   do not force a downgrade that breaks the pin.
 - WhatsApp automation is outside WhatsApp's Terms of Service. Aggressive
   outbound messaging increases the risk of an account ban; the rate limit and
