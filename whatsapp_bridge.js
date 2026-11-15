@@ -2130,13 +2130,39 @@ async function instaboxWaitOperation(id, timeoutMs = 180000) {
 }
 
 // The workspace has at most one free machine. Reuse it, or create it once.
+//
+// A configured INSTABOX_MACHINE_ID can belong to a different InstaBox account
+// (for example after swapping in a key from a new account). Trusting it blindly
+// made every call fail, so it is validated against this account's machine list
+// once per process; if it is not there it is ignored and discovery or creation
+// takes over instead.
+let instaboxMachineChecked = false;
+
 async function instaboxMachineId() {
-  if (INSTABOX_MACHINE_ID) return INSTABOX_MACHINE_ID;
-  const list = await instaboxRequest("/v1/machines");
-  const machines = Array.isArray(list && list.machines) ? list.machines : [];
+  if (INSTABOX_MACHINE_ID && instaboxMachineChecked) return INSTABOX_MACHINE_ID;
+  let machines = null;
+  try {
+    const list = await instaboxRequest("/v1/machines");
+    machines = Array.isArray(list && list.machines) ? list.machines : [];
+  } catch (e) {
+    // Cannot reach InstaBox to validate; trust the configured id for this call
+    // and let exec surface the real error.
+    if (INSTABOX_MACHINE_ID) return INSTABOX_MACHINE_ID;
+    throw e;
+  }
+  if (INSTABOX_MACHINE_ID) {
+    const known = machines.some((m) => String((m && m.id) || "") === INSTABOX_MACHINE_ID);
+    if (known) {
+      instaboxMachineChecked = true;
+      return INSTABOX_MACHINE_ID;
+    }
+    console.log(`warn: configured InstaBox machine ${INSTABOX_MACHINE_ID} is not in this account; using the account's own machine instead`);
+    INSTABOX_MACHINE_ID = "";
+  }
   if (machines.length) {
     INSTABOX_MACHINE_ID = String(machines[0].id || "");
     if (INSTABOX_MACHINE_ID) {
+      instaboxMachineChecked = true;
       console.log("info: InstaBox using machine", INSTABOX_MACHINE_ID);
       return INSTABOX_MACHINE_ID;
     }
@@ -2151,6 +2177,7 @@ async function instaboxMachineId() {
   const machine = (done && done.machine) || {};
   INSTABOX_MACHINE_ID = String((op && op.machineId) || machine.id || "");
   if (!INSTABOX_MACHINE_ID) throw new BadRequest("InstaBox created a machine but returned no id");
+  instaboxMachineChecked = true;
   console.log("info: InstaBox created machine", INSTABOX_MACHINE_ID);
   return INSTABOX_MACHINE_ID;
 }
