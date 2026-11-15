@@ -1064,7 +1064,7 @@ function stopAllTyping() {
   for (const target of Array.from(typingTimers.keys())) stopTyping(target);
 }
 
-function askLiam(user, phone, isGroup, groupJid, mentioned, replyTo) {
+function askLiam(user, phone, isGroup, groupJid, mentioned, replyTo, opts = {}) {
   lastAgentRequestAt = Date.now();
   lastAgentError = "";
   const job = () => new Promise((resolve, reject) => {
@@ -1088,7 +1088,9 @@ function askLiam(user, phone, isGroup, groupJid, mentioned, replyTo) {
       g: !!isGroup,
       j: groupJid || "",
       m: !!mentioned,
-      r: !!replyTo
+      r: !!replyTo,
+      // A diagnostic probe must not be remembered as a real conversation turn.
+      n: !!opts.noHistory
     });
     try { proc.stdin.write(payload + "\n"); }
     catch (e) { clearTimeout(timeout); agentPending = null; stopAgent(); reject(e); }
@@ -1238,20 +1240,32 @@ function permissionPromptText(p) {
 async function createPermissionRequest(jid, phone, text, quoted) {
   sweepTemp();
   const bare = bareId(phone);
+  const next = String(text || "").slice(0, 2000);
   for (const p of pendingPerms.values()) {
     if (p.jid === jid && p.phone === bare) {
-      p.text = String(text || "").slice(0, 2000);
+      const changed = next.trim() !== String(p.promptedText || "").trim();
+      p.text = next;
       p.quoted = quoted || p.quoted;
       p.ts = Date.now();
+      // The owner must approve exactly what they can see. If the member's
+      // request changed after the prompt went out, re-send it (capped so a
+      // chatty member cannot spam the group with prompts).
+      if (changed && (p.promptCount || 1) < 3) {
+        p.promptedText = next;
+        p.promptCount = (p.promptCount || 1) + 1;
+        await sendApprovalPrompt(permissionPromptText(p), jid);
+      }
       return p;
     }
   }
   const id = makeId("p");
   const p = {
     id, jid, phone: bare,
-    text: String(text || "").slice(0, 2000),
+    text: next,
     quoted: quoted || null,
     ts: Date.now(),
+    promptedText: next,
+    promptCount: 1,
   };
   pendingPerms.set(id, p);
   trimPending(pendingPerms);
@@ -1307,9 +1321,18 @@ async function handleApprovalCommand(text, phone, chat, isGroup) {
     return true;
   }
 
+  // A bare "yes" must not silently approve a group permission while a *tool*
+  // approval is pending for this same chat (that is why the id is required).
+  // A tool approval pending in a different group must not block this one. In a
+  // DM the owner answers tool approvals from their own chat, so any pending
+  // tool approval is relevant there.
+  const toolPendingHere = isGroup
+    ? [...pendingTools.values()].some((t) => t.chat === chat)
+    : pendingTools.size > 0;
+
   let permId = null;
   if (wanted && pendingPerms.has(wanted)) permId = wanted;
-  else if (!wanted && !pendingTools.size) {
+  else if (!wanted && !toolPendingHere) {
     const list = [...pendingPerms.values()].filter((p) => p.ts && Date.now() - p.ts <= PENDING_TTL_MS);
     // Inside a group only that group's request can be approved; in a DM an
     // owner can approve any request (that's where prompts go when no owner is
@@ -1357,7 +1380,7 @@ async function handleApprovalCommand(text, phone, chat, isGroup) {
       return true;
     }
   }
-  if (!wanted && pendingTools.size) {
+  if (!wanted && toolPendingHere) {
     try {
       await wa.sendMessage(chat, "Tool approvals need the request id — reply `yes t…` or `no t…`.");
     } catch (e) {}
@@ -1729,6 +1752,22 @@ function messageText(content, type) {
   }
 }
 
+// Media Liam cannot read yet. Without a caption these used to be dropped
+// silently, so she looked dead. A clear placeholder keeps the normal addressing
+// and permission flow and lets her answer honestly (see the system prompt).
+function mediaPlaceholder(content, type) {
+  const part = content && content[type];
+  if (!part) return "";
+  switch (type) {
+    case "audioMessage": return "[sent a voice note]";
+    case "imageMessage": return "[sent an image]";
+    case "videoMessage": return "[sent a video]";
+    case "documentMessage": return "[sent a document]";
+    case "stickerMessage": return "[sent a sticker]";
+    default: return "";
+  }
+}
+
 function contentContext(content, type) {
   try {
     const part = content && content[type];
@@ -1755,18 +1794,29 @@ async function handleIncomingMessage(msg) {
     const type = getContentType(content);
     if (!type || type === "protocolMessage" || type === "reactionMessage" ||
         type === "senderKeyDistributionMessage" || type === "messageContextInfo") return;
-    const text = messageText(content, type);
+    let text = messageText(content, type);
+    if (!text) text = mediaPlaceholder(content, type);
     if (!text) return;
 
     const isGroup = isJidGroup(from) || from.endsWith("@g.us");
     const senderId = isGroup
       ? (key.participantAlt || key.participantPn || key.senderPn || key.participant || from)
       : (key.remoteJidAlt || key.senderPn || from);
-    const phone = await resolvePhone(senderId, msg);
+    let phone = await resolvePhone(senderId, msg);
+    let lidOnly = false;
     if (!phone) {
-      lastInboundError = "could not resolve sender to a phone number";
-      console.log("warn: could not resolve sender", senderId);
-      return;
+      // We could not map this sender to a phone number, only a LID. Dropping
+      // them makes Liam look dead, so fall back to the LID as their identity:
+      // a group request can still be approved, and a DM is answered at the LID.
+      const fallback = bareId(senderId);
+      if (!/^\d{6,20}$/.test(fallback)) {
+        lastInboundError = "could not resolve sender to a phone number";
+        console.log("warn: could not resolve sender", senderId);
+        return;
+      }
+      phone = fallback;
+      lidOnly = true;
+      console.log("warn: using LID identity for sender", phone);
     }
     lastInboundPhone = phone;
 
@@ -1780,8 +1830,9 @@ async function handleIncomingMessage(msg) {
       // A direct message can arrive addressed by an anonymous LID instead of a
       // phone number. Replying to the LID can look like it succeeded while never
       // being delivered; the phone-number JID always delivers, and the number is
-      // already resolved for this sender.
-      const dmTarget = (from.endsWith("@lid") && phone) ? `${phone}@s.whatsapp.net` : from;
+      // already resolved for this sender. When only a LID identity is known,
+      // reply to the LID itself (a made-up phone JID would not deliver).
+      const dmTarget = (!lidOnly && from.endsWith("@lid") && phone) ? `${phone}@s.whatsapp.net` : from;
       // .allowdm: owners + admins + known group members. .disallowdm: owners + admins.
       if (!OWNERS.includes(phone) && (text === ".allowdm" || text === ".disallowdm")) return;
       if (OWNERS.includes(phone) && (text === ".allowdm" || text === ".disallowdm")) {
@@ -2145,7 +2196,12 @@ function normalizeGroup(value) {
 }
 
 function assertAllowed(jid) {
-  if (!DM_ALLOW.has(bareId(jid))) throw new BadRequest("recipient is not on the allowlist");
+  const p = bareId(jid);
+  // The receive path uses dmAllowed() (owners, admins, and known members while
+  // DMs are open). Sending must accept the same people, otherwise a member who
+  // can DM Liam gets "not on the allowlist" when she replies with an image or a
+  // voice note. DM_ALLOW also carries the LIAM_DM_ALLOWLIST extras.
+  if (!DM_ALLOW.has(p) && !dmAllowed(p)) throw new BadRequest("recipient is not on the allowlist");
 }
 
 function assertRate() {
@@ -3142,7 +3198,7 @@ const server = http.createServer(async (req, res) => {
           try {
             const reply = await withTimeout(
               askLiam("Call the email_read tool with limit 1 and report the exact result. Use no other tool.",
-                OWNERS[0], false, "", false, false),
+                OWNERS[0], false, "", false, false, { noHistory: true }),
               ASK_TIMEOUT_MS,
               "email probe timed out",
             );
@@ -3173,7 +3229,8 @@ const server = http.createServer(async (req, res) => {
         if (probe === "1") {
           try {
             const reply = await withTimeout(
-              askLiam("Reply with exactly OK and do not use any tools.", OWNERS[0], false, "", false, false),
+              askLiam("Reply with exactly OK and do not use any tools.", OWNERS[0], false, "", false, false,
+                { noHistory: true }),
               ASK_TIMEOUT_MS,
               "probe timed out",
             );
@@ -3464,4 +3521,5 @@ module.exports = {
   messageId, jidForSend, socketUserId, friendlyWaError,
   SERVER_DOWN_TEXT, startKeepAlive, markReadAndTyping, stopTyping,
   pnFromParticipant, rememberLidContacts, lidContacts, resolvePhone,
+  messageText, mediaPlaceholder,
 };

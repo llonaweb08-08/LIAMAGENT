@@ -601,6 +601,58 @@ class AgentToolTests(unittest.TestCase):
         self.assertEqual(trace["steps"], 1)
         self.assertNotIn("secret", json.dumps(trace))
 
+    def test_history_stores_the_turn_once_without_a_sender_prefix(self):
+        member = "2348111222333"
+        try:
+            agent._HISTORY.clear()
+            with mock.patch.object(agent, "call_model",
+                                   return_value={"role": "assistant", "content": "ok"}):
+                agent.run_agent("hi there", member, False, "", False, False)
+            hist = agent._HISTORY.get(member)
+            self.assertIsNotNone(hist)
+            self.assertEqual(hist[-2]["content"], "hi there")
+            self.assertNotIn(f"[{member}]", hist[-2]["content"])
+        finally:
+            agent._HISTORY.clear()
+
+    def test_group_history_stores_the_speaker_prefix_exactly_once(self):
+        member = "2348111222333"
+        group = "120363000000000000@g.us"
+        try:
+            agent._HISTORY.clear()
+            with mock.patch.object(agent, "call_model",
+                                   return_value={"role": "assistant", "content": "ok"}):
+                agent.run_agent("hello", member, True, group, False, False)
+            hist = agent._HISTORY.get(group)
+            self.assertIsNotNone(hist)
+            self.assertEqual(hist[-2]["content"], f"{member}: hello")
+        finally:
+            agent._HISTORY.clear()
+
+    def test_probe_turn_is_not_stored_in_history(self):
+        try:
+            agent._HISTORY.clear()
+            with mock.patch.object(agent, "call_model",
+                                   return_value={"role": "assistant", "content": "OK"}):
+                out = agent.run_agent("probe", OWNER, False, "", False, False, no_history=True)
+            self.assertEqual(out, "OK")
+            self.assertNotIn(OWNER, agent._HISTORY)
+        finally:
+            agent._HISTORY.clear()
+
+    def test_outage_reply_is_not_stored_in_history(self):
+        try:
+            agent._HISTORY.clear()
+            with mock.patch.object(
+                    agent, "call_model",
+                    return_value={"role": "assistant", "content": agent.FALLBACK_TEXT,
+                                  "_brain": "none"}):
+                out = agent.run_agent("hi", OWNER, False, "", False, False)
+            self.assertEqual(out, agent.FALLBACK_TEXT)
+            self.assertNotIn(OWNER, agent._HISTORY)
+        finally:
+            agent._HISTORY.clear()
+
     def test_turn_stops_running_tools_once_the_budget_is_gone(self):
         ran = []
 

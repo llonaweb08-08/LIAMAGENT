@@ -561,6 +561,63 @@ test('bridge endpoint security and actions', async (t) => {
     const phone = await bridge.resolvePhone('100000000000006@lid', { key: { remoteJid: GROUP } });
     assert.equal(phone, '2348000000006');
   });
+
+  await t.test('sending is allowed to anyone who can DM Liam', async () => {
+    const known = '2348111111111';
+    bridge.setDmOpen(false);
+    bridge.rememberKnownMember(known);
+    assert.throws(() => bridge.assertAllowed(known), /allowlist/, 'closed DMs reject a known member');
+    bridge.setDmOpen(true);
+    assert.doesNotThrow(() => bridge.assertAllowed(known), 'open DMs allow a known member');
+    assert.throws(() => bridge.assertAllowed('2348999999999'), /allowlist/, 'an unknown number is still rejected');
+    bridge.setDmOpen(false);
+  });
+
+  await t.test('re-sends a permission prompt when the request changes', async () => {
+    bridge.pendingPerms.clear();
+    const group = '2348000000000-123@g.us';
+    const member = '2348999999999';
+    fake.sent.length = 0;
+    const p1 = await bridge.createPermissionRequest(group, member, 'first', { key: { id: 'T1' } });
+    assert.equal(fake.sent.length, 1, 'the first request sends one prompt');
+    const p2 = await bridge.createPermissionRequest(group, member, 'first', { key: { id: 'T2' } });
+    assert.equal(p2.id, p1.id, 'the same member keeps one pending request');
+    assert.equal(fake.sent.length, 1, 'an unchanged request is not re-sent');
+    await bridge.createPermissionRequest(group, member, 'second', { key: { id: 'T3' } });
+    assert.equal(fake.sent.length, 2, 'a changed request is re-sent');
+    await bridge.createPermissionRequest(group, member, 'third', { key: { id: 'T4' } });
+    assert.equal(fake.sent.length, 3);
+    await bridge.createPermissionRequest(group, member, 'fourth', { key: { id: 'T5' } });
+    assert.equal(fake.sent.length, 3, 're-sends are capped so a chatty member cannot spam');
+    bridge.pendingPerms.clear();
+  });
+
+  await t.test('a pending tool approval in another group does not block a permission', async () => {
+    bridge.pendingPerms.clear();
+    bridge.pendingTools.clear();
+    const groupA = '2348000000000-1@g.us';
+    const groupB = '2348000000000-2@g.us';
+    const memberB = '2348222222222';
+    await bridge.createToolApproval('vps_exec', { command: 'id' }, '2348111111111',
+      { chat: groupA, isGroup: true });
+    await bridge.createPermissionRequest(groupB, memberB, 'hi', { key: { id: 'T' } });
+    const handled = await bridge.handleApprovalCommand('yes', OWNER, groupB, true);
+    assert.equal(handled, true);
+    assert.ok(bridge.TEMP[groupB] && bridge.TEMP[groupB][memberB] > 0, 'the permission is approved');
+    assert.equal(bridge.pendingTools.size, 1, 'the unrelated tool approval is untouched');
+    bridge.pendingPerms.clear();
+    bridge.pendingTools.clear();
+  });
+
+  await t.test('labels media Liam cannot read', async () => {
+    assert.equal(bridge.mediaPlaceholder({ audioMessage: {} }, 'audioMessage'), '[sent a voice note]');
+    assert.equal(bridge.mediaPlaceholder({ imageMessage: {} }, 'imageMessage'), '[sent an image]');
+    assert.equal(bridge.mediaPlaceholder({ videoMessage: {} }, 'videoMessage'), '[sent a video]');
+    assert.equal(bridge.mediaPlaceholder({ documentMessage: {} }, 'documentMessage'), '[sent a document]');
+    assert.equal(bridge.mediaPlaceholder({ stickerMessage: {} }, 'stickerMessage'), '[sent a sticker]');
+    assert.equal(bridge.mediaPlaceholder({ conversation: 'hi' }, 'conversation'), '');
+    assert.equal(bridge.mediaPlaceholder(null, 'imageMessage'), '');
+  });
 });
 
 test('a reply survives a socket that is briefly closed', async (t) => {
