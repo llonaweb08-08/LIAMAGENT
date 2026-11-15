@@ -156,6 +156,26 @@ test('bridge endpoint security and actions', async (t) => {
     assert.deepEqual(sent.content, { text: 'hello' });
   });
 
+  await t.test('delivers a progress update to the chat where the task was given', async () => {
+    fake.sent.length = 0;
+    await bridge.deliverProgress('I am on the signup page', { to: GROUP, isGroup: true });
+    assert.equal(fake.sent.at(-1).to, GROUP);
+    assert.equal(fake.sent.at(-1).content.text, 'I am on the signup page');
+
+    fake.sent.length = 0;
+    const dm = `${OWNER}@s.whatsapp.net`;
+    await bridge.deliverProgress('done, what next?', { to: dm, isGroup: false });
+    assert.equal(fake.sent.at(-1).to, dm);
+    assert.equal(fake.sent.at(-1).content.text, 'done, what next?');
+  });
+
+  await t.test('a blank progress update sends nothing', async () => {
+    fake.sent.length = 0;
+    await bridge.deliverProgress('   ', { to: GROUP, isGroup: true });
+    await bridge.deliverProgress('hi', null);
+    assert.equal(fake.sent.length, 0);
+  });
+
   await t.test('rejects owner-only actions from non-owners', async () => {
     const response = await post({
       action: 'send', to: OWNER, text: 'hello', sender: '2348000000000',

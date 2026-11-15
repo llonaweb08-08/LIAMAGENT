@@ -203,6 +203,16 @@ profile cannot be imported; pair on Render instead (see the runbook).
   command.
 - `shell_exec` (owner-only) runs inside the Render container. It is not
   persistent and is not the pentest machine; use `vps_exec`/InstaBox for that.
+- While a long task runs (browser work, a shell command, a slow search) Liam
+  posts short progress updates to the chat where the task was given - quoted in
+  a group, plain in a DM - so the person hears progress without sending another
+  message. If the model does not report a milestone itself, a heartbeat fires
+  before a slow tool (throttled by `LIAM_PROGRESS_GAP`, default 20s).
+- Tool timeouts are effectively unlimited: the browser, screenshot, shell and
+  InstaBox caps default to minutes-to-an-hour and the agent's own turn budget
+  (`LIAM_TURN_BUDGET`) is 55 minutes. The **one** outer safety net is the
+  bridge wait (`LIAM_ASK_TIMEOUT_MS`, 1 hour): a genuinely stuck turn ends there
+  instead of hanging forever.
 
 ## Tests and checks
 

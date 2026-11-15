@@ -114,7 +114,7 @@ def vps_exec(command: str, timeout: int = 120, cwd: str = "",
              group: bool = False) -> str:
     """Run a command on the InstaBox VM; non-owner calls need approval."""
     try:
-        seconds = max(1, min(600, int(timeout or 120)))
+        seconds = max(1, min(3600, int(timeout or 120)))
     except (TypeError, ValueError):
         seconds = 120
     return _post(

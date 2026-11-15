@@ -392,7 +392,9 @@ function isLiamMessage(jid, id) {
 }
 const pendingPerms = new Map();  // id -> { id, jid, phone, text, ts }
 const pendingTools = new Map();  // id -> { id, action, payload, actor, chat, isGroup, ts }
-const ASK_TIMEOUT_MS = envInt("LIAM_ASK_TIMEOUT_MS", 240000, 15000);
+// The single outer safety net. Liam's tools are otherwise unlimited, so this is
+// the only thing that ends a genuinely stuck turn instead of hanging forever.
+const ASK_TIMEOUT_MS = envInt("LIAM_ASK_TIMEOUT_MS", 3600000, 15000);
 // Baileys pings WhatsApp every interval, and gives up on a silent socket after
 // interval + 5s. WhatsApp drops the stream (428) when we cannot answer in time,
 // which is what happens when a heavy job (headless Chromium, a backup) blocks
@@ -817,6 +819,16 @@ function startAgent() {
         failPending(new Error(msg.error));
         continue;
       }
+      if (Object.prototype.hasOwnProperty.call(msg, "progress")) {
+        // An interim update from the agent. Post it to the chat where the task
+        // was given so the person hears progress without re-triggering Liam.
+        deliverProgress(msg.progress, agentPending && agentPending.progress)
+          .catch((e) => {
+            console.log("warn: progress update failed:",
+              String(e && e.message ? e.message : e).slice(0, 160));
+          });
+        continue;
+      }
       if (Object.prototype.hasOwnProperty.call(msg, "reply")) {
         if (!agentPending) { console.log("[agent] stale reply ignored"); continue; }
         const p = agentPending; agentPending = null;
@@ -1182,7 +1194,7 @@ function askLiam(user, phone, isGroup, groupJid, mentioned, replyTo, opts = {}) 
         reject(new Error("agent timed out"));
       }
     }, ASK_TIMEOUT_MS);
-    agentPending = { resolve, reject, timeout, id };
+    agentPending = { resolve, reject, timeout, id, progress: opts.progress || null };
     const payload = JSON.stringify({
       u: String(user == null ? "" : user),
       s: String(phone == null ? "" : phone),
@@ -1471,7 +1483,8 @@ async function handleApprovalCommand(text, phone, chat, isGroup) {
     try { await wa.sendMessage(p.jid, `okay, I'll reply to ${p.phone} for the next ${humanWindow(PERMISSION_TTL_MS)}.`); } catch (e) {}
     markReadAndTyping(p.jid, p.quoted);
     try {
-      const reply = await askLiam(p.text, p.phone, true, p.jid, true, false);
+      const reply = await askLiam(p.text, p.phone, true, p.jid, true, false,
+        { progress: { to: p.jid, isGroup: true, quoted: p.quoted } });
       const sent = await sendLong(p.jid, reply, p.quoted ? { quoted: p.quoted } : undefined);
       rememberLiamMessage(p.jid, messageId(sent));
     } catch (e) {
@@ -1830,6 +1843,20 @@ async function sendLong(to, text, options) {
   return last;
 }
 
+// An interim progress update from the agent. It goes to the chat where the task
+// was given: quoted in a group (so it threads under the triggering message) and
+// plain in a DM. A group progress message is remembered as a Liam message, so a
+// reply to it still counts as addressing Liam.
+function deliverProgress(text, where) {
+  const body = String(text == null ? "" : text).slice(0, 2000).trim();
+  if (!body || !where || !where.to) return Promise.resolve(null);
+  const options = (where.isGroup && where.quoted) ? { quoted: where.quoted } : undefined;
+  return sendLong(where.to, body, options).then((sent) => {
+    if (where.isGroup) rememberLiamMessage(where.to, messageId(sent));
+    return sent;
+  });
+}
+
 async function ownerPresentInGroup(jid) {
   return (await ownerIdsInGroup(jid)).length > 0;
 }
@@ -1963,7 +1990,8 @@ async function handleIncomingMessage(msg) {
       markReadAndTyping(dmTarget, msg);
       let reply;
       try {
-        reply = await askLiam(text, phone, false, "", false, false);
+        reply = await askLiam(text, phone, false, "", false, false,
+          { progress: { to: dmTarget, isGroup: false, quoted: null } });
       } catch (e) {
         console.log(`\n💀 agent failed for DM ${phone}: ${String(e)}`);
         try { await sendLong(dmTarget, SERVER_DOWN_TEXT); } catch (e2) {}
@@ -2023,7 +2051,8 @@ async function handleIncomingMessage(msg) {
     markReadAndTyping(from, msg);
     let reply;
     try {
-      reply = await askLiam(text, phone, true, from, mentioned, replyingToLiam);
+      reply = await askLiam(text, phone, true, from, mentioned, replyingToLiam,
+        { progress: { to: from, isGroup: true, quoted: msg } });
     } catch (e) {
       console.log(`\n💀 agent failed in group ${from}: ${String(e)}`);
       try { await sendLong(from, SERVER_DOWN_TEXT, { quoted: msg }); } catch (e2) {}
@@ -2212,7 +2241,7 @@ async function instaboxExec(command, timeoutSeconds = 120, cwd = "") {
   const text = String(command || "").trim();
   if (!text) throw new BadRequest("command is empty");
   if (text.length > 8000) throw new BadRequest("command is too long");
-  const timeout = Math.min(600, Math.max(1, Number.parseInt(timeoutSeconds, 10) || 120));
+  const timeout = Math.min(3600, Math.max(1, Number.parseInt(timeoutSeconds, 10) || 120));
   const machine = await instaboxMachineId();
   await instaboxEnsureRunning(machine);
   const body = { cmd: text, timeoutSeconds: timeout };
@@ -3051,11 +3080,10 @@ const server = http.createServer(async (req, res) => {
                 "    return (p.stdout + p.stderr).strip()",
                 "print('installing playwright...')",
                 "print(run('python3', '-m', 'pip', 'install', '--quiet', '--disable-pip-version-check', '--break-system-packages', '--target', '" + INSTABOX_PYLIB_DIR + "', 'playwright')[-1200:])",
-                "try:",
-                "    import playwright",
-                "    print('playwright module is now importable')",
-                "except Exception as e:",
-                "    print('still missing:', e)",
+                // Verify in a FRESH process. This interpreter looked for the
+                // package before the install created the directory, so importing
+                // it here would still report 'missing' even on success.
+                "print('playwright import:', run('python3', '-c', 'import playwright.sync_api as p; print(p.__name__)'))",
               ].join("\n");
               try {
                 const inst = await instaboxExec("PYTHONPATH=" + INSTABOX_PYLIB_DIR + " python3 - <<'PY'\n" + installScript + "\nPY", 420);
@@ -3670,5 +3698,5 @@ module.exports = {
   pnFromParticipant, rememberLidContacts, lidContacts, resolvePhone,
   messageText, mediaPlaceholder,
   loadBridgeState, saveBridgeStateLocal, applyBridgeState, bridgeStateSnapshot,
-  scheduleBridgeStateSave, heldReplies,
+  scheduleBridgeStateSave, heldReplies, deliverProgress,
 };

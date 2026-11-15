@@ -96,16 +96,19 @@ services:
         sync: false
 
       # --- Behaviour --------------------------------------------------------
-      # Bridge waits a little longer than the agent's per-turn budget so a heavy
-      # browser turn is not cut off mid-work, but a stuck turn still ends.
+      # Liam's tools are effectively unlimited so a real browser task can run to
+      # completion. The bridge wait is the ONE outer safety net: a genuinely
+      # stuck turn ends here instead of hanging forever. It is deliberately a
+      # little longer than the agent's own per-turn budget so the agent can
+      # answer gracefully before the bridge gives up.
       - key: LIAM_ASK_TIMEOUT_MS
-        value: "180000"
+        value: "3600000"
       - key: LIAM_TURN_BUDGET
-        value: "120"
+        value: "3300"
       - key: LIAM_BROWSER_TIMEOUT
-        value: "90"
+        value: "1800"
       - key: LIAM_SCREENSHOT_TIMEOUT
-        value: "75"
+        value: "900"
       - key: LIAM_GROUP_PERMISSION_MS
         value: "10800000"
       - key: LIAM_TOOL_APPROVAL_MS

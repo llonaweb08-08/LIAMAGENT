@@ -165,8 +165,8 @@ class ToolClientTests(unittest.TestCase):
                 wa.vps_exec("id", timeout=9999, cwd="/tmp", sender="2347", chat="1@g.us", group=True),
                 "exit=0")
         post.assert_called_once_with(
-            "vps_exec", command="id", timeout=600, cwd="/tmp", sender="2347",
-            chat="1@g.us", group=True, http_timeout=630)
+            "vps_exec", command="id", timeout=3600, cwd="/tmp", sender="2347",
+            chat="1@g.us", group=True, http_timeout=3630)
 
     def test_vps_file_transport_sends_base64_and_path(self):
         with mock.patch.object(wa, "_post", return_value="uploaded 3 bytes") as post:
@@ -420,6 +420,82 @@ class AgentToolTests(unittest.TestCase):
             report.assert_not_called()
             self.assertEqual(agent._tools_for(OWNER)["report_progress"]("hi"), "sent")
         report.assert_called_once_with("hi", sender=OWNER)
+
+    def test_progress_tool_is_available_to_members_and_writes_a_json_line(self):
+        schemas = {s["function"]["name"] for s in agent._schemas_for(MEMBER)}
+        self.assertIn("progress", schemas)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.assertEqual(agent._tools_for(MEMBER)["progress"]("  I'm on the signup page  "), "sent")
+        self.assertEqual(json.loads(buf.getvalue().strip()),
+                         {"progress": "I'm on the signup page"})
+
+    def test_emit_progress_ignores_blank_and_truncates_long_text(self):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.assertEqual(agent._emit_progress("   "), "nothing to report")
+        self.assertEqual(buf.getvalue().strip(), "")
+        buf2 = io.StringIO()
+        with contextlib.redirect_stdout(buf2):
+            self.assertEqual(agent._emit_progress("y" * 5000), "sent")
+        value = json.loads(buf2.getvalue().strip())["progress"]
+        self.assertLessEqual(len(value), 1201)
+        self.assertTrue(value.endswith("…"))
+
+    def test_auto_progress_heartbeat_fires_before_a_slow_tool(self):
+        emitted = []
+        steps = {"n": 0}
+
+        def fake_model(messages, sender, **kwargs):
+            steps["n"] += 1
+            if steps["n"] == 1:
+                return {"role": "assistant", "content": "", "tool_calls": [
+                    {"id": "c1", "function": {
+                        "name": "browser_task",
+                        "arguments": json.dumps({"script": "print(1)"})}}]}
+            return {"role": "assistant", "content": "done", "_brain": "moonmath"}
+
+        try:
+            with mock.patch.object(agent, "call_model", side_effect=fake_model), \
+                    mock.patch.dict(agent.TOOLS, {"browser_task": lambda script="": "ok"}), \
+                    mock.patch.object(agent, "_emit_progress",
+                                      side_effect=lambda text: emitted.append(text) or "sent"):
+                agent.run_agent("do it", OWNER, False, "", False, False)
+        finally:
+            agent._LAST_PROGRESS_AT = 0.0
+        self.assertTrue(emitted, "a slow tool should send a heartbeat")
+        self.assertIn("browser", emitted[0].lower())
+
+    def test_auto_progress_is_throttled_between_slow_tools(self):
+        emitted = []
+        steps = {"n": 0}
+
+        def fake_model(messages, sender, **kwargs):
+            steps["n"] += 1
+            if steps["n"] == 1:
+                return {"role": "assistant", "content": "", "tool_calls": [
+                    {"id": "c1", "function": {
+                        "name": "browser_task",
+                        "arguments": json.dumps({"script": "print(1)"})}},
+                    {"id": "c2", "function": {
+                        "name": "browser_task",
+                        "arguments": json.dumps({"script": "print(2)"})}},
+                ]}
+            return {"role": "assistant", "content": "done", "_brain": "moonmath"}
+
+        def fake_emit(text):
+            emitted.append(text)
+            agent._LAST_PROGRESS_AT = time.monotonic()  # a fresh update just went out
+            return "sent"
+
+        try:
+            with mock.patch.object(agent, "call_model", side_effect=fake_model), \
+                    mock.patch.dict(agent.TOOLS, {"browser_task": lambda script="": "ok"}), \
+                    mock.patch.object(agent, "_emit_progress", side_effect=fake_emit):
+                agent.run_agent("do it", OWNER, False, "", False, False)
+        finally:
+            agent._LAST_PROGRESS_AT = 0.0
+        self.assertEqual(len(emitted), 1, "the second slow tool must be throttled")
 
     def test_brain_switch_is_owner_only(self):
         self.assertIn("only the owner", agent.switch_brain("moon", MEMBER))
@@ -687,6 +763,25 @@ class AgentToolTests(unittest.TestCase):
             self.assertEqual(agent._clamp_timeout(90), 2.0)
         finally:
             agent._DEADLINE = None
+
+    def test_long_tool_timeouts_are_allowed_inside_a_generous_budget(self):
+        try:
+            agent._DEADLINE = time.monotonic() + 3000
+            self.assertEqual(agent._clamp_timeout(1800), 1800.0)
+            self.assertEqual(agent._clamp_timeout(900), 900.0)
+        finally:
+            agent._DEADLINE = None
+
+    def test_turn_budget_default_is_generous(self):
+        seen = {}
+
+        def fake_model(messages, sender, **kwargs):
+            seen["deadline"] = agent._DEADLINE
+            return {"role": "assistant", "content": "hi", "_brain": "moonmath"}
+
+        with mock.patch.object(agent, "call_model", side_effect=fake_model):
+            agent.run_agent("hi", OWNER, False, "", False, False)
+        self.assertGreater(seen["deadline"] - time.monotonic(), 600)
 
     def test_offline_mode_short_circuits_without_network(self):
         with mock.patch.object(agent, "OFFLINE", True), \
