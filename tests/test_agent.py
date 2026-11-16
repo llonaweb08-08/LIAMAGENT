@@ -1163,6 +1163,31 @@ class HygieneTests(unittest.TestCase):
         self.assertIn("moonmath", out.getvalue())
         self.assertNotIn("sk-", out.getvalue())
 
+    def test_debug_probe_voice_reports_audio(self):
+        path = str(Path(TEST_DATA) / "probe.mp3")
+        Path(path).write_bytes(b"ID3probe")
+        with mock.patch.object(liam_voice, "synth",
+                               return_value=(path, "audio/mpeg")) as synth:
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(debug_probe.main(["--voice", "hello"]), 0)
+        synth.assert_called_once_with("hello")
+        payload = json.loads(out.getvalue())
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["mimetype"], "audio/mpeg")
+        self.assertGreater(payload["bytes"], 0)
+        self.assertFalse(Path(path).exists())
+
+    def test_debug_probe_voice_reports_failure(self):
+        with mock.patch.object(liam_voice, "synth",
+                               side_effect=liam_voice.VoiceUnavailable("edge down")):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(debug_probe.main(["--voice"]), 1)
+        payload = json.loads(out.getvalue())
+        self.assertFalse(payload["ok"])
+        self.assertIn("edge down", payload["error"])
+
     def test_check_domain_has_no_import_side_effect(self):
         path = ROOT / "tools" / "check_domain.py"
         spec = importlib.util.spec_from_file_location("check_domain", path)

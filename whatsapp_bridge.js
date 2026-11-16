@@ -3402,6 +3402,14 @@ const server = http.createServer(async (req, res) => {
           const result = await runProbeScript([brain, "--keys", "--json"], 120000);
           return sendJson(res, 200, { ...base, brainProbe: { brain, ...result } });
         }
+        if (probe === "voice") {
+          // Synthesize a short voice note with the free engine and report the
+          // result (mimetype + bytes). No WhatsApp message is sent.
+          const text = String(url.searchParams.get("text") || "").trim();
+          const result = await runProbeScript(
+            text ? ["--voice", text] : ["--voice"], 90000);
+          return sendJson(res, 200, { ...base, voiceProbe: result });
+        }
         if (probe === "1") {
           try {
             const reply = await withTimeout(

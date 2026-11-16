@@ -17,6 +17,7 @@ import argparse
 import contextlib
 import io
 import json
+import os
 
 import agent
 
@@ -60,7 +61,32 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--json", action="store_true", dest="as_json", help="print JSON")
     parser.add_argument("--browser", metavar="URL",
                         help="run the real browser_task tool against URL and print JSON")
+    parser.add_argument("--voice", metavar="TEXT", nargs="?",
+                        const="Liam here. Voice notes are working.",
+                        help="synthesize a voice note with the free engine and print JSON")
     args = parser.parse_args(argv)
+
+    if args.voice is not None:
+        # Exercise the real voice engine (edge-tts -> ffmpeg) without sending a
+        # WhatsApp message. The temporary audio is deleted before we return.
+        import liam_voice
+        result = {"ok": True, "voice": liam_voice.describe()}
+        path = ""
+        try:
+            path, mime = liam_voice.synth(args.voice)
+            result["mimetype"] = mime
+            result["bytes"] = os.path.getsize(path)
+        except Exception as e:
+            result["ok"] = False
+            result["error"] = f"{type(e).__name__}: {e}"
+        finally:
+            if path:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+        print(json.dumps(result))
+        return 0 if result["ok"] else 1
 
     if args.browser:
         # Exercise the production browser tool exactly as a chat turn would,
