@@ -210,7 +210,7 @@ def _normalize_message(m):
 
 
 def _http_post(base, model, key, messages, tools, timeout):
-    payload = {"model": model, "messages": messages, "temperature": 0.5, "max_tokens": 1200}
+    payload = {"model": model, "messages": messages, "temperature": 0.5}
     if tools:
         payload["tools"] = tools
     req = urllib.request.Request(

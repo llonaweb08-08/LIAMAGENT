@@ -2455,13 +2455,16 @@ async function handleAction(d, ctx = {}) {
     assertRate();
     const file = assertOutbox(d.path);
     const mimetype = audioMime(d.mimetype, file);
+    const sendMime = (mimetype === "audio/ogg" || mimetype === "audio/opus")
+      ? "audio/ogg; codecs=opus"
+      : mimetype;
     const sent = await wa.sendMessage(to, {
       audio: fs.readFileSync(file),
-      mimetype,
+      mimetype: sendMime,
       ptt: true,
     });
     const id = messageId(sent) || "sent";
-    console.log(`info: voice note sent to ${jidType(to)} (${mimetype}, id ${id})`);
+    console.log(`info: voice note sent to ${jidType(to)} (${sendMime}, id ${id})`);
     return id;
   }
 
