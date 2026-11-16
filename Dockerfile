@@ -15,7 +15,8 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PLAYWRIGHT_BROWSERS_PATH=/home/liam/.cache/ms-playwright
 
 # python3 is Debian's Python 3.11; sqlite3 gives the bridge a WAL-safe snapshot
-# tool, and ffmpeg converts Liam's WAV replies to WhatsApp voice notes.
+# tool, and ffmpeg converts Liam's synthesized voice to a WhatsApp OGG/Opus
+# voice note (edge-tts returns MP3).
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates curl ffmpeg gzip python3 python3-pip python3-venv \
         sqlite3 tar \

@@ -49,7 +49,7 @@ MOON_KEYS = ["...", "..."]
 UNO_KEYS = ["...", "..."]
 AGNES_KEY = "..."
 HCN_KEY = "..."
-GOOGLE_API_KEY = ""   # optional: image generation and voice notes
+GOOGLE_API_KEY = ""   # optional: image generation (voice notes are free)
 TAVILY_API_KEY = ""   # optional: search providers
 BRAVE_API_KEY = ""
 SERPER_API_KEY = ""
@@ -193,9 +193,10 @@ profile cannot be imported; pair on Render instead (see the runbook).
   Liam by name. A member then needs a **3-hour permission per group**. The
   permission prompt goes to the group when an owner is present, otherwise to
   every owner by DM.
-- Members get chat, memory, web search, and web fetch. Owner-only tools include
-  outbound sends, screenshots, file access, `shell_exec`, `browser_task`,
-  brain switching, permissions, and progress reports.
+- Members get chat, memory, web search, web fetch, and voice notes in their own
+  chat. Owner-only tools include outbound sends to other people, screenshots,
+  file access, `shell_exec`, `browser_task`, brain switching, voice switching,
+  permissions, and progress reports.
 - `vps_exec` runs on the InstaBox VM through its REST API, never through
   inbound SSH. Any non-owner request creates a **one-time, 10-minute owner
   approval** that shows the exact tool and arguments. The owner must reply with
@@ -264,6 +265,12 @@ steps, are in [docs/DEPLOY_RENDER.md](docs/DEPLOY_RENDER.md).
 - WhatsApp automation is outside WhatsApp's Terms of Service. Aggressive
   outbound messaging increases the risk of an account ban; the rate limit and
   allowlist reduce, but do not remove, that risk.
-- Image generation and voice notes need `GOOGLE_API_KEY`. Voice output is a
-  valid WAV; it is converted to OGG/Opus only when `ffmpeg` is on `PATH`
-  (installed in the Docker image).
+- Image generation needs `GOOGLE_API_KEY`. Voice notes do **not**: they are
+  synthesized free with the Microsoft neural voices (`edge-tts`, no key, no
+  quota) and converted to OGG/Opus when `ffmpeg` is on `PATH` (installed in the
+  Docker image). Two voices ship: voice 1 = Ezinne (Nigerian English, default)
+  and voice 2 = Sonia (British English); the owner switches with
+  "switch to voice 2", and the choice is kept in the memory database so it
+  survives a restart. Anyone Liam replies to may ask for a voice note in the
+  chat they are in; only the owner can send one elsewhere. `GOOGLE_API_KEY`, if
+  set, is used only as a backup TTS path when edge-tts fails.

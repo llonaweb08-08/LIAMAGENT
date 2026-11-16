@@ -13,6 +13,8 @@ import tempfile
 import requests
 
 import liam_google
+import liam_keys
+import liam_voice
 
 def _bridge_url() -> str:
     # Prefer explicit URL; otherwise follow the same container-local port the
@@ -83,12 +85,25 @@ def send_image(to: str, path: str, sender: str | None = None) -> str:
     return _post("image", to=to, path=path, sender=sender, http_timeout=120)
 
 
-def send_voice(to: str, text: str, sender: str | None = None) -> str:
-    path, mimetype = liam_google.synth_voice(text)
+def send_voice(to: str, text: str, sender: str | None = None,
+               chat: str | None = None, group: bool = False) -> str:
+    """Synthesize a voice note and send it.
+
+    The free edge-tts engine is tried first. If it fails and a Google key is
+    configured, the older Gemini TTS path is used as a backup; otherwise the
+    failure is reported honestly instead of sending silence.
+    """
+    try:
+        path, mimetype = liam_voice.synth(text)
+    except liam_voice.VoiceUnavailable as exc:
+        if str(getattr(liam_keys, "GOOGLE_API_KEY", "") or "").strip():
+            path, mimetype = liam_google.synth_voice(text)
+        else:
+            raise ToolError(str(exc)) from exc
     try:
         return _post(
             "voice", to=to, path=path, mimetype=mimetype, sender=sender,
-            http_timeout=120)
+            chat=chat, group=bool(group), http_timeout=120)
     finally:
         try:
             os.remove(path)

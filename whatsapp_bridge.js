@@ -2440,9 +2440,18 @@ async function handleAction(d, ctx = {}) {
   }
 
   if (action === "voice") {
-    assertOwner(d);
+    // Owners may send a voice note to any allowed recipient. Members may send
+    // one only to the chat they are already in, so a member can never voice a
+    // third party. The agent defaults 'to' to the current chat; this check is
+    // the backstop if it is ever asked for somewhere else.
+    const actor = bareId(d.sender);
+    if (!/^\d{6,20}$/.test(actor)) throw new BadRequest("missing sender context");
     const to = normalizeRecipient(d.to, true);
     if (!isGroupJid(to)) assertAllowed(to);
+    if (!OWNERS.includes(actor)) {
+      const chat = normalizeRecipient(d.chat, true);
+      if (chat !== to) throw new BadRequest("you can only send a voice note to this chat");
+    }
     assertRate();
     const file = assertOutbox(d.path);
     const mimetype = audioMime(d.mimetype, file);
@@ -2979,7 +2988,9 @@ const server = http.createServer(async (req, res) => {
           // Read-only: which optional integrations have credentials present.
           // Never exposes the values, only whether each tool can work.
           config: {
-            imageVoice: !!process.env.GOOGLE_API_KEY,
+            // Images still need a Google key; voice notes are free (edge-tts).
+            image: !!process.env.GOOGLE_API_KEY,
+            voice: true,
             search: {
               tavily: !!process.env.TAVILY_API_KEY,
               brave: !!process.env.BRAVE_API_KEY,

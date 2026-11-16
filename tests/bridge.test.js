@@ -301,6 +301,25 @@ test('bridge endpoint security and actions', async (t) => {
     assert.match(response.json.msg, /owner/);
   });
 
+  await t.test('lets a member voice-note only their own chat', async () => {
+    const voice = path.join(OUTBOX, 'member.wav');
+    fs.writeFileSync(voice, Buffer.from('RIFF'));
+    const allowed = await post({
+      action: 'voice', to: GROUP, chat: GROUP, path: voice, mimetype: 'audio/wav',
+      sender: '2348000000000',
+    });
+    assert.equal(allowed.status, 200);
+    assert.equal(fake.sent.at(-1).to, GROUP);
+    assert.equal(fake.sent.at(-1).content.ptt, true);
+
+    const elsewhere = await post({
+      action: 'voice', to: `${OWNER}@s.whatsapp.net`, chat: GROUP, path: voice,
+      mimetype: 'audio/wav', sender: '2348000000000',
+    });
+    assert.equal(elsewhere.status, 400);
+    assert.match(elsewhere.json.msg, /only send a voice note to this chat/);
+  });
+
   await t.test('sends an image only from the outbox', async () => {
     const outside = path.join(APP, 'secret.txt');
     fs.writeFileSync(outside, 'secret');

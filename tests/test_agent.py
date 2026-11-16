@@ -35,6 +35,7 @@ import agent  # noqa: E402
 import debug_probe  # noqa: E402
 import liam_google  # noqa: E402
 import liam_keys  # noqa: E402
+import liam_voice  # noqa: E402
 import whatsapp_liam as wa  # noqa: E402
 
 OWNER = agent.OWNERS[0]
@@ -120,22 +121,44 @@ class ToolClientTests(unittest.TestCase):
     def test_send_voice_posts_mimetype_and_cleans_up(self):
         path = str(Path(TEST_DATA) / "voice.wav")
         Path(path).write_bytes(b"RIFF")
-        with mock.patch.object(liam_google, "synth_voice", return_value=(path, "audio/wav")), \
+        with mock.patch.object(liam_voice, "synth", return_value=(path, "audio/wav")), \
                 mock.patch.object(wa, "_post", return_value="sent") as post:
             self.assertEqual(wa.send_voice("2347000000000@c.us", "hello"), "sent")
         post.assert_called_once_with(
             "voice", to="2347000000000@c.us", path=path, mimetype="audio/wav",
-            sender=None, http_timeout=120)
+            sender=None, chat=None, group=False, http_timeout=120)
         self.assertFalse(Path(path).exists())
 
     def test_send_voice_cleans_up_when_send_fails(self):
         path = str(Path(TEST_DATA) / "voice-fail.wav")
         Path(path).write_bytes(b"RIFF")
-        with mock.patch.object(liam_google, "synth_voice", return_value=(path, "audio/wav")), \
+        with mock.patch.object(liam_voice, "synth", return_value=(path, "audio/wav")), \
                 mock.patch.object(wa, "_post", side_effect=wa.ToolError("bridge down")):
             with self.assertRaises(wa.ToolError):
                 wa.send_voice("2347000000000@c.us", "hello")
         self.assertFalse(Path(path).exists())
+
+    def test_send_voice_falls_back_to_google_when_key_present(self):
+        path = str(Path(TEST_DATA) / "voice-google.wav")
+        Path(path).write_bytes(b"RIFF")
+        with mock.patch.object(liam_voice, "synth",
+                               side_effect=liam_voice.VoiceUnavailable("edge down")), \
+                mock.patch.object(liam_keys, "GOOGLE_API_KEY", "test-key"), \
+                mock.patch.object(liam_google, "synth_voice",
+                                  return_value=(path, "audio/wav")) as google, \
+                mock.patch.object(wa, "_post", return_value="sent"):
+            self.assertEqual(wa.send_voice("2347000000000@c.us", "hello"), "sent")
+        google.assert_called_once_with("hello")
+
+    def test_send_voice_reports_failure_without_a_google_key(self):
+        with mock.patch.object(liam_voice, "synth",
+                               side_effect=liam_voice.VoiceUnavailable("edge down")), \
+                mock.patch.object(liam_keys, "GOOGLE_API_KEY", ""), \
+                mock.patch.object(liam_google, "synth_voice") as google:
+            with self.assertRaises(wa.ToolError) as ctx:
+                wa.send_voice("2347000000000@c.us", "hello")
+        self.assertIn("edge down", str(ctx.exception))
+        google.assert_not_called()
 
     def test_stop_and_control_files(self):
         with mock.patch.object(wa, "_post", return_value="stopping") as post:
@@ -351,10 +374,30 @@ class AgentToolTests(unittest.TestCase):
         image.assert_called_once_with(OWNER, "a cat", sender=OWNER)
         with mock.patch.object(agent, "send_voice", return_value="sent") as voice:
             agent._tools_for(OWNER, "1@g.us", True)["send_voice"](text="hi")
-        voice.assert_called_once_with("1@g.us", "hi", sender=OWNER)
+        voice.assert_called_once_with(
+            "1@g.us", "hi", sender=OWNER, chat="1@g.us", group=True)
+        with mock.patch.object(agent, "send_voice", return_value="sent") as voice:
+            agent._tools_for(OWNER, "", False)["send_voice"](text="hi")
+        voice.assert_called_once_with(
+            OWNER, "hi", sender=OWNER, chat=OWNER, group=False)
         with mock.patch.object(agent, "screenshot", return_value="sent") as shot:
             agent._tools_for(OWNER, "", False)["screenshot"](url="https://x.com")
         shot.assert_called_once_with(OWNER, "https://x.com", sender=OWNER)
+
+    def test_members_can_send_voice_to_their_own_chat(self):
+        with mock.patch.object(agent, "send_voice", return_value="sent") as voice:
+            result = agent._tools_for(MEMBER, "1@g.us", True)["send_voice"](text="hi")
+        self.assertEqual(result, "sent")
+        voice.assert_called_once_with(
+            "1@g.us", "hi", sender=MEMBER, chat="1@g.us", group=True)
+
+    def test_only_the_owner_can_switch_voice(self):
+        with mock.patch.object(agent, "switch_voice", return_value="okay") as switch:
+            self.assertIn("only the owner",
+                          agent._tools_for(MEMBER)["switch_voice"]("2"))
+            switch.assert_not_called()
+            self.assertEqual(agent._tools_for(OWNER)["switch_voice"]("2"), "okay")
+            switch.assert_called_once_with("2", sender=OWNER)
 
     def test_memory_tools_are_scoped(self):
         with mock.patch.object(agent, "remember", return_value="ok") as remember:
@@ -959,6 +1002,61 @@ class SearchAndFetchTests(unittest.TestCase):
             self.assertEqual(cm.call_args.kwargs["brain"], "moonmath")
         finally:
             image.unlink(missing_ok=True)
+
+
+class VoiceHelperTests(unittest.TestCase):
+    def setUp(self):
+        self.original = liam_voice.get_voice()
+        self.addCleanup(lambda: liam_voice.set_voice(self.original))
+
+    def test_normalize_choice_accepts_names_and_numbers(self):
+        self.assertEqual(liam_voice.normalize_choice("2"), "2")
+        self.assertEqual(liam_voice.normalize_choice("switch to voice 2"), "2")
+        self.assertEqual(liam_voice.normalize_choice("use the Sonia voice"), "2")
+        self.assertEqual(liam_voice.normalize_choice("voice 1"), "1")
+        self.assertEqual(liam_voice.normalize_choice("Ezinne"), "1")
+        self.assertIsNone(liam_voice.normalize_choice("banana"))
+
+    def test_voice_choice_persists(self):
+        self.assertEqual(liam_voice.set_voice("2"), "2")
+        self.assertEqual(liam_voice.get_voice(), "2")
+        self.assertEqual(liam_voice.set_voice("1"), "1")
+        self.assertEqual(liam_voice.get_voice(), "1")
+
+    def test_unknown_voice_is_rejected(self):
+        self.assertIsNone(liam_voice.set_voice("nope"))
+        self.assertEqual(liam_voice.get_voice(), self.original)
+
+    def test_describe_names_the_voice(self):
+        liam_voice.set_voice("2")
+        self.assertIn("Sonia", liam_voice.describe())
+
+    def test_empty_text_is_rejected(self):
+        with self.assertRaises(liam_voice.VoiceUnavailable):
+            liam_voice.synth("   ")
+
+    def test_synth_returns_audio_and_cleans_up(self):
+        async def fake_save(text, voice, out):
+            self.assertEqual(voice, "en-NG-EzinneNeural")
+            Path(out).write_bytes(b"ID3fake")
+
+        with mock.patch.object(liam_voice, "_save", fake_save), \
+                mock.patch.object(liam_voice, "_to_ogg", return_value=None):
+            path, mime = liam_voice.synth("hello there")
+        try:
+            self.assertEqual(mime, "audio/mpeg")
+            self.assertTrue(path.endswith(".mp3"))
+            self.assertTrue(Path(path).exists())
+        finally:
+            os.remove(path)
+
+    def test_synth_reports_failure(self):
+        async def boom(text, voice, out):
+            raise RuntimeError("no network")
+
+        with mock.patch.object(liam_voice, "_save", boom):
+            with self.assertRaises(liam_voice.VoiceUnavailable):
+                liam_voice.synth("hello")
 
 
 class GoogleHelperTests(unittest.TestCase):

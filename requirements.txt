@@ -1,4 +1,7 @@
 # Runtime dependencies for the Python agent (pinned to the versions tested here).
 requests==2.34.2
 playwright==1.64.1
-# ffmpeg is optional (for voice note conversion to OGG/Opus)
+# Free Microsoft neural voices for WhatsApp voice notes: no API key, no quota.
+edge-tts==7.3.1
+# ffmpeg (a system package, installed in the Dockerfile) converts the voice to
+# OGG/Opus; without it the MP3 edge-tts returns is still a valid voice note.
