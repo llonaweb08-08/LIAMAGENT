@@ -751,6 +751,7 @@ class AgentToolTests(unittest.TestCase):
     def test_probe_turn_is_not_stored_in_history(self):
         try:
             agent._HISTORY.clear()
+            agent.save_chat_history(OWNER, [], agent.HISTORY_MESSAGES)
             with mock.patch.object(agent, "call_model",
                                    return_value={"role": "assistant", "content": "OK"}):
                 out = agent.run_agent("probe", OWNER, False, "", False, False, no_history=True)
@@ -758,10 +759,12 @@ class AgentToolTests(unittest.TestCase):
             self.assertNotIn(OWNER, agent._HISTORY)
         finally:
             agent._HISTORY.clear()
+            agent.save_chat_history(OWNER, [], agent.HISTORY_MESSAGES)
 
     def test_outage_reply_is_not_stored_in_history(self):
         try:
             agent._HISTORY.clear()
+            agent.save_chat_history(OWNER, [], agent.HISTORY_MESSAGES)
             with mock.patch.object(
                     agent, "call_model",
                     return_value={"role": "assistant", "content": agent.FALLBACK_TEXT,
@@ -771,6 +774,7 @@ class AgentToolTests(unittest.TestCase):
             self.assertNotIn(OWNER, agent._HISTORY)
         finally:
             agent._HISTORY.clear()
+            agent.save_chat_history(OWNER, [], agent.HISTORY_MESSAGES)
 
     def test_turn_stops_running_tools_once_the_budget_is_gone(self):
         ran = []

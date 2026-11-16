@@ -101,9 +101,12 @@ def send_voice(to: str, text: str, sender: str | None = None,
         else:
             raise ToolError(str(exc)) from exc
     try:
-        return _post(
+        result = _post(
             "voice", to=to, path=path, mimetype=mimetype, sender=sender,
             chat=chat, group=bool(group), http_timeout=120)
+        if str(result).strip() == "sent":
+            return "sent"
+        return f"voice note sent to WhatsApp ({mimetype}, id={result})"
     finally:
         try:
             os.remove(path)

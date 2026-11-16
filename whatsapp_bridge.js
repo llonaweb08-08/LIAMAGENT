@@ -2460,7 +2460,9 @@ async function handleAction(d, ctx = {}) {
       mimetype,
       ptt: true,
     });
-    return messageId(sent) || "sent";
+    const id = messageId(sent) || "sent";
+    console.log(`info: voice note sent to ${jidType(to)} (${mimetype}, id ${id})`);
+    return id;
   }
 
   if (action === "leave") {
@@ -3583,7 +3585,11 @@ server.listen(PORT, HOST, () => {
   const port = address && typeof address === "object" ? address.port : PORT;
   console.log(`⚙️ Liam's tool endpoint is live on :${port} (HOST=${HOST})`);
   const base = PUBLIC_URL || `http://127.0.0.1:${port}`;
-  console.log(`🔗 Pairing page: ${base}/pair?token=${PAIR_TOKEN}`);
+  // Do not print the full pairing token to logs (shared log aggregators may
+  // capture it). Use LIAM_PAIR_TOKEN / the persisted pair_token file to build
+  // the full /pair?token=... URL when needed.
+  const masked = PAIR_TOKEN.length > 8 ? `${PAIR_TOKEN.slice(0, 4)}…${PAIR_TOKEN.slice(-4)}` : "(set)";
+  console.log(`🔗 Pairing page: ${base}/pair?token=<redacted> (token ${masked})`);
 });
 
 async function initializeWhatsApp(reason) {
