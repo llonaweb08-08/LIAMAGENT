@@ -1,0 +1,18 @@
+repos:
+  - repo: local
+    hooks:
+      - id: scan-secrets
+        name: Scan for likely plaintext secrets
+        entry: python scripts/scan_secrets.py
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-commit]
+      - id: scan-secrets-local
+        name: Warn on local secret files (liam_secrets.py)
+        entry: python scripts/scan_secrets.py --include-local
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-push]
+        verbose: true

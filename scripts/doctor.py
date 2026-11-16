@@ -85,6 +85,18 @@ def _check_health(base: str) -> bool:
     return True
 
 
+def _run_secret_scan(include_local: bool = False) -> tuple[int, str]:
+    cmd = [sys.executable, str(ROOT / "scripts" / "scan_secrets.py")]
+    if include_local:
+        cmd.append("--include-local")
+    try:
+        p = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True, timeout=60)
+        out = (p.stdout or "").strip() or (p.stderr or "").strip()
+        return p.returncode, out.splitlines()[0] if out else ""
+    except Exception as exc:
+        return 2, f"scan failed: {exc}"
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Diagnose a Liam install or deployment.")
     parser.add_argument("--deploy", action="store_true",
@@ -100,6 +112,20 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  repository: {ROOT}")
     print(f"  python: {sys.version.split()[0]}")
     print(f"  node: {_node_version()}")
+
+    scan_rc, scan_msg = _run_secret_scan(include_local=False)
+    print(f"  secret scan (tracked): {'ok' if scan_rc == 0 else 'findings/error'}")
+    if scan_rc == 1:
+        errors.append("tracked secret scan reported findings; run `python scripts/scan_secrets.py` for redacted details")
+    elif scan_rc not in (0, 1):
+        warnings.append(f"could not complete tracked secret scan ({scan_msg})")
+
+    secrets_file = ROOT / "liam_secrets.py"
+    if secrets_file.exists():
+        warnings.append(
+            "local liam_secrets.py is present (gitignored). Prefer env/secret-manager values in deploys; "
+            "run `python scripts/scan_secrets.py --include-local` for a redacted local check"
+        )
 
     try:
         config = json.loads((ROOT / "liam_config.json").read_text(encoding="utf-8"))
@@ -135,7 +161,14 @@ def main(argv: list[str] | None = None) -> int:
     if not has_session:
         warnings.append("no saved WhatsApp profile: pair with /qr or /pair after deploying")
 
-    _check_db(_db_path(), errors, warnings)
+    db_path = _db_path()
+    repo_db = ROOT / "liam_memory.db"
+    if db_path.resolve() != repo_db.resolve() and repo_db.exists():
+        warnings.append(
+            f"both canonical DB ({db_path}) and repo-root DB ({repo_db}) exist; "
+            "use one canonical LIAM_DB/LIAM_DATA_DIR to avoid backup/inspection drift"
+        )
+    _check_db(db_path, errors, warnings)
 
     providers = {
         "MoonMath keys": len([k for k in liam_keys.MOON_KEYS if k]),

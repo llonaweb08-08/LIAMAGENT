@@ -5,6 +5,7 @@ then from the local (git-ignored) liam_secrets.py file.
 """
 
 import os
+import sys
 
 # Many free providers sit behind Cloudflare and reject Python's default
 # User-Agent. One shared browser UA keeps every provider probe and call equal.
@@ -15,13 +16,35 @@ BROWSER_UA = os.environ.get(
 )
 
 
+_LOCAL_SECRETS_WARNED = False
+
+
+def _warn_local_secrets_once() -> None:
+    global _LOCAL_SECRETS_WARNED
+    if _LOCAL_SECRETS_WARNED:
+        return
+    _LOCAL_SECRETS_WARNED = True
+    try:
+        # Do not print secret values. This warns when a local gitignored secrets
+        # file is present so operators can prefer env/secret-manager configuration.
+        sys.stderr.write(
+            "[security] liam_secrets.py is in use; prefer environment/secret-manager "
+            "configuration for deploys. Run `python scripts/scan_secrets.py --include-local` "
+            "for a redacted local check.\n"
+        )
+        sys.stderr.flush()
+    except Exception:
+        pass
+
+
 def _secret(name, default):
     value = os.environ.get(name)
     if value:
         return value
     try:
-        import liam_secrets
-        value = getattr(liam_secrets, name, None)
+        import liam_secrets as _liam_secrets
+        _warn_local_secrets_once()
+        value = getattr(_liam_secrets, name, None)
         if value:
             return value
     except ImportError:
