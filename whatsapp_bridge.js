@@ -2530,7 +2530,7 @@ async function handleAction(d, ctx = {}) {
 // ---------------------------------------------------------------------------
 // HTTP server: health, readiness, pairing pages, local tool API
 // ---------------------------------------------------------------------------
-function sendJson(res, status, payload) {
+function sendJson(res, status, payload, headers = {}) {
   if (res.writableEnded) return;
   const body = JSON.stringify(payload);
   res.writeHead(status, {
@@ -2538,11 +2538,12 @@ function sendJson(res, status, payload) {
     "Content-Length": Buffer.byteLength(body),
     "Cache-Control": "no-store",
     "X-Content-Type-Options": "nosniff",
+    ...headers,
   });
   res.end(body);
 }
 
-function sendHtml(res, status, html) {
+function sendHtml(res, status, html, headers = {}) {
   if (res.writableEnded) return;
   res.writeHead(status, {
     "Content-Type": "text/html; charset=utf-8",
@@ -2550,6 +2551,7 @@ function sendHtml(res, status, html) {
     "X-Content-Type-Options": "nosniff",
     "Referrer-Policy": "no-referrer",
     "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; img-src data:; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
+    ...headers,
   });
   res.end(html);
 }
@@ -2567,6 +2569,61 @@ function safeEqual(a, b) {
 }
 
 function pairTokenOk(value) { return !!value && safeEqual(value, PAIR_TOKEN); }
+
+function parseCookies(req) {
+  const header = String(req.headers.cookie || "");
+  const out = {};
+  for (const part of header.split(";")) {
+    const i = part.indexOf("=");
+    if (i < 0) continue;
+    const k = part.slice(0, i).trim();
+    if (!k) continue;
+    try { out[k] = decodeURIComponent(part.slice(i + 1).trim()); }
+    catch (e) { out[k] = part.slice(i + 1).trim(); }
+  }
+  return out;
+}
+
+function wantsSecureCookie(req) {
+  const xf = String(req.headers["x-forwarded-proto"] || "").toLowerCase();
+  if (xf === "https") return true;
+  return String(PUBLIC_URL || "").toLowerCase().startsWith("https://");
+}
+
+function pairCookieHeader(req) {
+  const attrs = [
+    `liam_pair=${encodeURIComponent(PAIR_TOKEN)}`,
+    "Path=/",
+    "HttpOnly",
+    "SameSite=Strict",
+    "Max-Age=43200",
+  ];
+  if (wantsSecureCookie(req)) attrs.push("Secure");
+  return attrs.join("; ");
+}
+
+function clearPairCookieHeader(req) {
+  const attrs = [
+    "liam_pair=",
+    "Path=/",
+    "HttpOnly",
+    "SameSite=Strict",
+    "Max-Age=0",
+  ];
+  if (wantsSecureCookie(req)) attrs.push("Secure");
+  return attrs.join("; ");
+}
+
+function pairAuth(req, url, extraToken = "") {
+  const header = String(req.headers.authorization || "");
+  if (header.startsWith("Bearer ") && pairTokenOk(header.slice(7))) return { ok: true, via: "header" };
+  const cookies = parseCookies(req);
+  if (pairTokenOk(cookies.liam_pair)) return { ok: true, via: "cookie" };
+  if (pairTokenOk(extraToken)) return { ok: true, via: "body" };
+  const q = String((url && url.searchParams.get("token")) || "");
+  if (pairTokenOk(q)) return { ok: true, via: "query" };
+  return { ok: false, via: "" };
+}
 
 function authorized(req) {
   const header = String(req.headers.authorization || "");
@@ -2626,14 +2683,21 @@ function pageShell(title, body) {
     `</style></head><body>${body}</body></html>`;
 }
 
-function pairPage(token, opts = {}) {
-  const action = `/pair?token=${encodeURIComponent(token)}`;
+function pairPage(opts = {}) {
+  // Best practice: never place the pairing token in URLs. Authentication is via
+  // HttpOnly cookie (set after a secure token submission/redirect) or a token
+  // field/header in a request. The page uses clean URLs only.
+  const action = "/pair";
   const value = opts.phone ? escapeHtml(opts.phone) : BOT_PHONE;
   let result = "";
   if (opts.error) {
     result = `<div style="border:1px solid #7f1d1d;background:#2a1215;padding:.8rem 1rem;border-radius:.5rem;margin-bottom:1rem">` +
       `<p style="margin:0;color:#fecaca"><strong>Could not get a code.</strong> ${escapeHtml(opts.error)}</p></div>`;
   }
+  const tokenField = opts.needToken
+    ? `<label for="token" style="display:block;margin-top:.8rem">Pairing token</label>` +
+      `<input id="token" name="token" type="password" autocomplete="off" placeholder="Paste LIAM_PAIR_TOKEN" required>`
+    : "";
   if (opts.code) {
     const formatted = opts.code.length === 8 ? `${opts.code.slice(0, 4)}-${opts.code.slice(4)}` : opts.code;
     const asked = opts.requestedAt ? new Date(opts.requestedAt).toLocaleTimeString() : "";
@@ -2649,6 +2713,7 @@ function pairPage(token, opts = {}) {
     return pageShell("Liam pairing", `<h1>Pair Liam</h1>${result}` +
       `<form method="post" action="${action}">` +
       `<input type="hidden" name="phone" value="${value}">` +
+      `${tokenField}` +
       `<button type="submit">Get a new code</button></form>`);
   }
   return pageShell("Liam pairing", `<h1>Pair Liam</h1>${result}` +
@@ -2664,8 +2729,9 @@ function pairPage(token, opts = {}) {
     `<form method="post" action="${action}">` +
     `<label for="phone">Bot number with country code (digits only)</label>` +
     `<input id="phone" name="phone" inputmode="numeric" autocomplete="tel" value="${value}" required>` +
+    `${tokenField}` +
     `<button type="submit">Get pairing code</button></form>` +
-    `<p style="opacity:.7">This page only asks WhatsApp for a code when you press the button.</p>`);
+    `<p style="opacity:.7">This page only asks WhatsApp for a code when you press the button. Sensitive actions use a secure session (no token in the URL).</p>`);
 }
 
 function readBody(req, limit) {
@@ -2925,8 +2991,11 @@ const server = http.createServer(async (req, res) => {
       return;
     }
     if (pathname === "/cancelpair") {
-      const token = url.searchParams.get("token") || "";
-      if (!pairTokenOk(token)) return sendJson(res, 403, { ok: false, msg: "forbidden" });
+      const auth = pairAuth(req, url);
+      if (!auth.ok) return sendJson(res, 403, { ok: false, msg: "forbidden" });
+      if (auth.via === "query") {
+        return sendJson(res, 302, { ok: true }, { Location: "/cancelpair", "Set-Cookie": pairCookieHeader(req) });
+      }
       try {
         await Promise.race([
           cancelPairing(),
@@ -2939,8 +3008,11 @@ const server = http.createServer(async (req, res) => {
       return;
     }
     if (pathname === "/reset") {
-      const token = url.searchParams.get("token") || "";
-      if (!pairTokenOk(token)) return sendJson(res, 403, { ok: false, msg: "forbidden" });
+      const auth = pairAuth(req, url);
+      if (!auth.ok) return sendJson(res, 403, { ok: false, msg: "forbidden" });
+      if (auth.via === "query") {
+        return sendJson(res, 302, { ok: true }, { Location: "/reset", "Set-Cookie": pairCookieHeader(req) });
+      }
       if (waState === "ready") return sendJson(res, 409, { ok: false, msg: "already linked; a reset is not needed" });
       try {
         await Promise.race([
@@ -2955,9 +3027,17 @@ const server = http.createServer(async (req, res) => {
     }
     if (pathname === "/diag") {
       // Unlinked-startup diagnostics, plus safe message counters once linked.
-      // Message text is never stored or exposed; the token is required.
-      const token = url.searchParams.get("token") || "";
-      if (!pairTokenOk(token)) return sendHtml(res, 403, pageShell("Forbidden", "<h1>Forbidden</h1>"));
+      // Message text is never stored or exposed; the pairing token is required.
+      // Best practice: do not keep tokens in URLs; accept query token once only
+      // to establish a secure session cookie, then redirect to a clean URL.
+      const auth = pairAuth(req, url);
+      if (!auth.ok) return sendHtml(res, 403, pageShell("Forbidden", "<h1>Forbidden</h1><p>Provide the pairing token via Authorization header or a secure pairing session.</p>"));
+      if (auth.via === "query") {
+        const clean = new URL(url.toString());
+        clean.searchParams.delete("token");
+        const loc = clean.pathname + (clean.search || "");
+        return sendHtml(res, 302, "", { Location: loc, "Set-Cookie": pairCookieHeader(req) });
+      }
       const agentAlive = !!(agentProc && agentProc.exitCode === null && !agentProc.killed);
       if (waState === "ready") {
         const base = {
@@ -3464,22 +3544,33 @@ const server = http.createServer(async (req, res) => {
       return;
     }
     if (pathname === "/qr") {
-      const token = url.searchParams.get("token") || "";
-      if (!pairTokenOk(token)) return sendHtml(res, 403, pageShell("Forbidden", "<h1>Forbidden</h1>"));
+      const auth = pairAuth(req, url);
+      if (!auth.ok) return sendHtml(res, 403, pageShell("Forbidden", "<h1>Forbidden</h1><p>Provide the pairing token via a secure pairing session or Authorization header.</p>"));
+      if (auth.via === "query") {
+        return sendHtml(res, 302, "", { Location: "/qr", "Set-Cookie": pairCookieHeader(req) });
+      }
       return sendHtml(res, 200, pageShell("Liam pairing",
         `<h1>Liam uses a phone code</h1>` +
-        `<p>QR linking has been removed. Open the <a href="/pair?token=${encodeURIComponent(token)}">pairing page</a> ` +
+        `<p>QR linking has been removed. Open the <a href="/pair">pairing page</a> ` +
         `and press the button to get an 8-character code.</p>` +
         (waState === "ready" ? `<p>Liam is already linked.</p>` : "")));
     }
     if (pathname === "/pair") {
-      const token = url.searchParams.get("token") || "";
-      if (!pairTokenOk(token)) return sendHtml(res, 403, pageShell("Forbidden", "<h1>Forbidden</h1>"));
+      const auth = pairAuth(req, url);
+      if (!auth.ok) {
+        // Allow entering the token securely in the page (no token in URL).
+        return sendHtml(res, 403, pairPage({ needToken: true, error: "Enter the pairing token to continue." }));
+      }
+      if (auth.via === "query") {
+        const phone = url.searchParams.get("phone") || "";
+        const loc = "/pair" + (phone ? `?phone=${encodeURIComponent(phone)}` : "");
+        return sendHtml(res, 302, "", { Location: loc, "Set-Cookie": pairCookieHeader(req) });
+      }
       const phone = url.searchParams.get("phone") || "";
       // Never create a code just because the page was opened or reloaded. That
       // silently burned another request against WhatsApp's rate limit and handed
       // out codes nobody typed. Only the button (POST /pair) asks for a code.
-      return sendHtml(res, 200, pairPage(token, { phone }));
+      return sendHtml(res, 200, pairPage({ phone }));
     }
   }
 
@@ -3493,17 +3584,71 @@ const server = http.createServer(async (req, res) => {
         if (/application\/json/i.test(type)) data = JSON.parse(raw || "{}");
         else data = Object.fromEntries(new URLSearchParams(raw || ""));
         bodyToken = String(data.token || "");
-        const token = bodyToken || String(url.searchParams.get("token") || "");
-        if (!pairTokenOk(token)) return sendHtml(res, 403, pageShell("Forbidden", "<h1>Forbidden</h1>"));
+        const auth = pairAuth(req, url, bodyToken);
+        if (!auth.ok) return sendHtml(res, 403, pairPage({ needToken: true, error: "Invalid or missing pairing token." }));
         const phone = String(data.phone || "");
         const code = await requestPairing(phone);
-        sendHtml(res, 200, pairPage(token, { phone, code, requestedAt: lastPairAt }));
+        const headers = (auth.via === "body" || auth.via === "query") ? { "Set-Cookie": pairCookieHeader(req) } : {};
+        // Always render on clean URL context; token never echoed into page/URL.
+        sendHtml(res, 200, pairPage({ phone, code, requestedAt: lastPairAt }), headers);
       } catch (e) {
         // The body was already read above, so reuse its token instead of
         // re-reading the request (which is not possible) or ignoring it.
-        const token = bodyToken || String(url.searchParams.get("token") || "");
-        if (!pairTokenOk(token)) return sendHtml(res, 403, pageShell("Forbidden", "<h1>Forbidden</h1>"));
-        sendHtml(res, 400, pairPage(token, { error: e instanceof BadRequest ? e.message : "pairing failed" }));
+        const auth = pairAuth(req, url, bodyToken);
+        if (!auth.ok) return sendHtml(res, 403, pairPage({ needToken: true, error: "Invalid or missing pairing token." }));
+        const headers = (auth.via === "body" || auth.via === "query") ? { "Set-Cookie": pairCookieHeader(req) } : {};
+        sendHtml(res, 400, pairPage({ error: e instanceof BadRequest ? e.message : "pairing failed" }), headers);
+      }
+    })();
+    return;
+  }
+
+  // Allow tokened POST for state-changing pairing actions (best practice over GET).
+  if (req.method === "POST" && pathname === "/cancelpair") {
+    (async () => {
+      let bodyToken = "";
+      try {
+        const raw = await readBody(req, 8 * 1024);
+        let data = {};
+        const type = String(req.headers["content-type"] || "");
+        if (/application\/json/i.test(type)) data = JSON.parse(raw || "{}");
+        else data = Object.fromEntries(new URLSearchParams(raw || ""));
+        bodyToken = String(data.token || "");
+        const auth = pairAuth(req, url, bodyToken);
+        if (!auth.ok) return sendJson(res, 403, { ok: false, msg: "forbidden" });
+        await Promise.race([
+          cancelPairing(),
+          sleep(20000).then(() => { throw new Error("cancel timed out"); }),
+        ]);
+        const headers = (auth.via === "body" || auth.via === "query") ? { "Set-Cookie": pairCookieHeader(req) } : {};
+        sendJson(res, 200, { ok: true, ...statusPayload() }, headers);
+      } catch (e) {
+        sendJson(res, 500, { ok: false, msg: String(e && e.message ? e.message : e) });
+      }
+    })();
+    return;
+  }
+  if (req.method === "POST" && pathname === "/reset") {
+    (async () => {
+      let bodyToken = "";
+      try {
+        const raw = await readBody(req, 8 * 1024);
+        let data = {};
+        const type = String(req.headers["content-type"] || "");
+        if (/application\/json/i.test(type)) data = JSON.parse(raw || "{}");
+        else data = Object.fromEntries(new URLSearchParams(raw || ""));
+        bodyToken = String(data.token || "");
+        const auth = pairAuth(req, url, bodyToken);
+        if (!auth.ok) return sendJson(res, 403, { ok: false, msg: "forbidden" });
+        if (waState === "ready") return sendJson(res, 409, { ok: false, msg: "already linked; a reset is not needed" });
+        await Promise.race([
+          resetWhatsApp("manual reset"),
+          sleep(180000).then(() => { throw new Error("reset timed out"); }),
+        ]);
+        const headers = (auth.via === "body" || auth.via === "query") ? { "Set-Cookie": pairCookieHeader(req) } : {};
+        sendJson(res, 200, { ok: true, ...statusPayload() }, headers);
+      } catch (e) {
+        sendJson(res, 500, { ok: false, msg: String(e && e.message ? e.message : e) });
       }
     })();
     return;

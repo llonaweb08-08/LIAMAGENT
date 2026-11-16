@@ -109,16 +109,20 @@ function request(port, options = {}) {
     if (!options.chunked) headers['Content-Length'] = Buffer.byteLength(body);
   }
   if (options.token !== undefined) headers.Authorization = `Bearer ${options.token}`;
+  if (options.cookie) headers.Cookie = options.cookie;
 
-  return new Promise((resolve, reject) => {
+  const maxRedirects = options.maxRedirects == null ? 0 : options.maxRedirects;
+  const doReq = (reqPath, redirectsLeft, cookieJar) => new Promise((resolve, reject) => {
     let settled = false;
     const finish = (fn, value) => {
       if (settled) return;
       settled = true;
       fn(value);
     };
+    const h = { ...headers };
+    if (cookieJar) h.Cookie = cookieJar;
     const req = http.request({
-      host: '127.0.0.1', port, path: options.path || '/', method, headers, agent: false,
+      host: '127.0.0.1', port, path: reqPath || '/', method, headers: h, agent: false,
     }, (res) => {
       let data = '';
       res.setEncoding('utf8');
@@ -126,7 +130,37 @@ function request(port, options = {}) {
       res.on('end', () => {
         let json = null;
         try { json = JSON.parse(data); } catch (e) {}
-        finish(resolve, { status: res.statusCode, json, text: data });
+        if (redirectsLeft > 0 && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+          const setCookie = res.headers['set-cookie'];
+          let nextCookie = cookieJar;
+          if (Array.isArray(setCookie) && setCookie.length) {
+            // keep simple cookie jar (name=value) for follow-up
+            const pairs = setCookie.map((c) => String(c).split(';')[0]).filter(Boolean);
+            nextCookie = pairs.join('; ');
+          }
+          const loc = res.headers.location.startsWith('http')
+            ? new URL(res.headers.location).pathname + new URL(res.headers.location).search
+            : res.headers.location;
+          // follow redirects as GET
+          const followMethod = options.followMethod || 'GET';
+          const follow = { ...options, method: followMethod, path: loc, maxRedirects: 0, cookie: nextCookie };
+          // For follow, no body
+          const fh = { Host: `127.0.0.1:${port}`, Connection: 'close' };
+          if (nextCookie) fh.Cookie = nextCookie;
+          const fr = http.request({ host: '127.0.0.1', port, path: loc, method: followMethod, headers: fh, agent: false }, (r2) => {
+            let d2 = '';
+            r2.setEncoding('utf8');
+            r2.on('data', (c) => { d2 += c; });
+            r2.on('end', () => {
+              let j2 = null; try { j2 = JSON.parse(d2); } catch (e) {}
+              finish(resolve, { status: r2.statusCode, json: j2, text: d2, headers: r2.headers, redirect: { status: res.statusCode, location: res.headers.location, headers: res.headers } });
+            });
+          });
+          fr.on('error', (error) => finish(reject, error));
+          fr.end();
+          return;
+        }
+        finish(resolve, { status: res.statusCode, json, text: data, headers: res.headers });
       });
     });
     req.on('error', (error) => finish(reject, error));
@@ -134,6 +168,7 @@ function request(port, options = {}) {
     if (options.chunked) req.end();
     else req.end(body);
   });
+  return doReq(options.path || '/', maxRedirects, options.cookie || null);
 }
 
 test('bridge endpoint security and actions', async (t) => {
@@ -439,24 +474,35 @@ test('bridge endpoint security and actions', async (t) => {
   await t.test('protects pairing pages with the pairing token', async () => {
     const qrForbidden = await request(port, { method: 'GET', path: '/qr' });
     assert.equal(qrForbidden.status, 403);
-    const qrOk = await request(port, { method: 'GET', path: `/qr?token=${bridge.PAIR_TOKEN}` });
+    // Best practice: token in URL is accepted once to establish a secure session
+    // cookie, then redirected to a clean URL (token must not remain in URL).
+    const qrOk = await request(port, { method: 'GET', path: `/qr?token=${bridge.PAIR_TOKEN}`, maxRedirects: 1 });
     assert.equal(qrOk.status, 200);
     assert.match(qrOk.text, /phone code/);
+    assert.equal(qrOk.redirect && qrOk.redirect.status, 302);
+    assert.equal(qrOk.redirect && qrOk.redirect.location, '/qr');
     const pairForbidden = await request(port, { method: 'GET', path: '/pair' });
     assert.equal(pairForbidden.status, 403);
   });
 
   await t.test('generates an 8-character pairing code only on submit', async () => {
+    // Opening the page (via secure token bootstrap -> clean URL) must not create a code.
     const page = await request(port, {
       method: 'GET',
       path: `/pair?token=${bridge.PAIR_TOKEN}&phone=${OWNER}`,
+      maxRedirects: 1,
     });
     assert.equal(page.status, 200);
+    assert.equal(page.redirect && page.redirect.status, 302);
+    assert.match(page.redirect.location, /^\/pair(\?phone=|$)/);
     assert.doesNotMatch(page.text, /ABCD-1234/);
+    // Use the secure session cookie from bootstrap (no token in URL).
+    const cookie = (page.redirect.headers['set-cookie'] || []).map((c) => String(c).split(';')[0]).join('; ');
     const response = await request(port, {
       method: 'POST',
-      path: `/pair?token=${bridge.PAIR_TOKEN}`,
+      path: '/pair',
       body: { phone: OWNER },
+      cookie,
     });
     assert.equal(response.status, 200);
     assert.match(response.text, /ABCD-1234/);
