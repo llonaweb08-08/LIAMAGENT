@@ -51,10 +51,11 @@ for _directory in (DATA_DIR, OUTBOX_DIR):
 from liam_agent import brains, integrations, loop, memory, people, registry, runtime, state, web
 from liam_agent.brains import (
     ATTEMPT_TIMEOUT, BRAIN_STATE, BRAIN_TIMEOUT, BRAINS, CALL_BUDGET, FALLBACK_ORDER,
-    LEGACY_BRAIN_STATE, MAX_ATTEMPTS, OFFLINE, _BRAIN_ALIASES, _attempt_plan, _exhaust_key,
-    _exhausted_at, _http_post, _is_transient, _key_exhausted, _mark_exhausted,
-    _normalize_brain, _normalize_message, _probe, call_model, check_status, check_tokens,
-    get_brain, set_brain, switch_brain,
+    LEGACY_BRAIN_STATE, MAX_ATTEMPTS, OFFLINE, PREFERRED_KEY_STATE, QUOTA_COOLDOWN,
+    _BRAIN_ALIASES, _attempt_plan, _clear_exhausted, _exhaust_key, _exhausted_at,
+    _get_preferred_key, _http_post, _is_transient, _key_exhausted, _mark_exhausted,
+    _normalize_brain, _normalize_message, _probe, _set_preferred_key, call_model,
+    check_key, check_status, check_tokens, get_brain, set_brain, switch_brain,
 )
 from liam_agent.integrations import (
     SLOW_TOOLS, VPS_BROWSER_DIR, VPS_PYLIB_DIR, _AUTO_PROGRESS, _SCREENSHOT_SCRIPT, _VPS_ENV,
@@ -70,8 +71,8 @@ from liam_agent.loop import (
 )
 from liam_agent.memory import (
     DB, _SCHEMA, _THINK_RE, _THINK_TAG_RE, _THINK_UNCLOSED_RE, _clean_fact, _clean_reply,
-    _connect, _facts, _init_db, clear_memory, load_chat_history, recall, recall_all, remember,
-    save_chat_history,
+    _connect, _facts, _init_db, clear_active_task, clear_memory, get_active_task,
+    load_chat_history, recall, recall_all, remember, save_chat_history, set_active_task,
 )
 from liam_agent.people import (
     ADMS, CONFIG_PATH, OWNERS, PETNAMES, _is_admin, _is_owner, _load_people, _norm_user,

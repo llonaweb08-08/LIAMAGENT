@@ -109,14 +109,27 @@ def _clean_fact(fact, limit=500):
     s = "".join(ch for ch in str(fact or "") if ch.isprintable() or ch in "\n\t")
     return " ".join(s.split())[:limit]
 
-_THINK_RE = re.compile(r"<(?:think(?:ing)?|reasoning|analysis|scratchpad|thought)>.*?</(?:think(?:ing)?|reasoning|analysis|scratchpad|thought)>", re.S | re.I)
+_THINK_OPEN_RE = re.compile(r"<(?:think(?:ing)?|reasoning|analysis|scratchpad|thought)>", re.I)
+_THINK_CLOSE_RE = re.compile(r"</(?:think(?:ing)?|reasoning|analysis|scratchpad|thought)>", re.I)
 _THINK_TAG_RE = re.compile(r"</?(?:think(?:ing)?|reasoning|analysis|scratchpad|thought)>", re.I)
-_THINK_UNCLOSED_RE = re.compile(r"<(?:think(?:ing)?|reasoning|analysis|scratchpad|thought)>.*", re.S | re.I)
+# Compatibility aliases for older importers; the greedy unclosed rule is gone
+# because it deleted every answer that followed an unfinished reasoning tag.
+_THINK_RE = _THINK_OPEN_RE
+_THINK_UNCLOSED_RE = _THINK_OPEN_RE
 
 def _clean_reply(text):
-    """Strip provider reasoning leakage (some models emit ...)."""
-    text = _THINK_RE.sub("", str(text or ""))
-    text = _THINK_UNCLOSED_RE.sub("", text)
+    """Strip provider reasoning without swallowing the answer after it."""
+    text = str(text or "")
+    while True:
+        opened = _THINK_OPEN_RE.search(text)
+        if not opened:
+            break
+        closed = _THINK_CLOSE_RE.search(text, opened.end())
+        if closed:
+            text = text[:opened.start()] + text[closed.end():]
+            continue
+        text = text[:opened.start()] + text[opened.end():]
+        break
     text = _THINK_TAG_RE.sub("", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
@@ -1027,6 +1040,8 @@ def shell_exec(command, timeout=30):
 
 BRAIN_STATE = os.path.join(DATA_DIR, "brain_state")
 LEGACY_BRAIN_STATE = os.path.join(BASE_DIR, ".brain_state")
+PREFERRED_KEY_STATE = os.path.join(DATA_DIR, "preferred_keys.json")
+QUOTA_COOLDOWN = 86400  # MoonMath's free daily allowance resets once a day
 # There is deliberately no "glm" brain: it mapped to liam_keys.MOON_FALLBACK,
 # which returns HTTP 404/402. Offering it let the owner "switch" to a brain that
 # failed every turn, so it was removed rather than kept as a broken alias.
@@ -1078,12 +1093,14 @@ def switch_brain(brain, sender=None):
         return f"unknown brain '{brain}' - pick moonmath, unorouter, agnes or hcn"
     return f"switched to {b}"
 
-def _probe(base, model, key, timeout=8):
+def _probe(base, model, key, timeout=8, brain=None):
     if not key:
         return False, "no key configured"
+    if brain and _key_exhausted(brain, key, model):
+        return False, "quota cooling"
     try:
         req = urllib.request.Request(base.rstrip("/") + "/chat/completions",
-            data=json.dumps({"model":model,"messages":[{"role":"user","content":"ok"}],"max_tokens":5}).encode(),
+            data=json.dumps({"model":model,"messages":[{"role":"user","content":"ok"}]}).encode(),
             headers={
                 "Authorization":"Bearer "+key,
                 "Content-Type":"application/json",
@@ -1098,26 +1115,42 @@ def _probe(base, model, key, timeout=8):
             return False, "no choices"
         return True, ""
     except urllib.error.HTTPError as e:
+        if brain and e.code in (402, 429):
+            _mark_exhausted(brain, key, None, ttl=QUOTA_COOLDOWN)
+            return False, "quota exhausted"
         return False, f"HTTP {e.code}"
     except Exception as e:
         return False, type(e).__name__
 
 def check_status():
+    """Report usable brains, not merely reachable endpoints."""
     def probe(name, key):
         p = BRAINS[name]
-        return (name,) + _probe(p["base"], p["model"], key)
+        # HCNSec needs ~30s to answer; an 8s probe reports a false timeout.
+        timeout = BRAIN_TIMEOUT.get(name, ATTEMPT_TIMEOUT)
+        ok, why = _probe(p["base"], p["model"], key, timeout=timeout, brain=name)
+        return (name, ok, why)
     first = {name: (p["keys"][0] if p["keys"] else "") for name, p in BRAINS.items()}
     with ThreadPoolExecutor(max_workers=8) as ex:
         results = {n: (ok, why) for n, ok, why in ex.map(lambda kv: probe(*kv), first.items())}
     retry = [(n, k) for n, p in BRAINS.items() if not results[n][0] for k in p["keys"][1:]]
     if retry:
         with ThreadPoolExecutor(max_workers=8) as ex:
-            for n, ok, _why in ex.map(lambda nk: probe(*nk), retry):
+            for n, ok, why in ex.map(lambda nk: probe(*nk), retry):
                 if ok and not results[n][0]:
                     results[n] = (True, "")
-    return " | ".join(
-        f"{BRAINS[n]['label']}: " + ("✅" if ok else f"❌ {why or 'unreachable'}")
-        for n, (ok, why) in results.items())
+                elif results[n][1] in ("", "quota cooling") and why:
+                    results[n] = (False, why)
+    parts = []
+    for n, (ok, why) in results.items():
+        label = BRAINS[n]["label"]
+        if ok:
+            parts.append(f"{label}: ✅ usable")
+        elif why in ("quota cooling", "quota exhausted"):
+            parts.append(f"{label}: ⚠️ {why}")
+        else:
+            parts.append(f"{label}: ❌ {why or 'unreachable'}")
+    return " | ".join(parts)
 
 def check_tokens():
     lines = [f"Current brain: {get_brain()} ({BRAINS[get_brain()]['model']})",
@@ -1148,22 +1181,87 @@ def _key_exhausted(brain, key, model=None):
         return True
     return model is not None and _exhausted_at(brain, key, None)
 
-def _mark_exhausted(brain, key, model=None, ttl=86400):
-    # Store the expiry, not the start, so a short cooldown (e.g. a provider that
-    # is simply out of free quota today) can be retried sooner than a full day.
+def _mark_exhausted(brain, key, model=None, ttl=QUOTA_COOLDOWN):
+    # Store the expiry, not the start, so the flag can be retried after 24h.
     _EXHAUSTED[_exhaust_key(brain, key, model)] = time.time() + max(30, float(ttl))
     while len(_EXHAUSTED) > 2000:
         try: del _EXHAUSTED[next(iter(_EXHAUSTED))]
         except Exception: break
+
+def _clear_exhausted(brain, key):
+    """Forget every cooldown for one key (owner re-checked it)."""
+    for k in [k for k in _EXHAUSTED if k[0] == str(brain) and k[1] == str(key or "")]:
+        _EXHAUSTED.pop(k, None)
+
+def _load_preferred_keys():
+    try:
+        with open(PREFERRED_KEY_STATE, encoding="utf-8") as handle:
+            value = json.load(handle)
+        return value if isinstance(value, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+def _get_preferred_key(brain):
+    try:
+        value = _load_preferred_keys().get(brain)
+        return int(value) if value is not None and int(value) >= 0 else None
+    except (TypeError, ValueError):
+        return None
+
+def _set_preferred_key(brain, index):
+    index = int(index)
+    data = _load_preferred_keys()
+    data[str(brain)] = index
+    _atomic_write_text(PREFERRED_KEY_STATE, json.dumps(data, sort_keys=True))
+    return index
+
+def check_key(brain=None, key=1, sender=None):
+    """Owner-only: probe one key, and use it first going on if it answers."""
+    if not _is_owner(sender):
+        return "only the owner can check keys"
+    name = _normalize_brain(brain) or "moonmath"
+    p = BRAINS.get(name)
+    if not p:
+        return f"unknown brain '{brain}'"
+    keys = [k for k in p["keys"] if k]
+    if not keys:
+        return f"{name} has no configured keys"
+    raw = str(key).strip().lower()
+    if raw in ("all", "*", "every"):
+        positions = list(range(len(keys)))
+    else:
+        try:
+            number = int(raw)
+        except (TypeError, ValueError):
+            return f"give a key number from 1 to {len(keys)} (or 'all')"
+        if number == 0:
+            number = 1
+        if not 1 <= number <= len(keys):
+            return f"{name} has {len(keys)} key(s); give a number from 1 to {len(keys)}"
+        positions = [number - 1]
+    timeout = BRAIN_TIMEOUT.get(name, ATTEMPT_TIMEOUT)
+    results = []
+    for pos in positions:
+        k = keys[pos]
+        ok, why = _probe(p["base"], p["model"], k, timeout=timeout)
+        if ok:
+            _clear_exhausted(name, k)
+            _set_preferred_key(name, pos)
+            results.append(f"key {pos + 1}: responding - using it first from now on")
+        else:
+            _mark_exhausted(name, k, None, ttl=QUOTA_COOLDOWN)
+            results.append(f"key {pos + 1}: not responding ({why or 'unreachable'}) "
+                           "- flagged for 24 hours")
+    return " | ".join(results)
+
 ATTEMPT_TIMEOUT = 35       # seconds per HTTP attempt
-CALL_BUDGET = 70           # total seconds for one assistant step
+# Three slow MoonMath keys + HCNSec + Agnes need more than the old 70s cap.
+CALL_BUDGET = _env_int("LIAM_CALL_BUDGET", 150, 30, 900)
 MAX_ATTEMPTS = 8           # provider/key attempts per turn
-# Fallback chain: primary first, then only brains that actually answer. MoonMath's
-# "glm" model (MOON_FALLBACK) returns HTTP 404 and Unorouter returns 503, so a
-# slot for either just wastes a turn. HCNSec is slow, so it is tried last.
-FALLBACK_ORDER = ["moonmath", "agnes", "hcn"]
-# Per-brain HTTP cap. A slow provider must not be allowed to eat the budget.
-BRAIN_TIMEOUT = {"moonmath": 20, "agnes": 30, "hcn": 20}
+# Requested chain: MoonMath keys 1-3, then HCNSec, then Agnes as the last resort.
+FALLBACK_ORDER = ["moonmath", "hcn", "agnes"]
+# HCNSec answers in ~30s but times out below that, so a 20s cap looked dead.
+BRAIN_TIMEOUT = {"moonmath": 20, "agnes": 30, "hcn": 35}
 OFFLINE = os.environ.get("LIAM_OFFLINE") == "1"
 
 def _is_transient(status):
@@ -1226,18 +1324,29 @@ def _http_post(base, model, key, messages, tools, timeout):
         raise ValueError("provider returned no message")
     return _normalize_message(choices[0]["message"])
 
+def _key_order(brain, keys):
+    """Key positions in call order: owner-checked key first, then 1,2,3."""
+    order = list(range(len(keys)))
+    preferred = _get_preferred_key(brain)
+    if preferred is not None and 0 <= preferred < len(keys):
+        order.remove(preferred)
+        order.insert(0, preferred)
+    return order
+
 def _attempt_plan(brain):
     p = BRAINS[brain]
     keys = [k for k in p["keys"] if k]
     if brain == "moonmath":
-        # Keys first, then models: every key gets a shot at the primary model
-        # before any key is tried on the fallback model. The other order lets a
-        # slow or dead fallback burn the whole budget before key 2 is reached.
+        # Keys are the rotation unit: 1, then 2, then 3, each on the primary
+        # model before any key is tried on a fallback model. Exhausted keys are
+        # filtered out here, so a cooling key costs no network call at all.
+        order = _key_order(brain, keys)
         plan = []
         for model in (liam_keys.MOON_MODEL, liam_keys.MOON_FALLBACK):
             if not model:
                 continue
-            for k in keys:
+            for i in order:
+                k = keys[i]
                 if _key_exhausted("moonmath", k, model):
                     continue
                 plan.append(("moonmath", model, k))
@@ -1249,15 +1358,16 @@ def _attempt_plan(brain):
     if brain == "unorouter":
         if not keys:
             return []
+        offset = _get_preferred_key(brain) or 0
         plan = []
         for i, m in enumerate(liam_keys.UNO_MODELS):
-            key = keys[i % len(keys)] if keys else ""
+            key = keys[(offset + i) % len(keys)]
             if _key_exhausted("unorouter", key, m):
                 continue
             plan.append((brain, m, key))
         return plan
-    return [(brain, p["model"], k) for k in keys[:3]
-            if not _key_exhausted(brain, k, p["model"])]
+    return [(brain, p["model"], keys[i]) for i in _key_order(brain, keys)[:3]
+            if not _key_exhausted(brain, keys[i], p["model"])]
 
 def call_model(messages, sender, brain=None, tools=None, budget=None):
     if OFFLINE:
@@ -1265,8 +1375,10 @@ def call_model(messages, sender, brain=None, tools=None, budget=None):
     brain = _normalize_brain(brain) or get_brain()
     admin_only = _is_admin(sender) and not _is_owner(sender)
     if admin_only:
-        brain = "agnes"          # Temi and Precious are answered by Agnes only
-    order = [brain] if admin_only else [brain] + [b for b in FALLBACK_ORDER if b != brain]
+        # Agnes is still tried first for Temi and Precious, but a failed attempt
+        # must fall through instead of ending in FALLBACK_TEXT.
+        brain = "agnes"
+    order = [brain] + [b for b in FALLBACK_ORDER if b != brain]
 
     seconds = CALL_BUDGET if not budget else max(3, min(CALL_BUDGET, float(budget)))
     deadline = time.monotonic() + seconds
@@ -1296,18 +1408,11 @@ def call_model(messages, sender, brain=None, tools=None, budget=None):
                     except Exception: detail = ""
                     last_err = f"{b}/{model} HTTP {status}"
                     _log(f"[brain] {last_err} {detail}")
-                    if status == 429:
-                        _mark_exhausted(b, key, model)
-                        if b == "unorouter":
-                            _mark_exhausted(b, key, None)
-                        # A rate limit never clears in the 0.8s we used to sleep
-                        # before retrying the same key. Mark it and move on.
-                        break
-                    elif status == 402:
-                        # "Payment required" - the free quota is used up for the
-                        # day. Skip this key for a while instead of paying the
-                        # round-trip (or a hung socket) on every single turn.
-                        _mark_exhausted(b, key, model, ttl=1800)
+                    if status in (402, 429):
+                        # Both mean the key's free allowance is gone. Flag the
+                        # whole key for 24h so later turns skip it immediately
+                        # rather than paying a fallback delay every message.
+                        _mark_exhausted(b, key, None, ttl=QUOTA_COOLDOWN)
                         break
                     if status == 400 and use_tools:
                         # Some models reject the tools parameter; retry once without it.

@@ -692,6 +692,10 @@ let lastAgentError = "";
 let agentStderrTail = "";
 // Last turn's timing breakdown from the Python agent (no message text).
 let lastAgentTrace = null;
+// The first successful link already archives the session. Every reconnect
+// also reaches handleReady(), so without this guard each 428 would queue
+// another full backup and flood the log with "session backed up".
+let immediateBackupScheduled = false;
 function maskPhone(value) {
   const p = barePhone(value);
   return p ? "***" + p.slice(-4) : "";
@@ -1572,14 +1576,18 @@ function handleReady() {
   // the profile is disposable and must never replace a good cloud copy.
   sync.startPeriodicBackup(DATA_DIR, SESSION_DIR, DATA_DIR);
   // Archive immediately, so a free Render instance that spins down soon after
-  // pairing still leaves a restorable session in Supabase.
-  setTimeout(() => {
-    try {
-      Promise.resolve(sync.backupNow(DATA_DIR, SESSION_DIR, DATA_DIR))
-        .then((r) => { if (!r || !r.ok) console.log("warn: immediate backup did not complete"); })
-        .catch((e) => console.log("warn: immediate backup failed:", String(e)));
-    } catch (e) {}
-  }, 3000);
+  // pairing still leaves a restorable session in Supabase. Only once per
+  // process: reconnects re-enter this function and must not re-archive.
+  if (!immediateBackupScheduled) {
+    immediateBackupScheduled = true;
+    setTimeout(() => {
+      try {
+        Promise.resolve(sync.backupNow(DATA_DIR, SESSION_DIR, DATA_DIR))
+          .then((r) => { if (!r || !r.ok) console.log("warn: immediate backup did not complete"); })
+          .catch((e) => console.log("warn: immediate backup failed:", String(e)));
+      } catch (e) {}
+    }, 3000);
+  }
 }
 
 function scheduleReconnect(reason, delay) {
@@ -1608,8 +1616,10 @@ function handleConnectionClose(socket, status, detail) {
   const reason = String(detail || "").split("\n")[0].slice(0, 200);
   noteWaEvent("closed", `${status || "?"} ${reason}`);
   console.log(`\n⚠️ WhatsApp connection closed (${status || "unknown"})${reason ? ": " + reason : ""}`);
-  stopAgent();
-
+  // Do not kill the Python agent on a transient socket drop. The turn can
+  // finish; wa.sendMessage() already waits for the reconnect and holds the
+  // reply if the socket never comes back. Killing here is what made a 428
+  // look like Liam abandoning a task and forgetting it on the next message.
   if (status === DisconnectReason.loggedOut) {
     // The phone removed this device. The stored profile is dead, so start over
     // with a clean one instead of reconnecting with dead credentials.

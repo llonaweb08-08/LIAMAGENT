@@ -26,6 +26,13 @@ _HISTORY_SCHEMA = """CREATE TABLE IF NOT EXISTS chat_history(
     updated REAL NOT NULL DEFAULT 0
 )"""
 
+_ACTIVE_SCHEMA = """CREATE TABLE IF NOT EXISTS active_task(
+    chat TEXT PRIMARY KEY,
+    status TEXT NOT NULL DEFAULT '',
+    detail TEXT NOT NULL DEFAULT '',
+    updated REAL NOT NULL DEFAULT 0
+)"""
+
 
 def _connect():
     c = sqlite3.connect(DB, timeout=10)
@@ -41,6 +48,7 @@ def _init_db():
             pass
         c.execute(_SCHEMA)
         c.execute(_HISTORY_SCHEMA)
+        c.execute(_ACTIVE_SCHEMA)
         cols = {r[1] for r in c.execute("PRAGMA table_info(mem)")}
         if "created" not in cols:
             c.execute("ALTER TABLE mem ADD COLUMN created REAL NOT NULL DEFAULT 0")
@@ -59,15 +67,35 @@ def _clean_fact(fact, limit=500):
     return " ".join(s.split())[:limit]
 
 
-_THINK_RE = re.compile(r"<(?:think(?:ing)?|reasoning|analysis|scratchpad|thought)>.*?</(?:think(?:ing)?|reasoning|analysis|scratchpad|thought)>", re.S | re.I)
+_THINK_OPEN_RE = re.compile(r"<(?:think(?:ing)?|reasoning|analysis|scratchpad|thought)>", re.I)
+_THINK_CLOSE_RE = re.compile(r"</(?:think(?:ing)?|reasoning|analysis|scratchpad|thought)>", re.I)
 _THINK_TAG_RE = re.compile(r"</?(?:think(?:ing)?|reasoning|analysis|scratchpad|thought)>", re.I)
-_THINK_UNCLOSED_RE = re.compile(r"<(?:think(?:ing)?|reasoning|analysis|scratchpad|thought)>.*", re.S | re.I)
+# Compatibility aliases for older importers; the greedy unclosed rule is gone
+# because it deleted every answer that followed an unfinished reasoning tag.
+_THINK_RE = _THINK_OPEN_RE
+_THINK_UNCLOSED_RE = _THINK_OPEN_RE
 
 
 def _clean_reply(text):
-    """Strip provider reasoning leakage (some models emit <think>...)."""
-    text = _THINK_RE.sub("", str(text or ""))
-    text = _THINK_UNCLOSED_RE.sub("", text)
+    """Strip provider reasoning without swallowing the answer after it.
+
+    Some providers truncate their own reasoning and leave an unclosed
+    "<think>" tag. The old greedy "strip to end of string" rule removed
+    everything after that tag, so "I<think>..." became just "I". Remove a
+    closed block completely; for an unclosed block, drop only the tag and
+    keep the text that follows as the answer.
+    """
+    text = str(text or "")
+    while True:
+        opened = _THINK_OPEN_RE.search(text)
+        if not opened:
+            break
+        closed = _THINK_CLOSE_RE.search(text, opened.end())
+        if closed:
+            text = text[:opened.start()] + text[closed.end():]
+            continue
+        text = text[:opened.start()] + text[opened.end():]
+        break
     text = _THINK_TAG_RE.sub("", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
@@ -252,3 +280,57 @@ def save_chat_history(chat, messages, limit=10):
             c.commit()
     except Exception as e:
         _log(f"[memory] history write failed: {e}")
+
+
+def set_active_task(chat, status="running", detail=""):
+    """Persist what this chat was doing so a reconnect cannot erase it."""
+    chat = _norm_user(chat) or str(chat or "").strip()
+    if not chat:
+        return "no chat to attach a task to"
+    value = " ".join(str(detail or "").split())[:1200]
+    state = str(status or "running").strip()[:80] or "running"
+    try:
+        with closing(_connect()) as c:
+            c.execute(
+                "INSERT INTO active_task(chat,status,detail,updated) VALUES(?,?,?,?) "
+                "ON CONFLICT(chat) DO UPDATE SET status=excluded.status, "
+                "detail=excluded.detail, updated=excluded.updated",
+                (chat, state, value, time.time()))
+            c.commit()
+        return "task saved"
+    except Exception as e:
+        _log(f"[memory] task write failed: {e}")
+        return f"task save failed: {type(e).__name__}"
+
+
+def get_active_task(chat):
+    """Return the last saved task for this chat, or None."""
+    chat = _norm_user(chat) or str(chat or "").strip()
+    if not chat:
+        return None
+    try:
+        with closing(_connect()) as c:
+            row = c.execute(
+                "SELECT status, detail, updated FROM active_task WHERE chat=?",
+                (chat,)).fetchone()
+        if not row:
+            return None
+        return {"status": str(row[0] or ""), "detail": str(row[1] or ""),
+                "updated": float(row[2] or 0)}
+    except Exception as e:
+        _log(f"[memory] task read failed: {e}")
+        return None
+
+
+def clear_active_task(chat):
+    chat = _norm_user(chat) or str(chat or "").strip()
+    if not chat:
+        return "no chat to clear"
+    try:
+        with closing(_connect()) as c:
+            c.execute("DELETE FROM active_task WHERE chat=?", (chat,))
+            c.commit()
+        return "task cleared"
+    except Exception as e:
+        _log(f"[memory] task clear failed: {e}")
+        return f"task clear failed: {type(e).__name__}"

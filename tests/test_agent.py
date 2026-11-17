@@ -1207,5 +1207,183 @@ class HygieneTests(unittest.TestCase):
             self.assertEqual(module.main([]), 2)
 
 
+class LogFixRegressionTests(unittest.TestCase):
+    def test_status_reports_quota_cooling_instead_of_usable(self):
+        fake = {"base": "https://x", "model": "m", "keys": ["k"], "label": "Fake"}
+        try:
+            agent._EXHAUSTED.clear()
+            agent._mark_exhausted("moonmath", "k", "m", ttl=1800)
+            with mock.patch.dict(agent.BRAINS, {"moonmath": fake}, clear=True):
+                out = agent.check_status()
+            self.assertIn("quota cooling", out)
+            self.assertNotIn("✅ usable", out)
+        finally:
+            agent._EXHAUSTED.clear()
+
+    def test_admin_falls_back_when_agnes_fails(self):
+        agnes = {"base": "https://agnes", "model": "m", "keys": ["a"], "label": "Agnes"}
+        hcn = {"base": "https://hcn", "model": "m", "keys": ["h"], "label": "HCNSec"}
+
+        def fake_post(base, model, key, messages, tools=None, timeout=None):
+            if "agnes" in base:
+                raise TimeoutError("read timed out")
+            return {"role": "assistant", "content": "ok"}
+
+        try:
+            agent._EXHAUSTED.clear()
+            with mock.patch.dict(agent.BRAINS, {"agnes": agnes, "hcn": hcn}, clear=True), \
+                    mock.patch("liam_agent.brains.FALLBACK_ORDER", ["hcn"]), \
+                    mock.patch.object(agent, "_http_post", side_effect=fake_post):
+                msg = agent.call_model([{"role": "user", "content": "hi"}], ADMIN)
+            self.assertEqual(msg["_brain"], "hcn")
+        finally:
+            agent._EXHAUSTED.clear()
+
+    def test_failed_tool_overrides_false_success_reply(self):
+        steps = {"n": 0}
+
+        def fake_model(messages, sender, **kwargs):
+            steps["n"] += 1
+            if steps["n"] == 1:
+                return {"role": "assistant", "content": "", "tool_calls": [
+                    {"id": "v1", "function": {
+                        "name": "send_voice",
+                        "arguments": json.dumps({"text": "hello"})}}]}
+            return {"role": "assistant", "content": "Sent, baby - it's in the chat.",
+                    "_brain": "moonmath"}
+
+        with mock.patch.object(agent, "call_model", side_effect=fake_model), \
+                mock.patch.object(agent, "send_voice",
+                                  return_value="tool error: voice failed"):
+            out = agent.run_agent("send it", OWNER, False, "", False, False)
+        self.assertIn("didn't go through", out.lower())
+
+    def test_active_task_persists_until_cleared(self):
+        chat = "task-regression-chat"
+        try:
+            agent.clear_active_task(chat)
+            agent.set_active_task(chat, "running", "open opayweb and screenshot a page")
+            task = agent.get_active_task(chat)
+            self.assertIsNotNone(task)
+            self.assertIn("opayweb", task["detail"])
+            agent.clear_active_task(chat)
+            self.assertIsNone(agent.get_active_task(chat))
+        finally:
+            agent.clear_active_task(chat)
+
+    def test_voice_duration_argument_is_honest(self):
+        tools = agent._tools_for(OWNER, "", False)
+        out = tools["send_voice"](text="hello", duration_seconds=29)
+        self.assertIn("can't set an exact voice-note duration", out)
+
+
+class KeyRotationTests(unittest.TestCase):
+    """MoonMath key rotation and the MoonMath -> HCNSec -> Agnes chain."""
+
+    def setUp(self):
+        agent._EXHAUSTED.clear()
+
+    def tearDown(self):
+        agent._EXHAUSTED.clear()
+
+    def test_chain_order_and_hcn_timeout(self):
+        self.assertEqual(agent.FALLBACK_ORDER, ["moonmath", "hcn", "agnes"])
+        self.assertGreaterEqual(agent.BRAIN_TIMEOUT["hcn"], 30)
+        self.assertGreater(agent.CALL_BUDGET, 70)
+        self.assertLessEqual(agent.BRAIN_TIMEOUT["hcn"], agent.CALL_BUDGET)
+
+    def test_quota_errors_flag_the_whole_key_for_24_hours(self):
+        fake = {"base": "https://x", "model": "m", "keys": ["k1"], "label": "M"}
+        for status in (402, 429):
+            with self.subTest(status=status):
+                agent._EXHAUSTED.clear()
+                err = agent.urllib.error.HTTPError(
+                    "u", status, "quota", {}, io.BytesIO(b"{}"))
+                with mock.patch.dict(agent.BRAINS, {"moonmath": fake}, clear=True), \
+                        mock.patch("liam_agent.brains.FALLBACK_ORDER", ["moonmath"]), \
+                        mock.patch.object(agent, "_http_post", side_effect=err):
+                    agent.call_model([{"role": "user", "content": "hi"}], OWNER)
+                key = agent._exhaust_key("moonmath", "k1", None)
+                self.assertIn(key, agent._EXHAUSTED)
+                self.assertGreater(agent._EXHAUSTED[key] - time.time(), 86000)
+                self.assertTrue(agent._key_exhausted("moonmath", "k1", "any-model"))
+
+    def test_exhausted_key_is_skipped_without_a_call(self):
+        fake = {"base": "https://x", "model": "m", "keys": ["k1", "k2"], "label": "M"}
+        seen = []
+
+        def fake_post(base, model, key, messages, tools=None, timeout=None):
+            seen.append(key)
+            return {"role": "assistant", "content": "ok"}
+
+        agent._mark_exhausted("moonmath", "k1", None, ttl=agent.QUOTA_COOLDOWN)
+        with mock.patch.dict(agent.BRAINS, {"moonmath": fake}, clear=True), \
+                mock.patch("liam_agent.brains.FALLBACK_ORDER", ["moonmath"]), \
+                mock.patch.object(agent, "_http_post", side_effect=fake_post):
+            msg = agent.call_model([{"role": "user", "content": "hi"}], OWNER)
+        self.assertEqual(seen, ["k2"])
+        self.assertEqual(msg["_brain"], "moonmath")
+
+    def test_all_moonmath_keys_exhausted_falls_to_hcn_then_agnes(self):
+        brains = {
+            "moonmath": {"base": "https://moon", "model": "m",
+                         "keys": ["k1", "k2", "k3"], "label": "MoonMath"},
+            "hcn": {"base": "https://hcn", "model": "m", "keys": ["h"], "label": "HCNSec"},
+            "agnes": {"base": "https://agnes", "model": "m", "keys": ["a"], "label": "Agnes"},
+        }
+        seen = []
+
+        def fake_post(base, model, key, messages, tools=None, timeout=None):
+            seen.append(key)
+            if "hcn" in base:
+                raise TimeoutError("read timed out")
+            return {"role": "assistant", "content": "ok"}
+
+        for key in brains["moonmath"]["keys"]:
+            agent._mark_exhausted("moonmath", key, None, ttl=agent.QUOTA_COOLDOWN)
+        with mock.patch.dict(agent.BRAINS, brains, clear=True), \
+                mock.patch("liam_agent.brains.FALLBACK_ORDER",
+                           ["moonmath", "hcn", "agnes"]), \
+                mock.patch.object(agent, "_http_post", side_effect=fake_post):
+            msg = agent.call_model([{"role": "user", "content": "hi"}], OWNER)
+        self.assertEqual(seen, ["h", "a"])
+        self.assertEqual(msg["_brain"], "agnes")
+
+    def test_check_key_recovers_a_key_and_makes_it_preferred(self):
+        fake = {"base": "https://x", "model": "m", "keys": ["k1", "k2", "k3"], "label": "M"}
+        pref_file = os.path.join(tempfile.mkdtemp(prefix="liam_key_test_"), "pref.json")
+        agent._mark_exhausted("moonmath", "k2", None, ttl=agent.QUOTA_COOLDOWN)
+        with mock.patch.dict(agent.BRAINS, {"moonmath": fake}, clear=True), \
+                mock.patch.object(agent, "PREFERRED_KEY_STATE", pref_file), \
+                mock.patch.object(agent.liam_keys, "MOON_FALLBACK", ""), \
+                mock.patch.object(agent, "_probe", return_value=(True, "")):
+            out = agent.check_key("moonmath", 2, OWNER)
+            self.assertFalse(agent._key_exhausted("moonmath", "k2", "any-model"))
+            self.assertEqual(agent._get_preferred_key("moonmath"), 1)
+            plan = agent._attempt_plan("moonmath")
+        self.assertIn("key 2", out)
+        self.assertIn("using it first", out)
+        self.assertNotIn("k2", out)
+        self.assertEqual(plan[0], ("moonmath", agent.liam_keys.MOON_MODEL, "k2"))
+
+    def test_check_key_flags_a_failing_key_for_24_hours(self):
+        fake = {"base": "https://x", "model": "m", "keys": ["k1"], "label": "M"}
+        pref_file = os.path.join(tempfile.mkdtemp(prefix="liam_key_test_"), "pref.json")
+        with mock.patch.dict(agent.BRAINS, {"moonmath": fake}, clear=True), \
+                mock.patch.object(agent, "PREFERRED_KEY_STATE", pref_file), \
+                mock.patch.object(agent, "_probe", return_value=(False, "HTTP 402")):
+            out = agent.check_key("moonmath", 1, OWNER)
+            expiry = agent._EXHAUSTED[agent._exhaust_key("moonmath", "k1", None)]
+        self.assertIn("flagged for 24 hours", out)
+        self.assertGreater(expiry - time.time(), 86000)
+
+    def test_check_key_is_owner_only_and_registered(self):
+        self.assertIn("check_key", agent.OWNER_ONLY_TOOLS)
+        self.assertIn("check_key", {s["function"]["name"] for s in agent.SCHEMAS})
+        self.assertIn("only the owner", agent.check_key("moonmath", 1, MEMBER))
+        tools = agent._tools_for(MEMBER, "", False)
+        self.assertIn("only the owner", tools["check_key"]("moonmath", 1))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -43,6 +43,31 @@ def _parse_args(raw):
     return value
 
 
+def _tool_failed(result):
+    """Cheap signal that a tool did not do what the model intended.
+
+    Tool results are plain strings, so this looks for the prefixes the tool
+    layer uses on real errors. The goal is to stop the model from saying
+    "sent" after a failure, not to parse every possible success message.
+    """
+    value = str(result or "").strip().lower()
+    markers = (
+        "tool error:", "error:", "failed", "can't", "cannot", "not configured",
+        "unsupported", "denied", "blocked", "unknown tool", "isn't available",
+        "didn't go", "did not go",
+    )
+    return any(value.startswith(m) or m in value[:100] for m in markers)
+
+
+def _claims_success(text):
+    value = str(text or "").lower()
+    markers = (
+        "sent", "landed", "went through", "done", "success", "successful",
+        "complete", "there it is", "it's in the chat", "its in the chat",
+    )
+    return any(m in value for m in markers)
+
+
 def _history_get(key):
     a = agent_mod()
     if not key:
@@ -96,7 +121,7 @@ def _system_prompt(sender, is_group, mentioned, reply_to, group_jid=""):
         text += (f"\nRight now you're talking to {adm['name']} - {adm['is']}. "
                  f"Call her {random.choice(adm['she_calls'])}. No permission needed.")
     elif is_group:
-        text += "\nRight now you're talking to a member of this group who has permission. Be warm but brief."
+        text += "\nRight now you're talking to a member of this group who has permission. Be warm and complete."
     else:
         text += "\nRight now you're talking to someone in a direct message."
     if reply_to and not mentioned:
@@ -130,6 +155,12 @@ def run_agent(user_message, sender, is_group, group_jid, mentioned, reply_to, no
                  "content": _system_prompt(sender, is_group, mentioned, reply_to,
                                            group_jid if is_group else "")}]
     messages += _history_get(chat_key)
+    active = a.get_active_task(chat_key)
+    if active and active.get("detail"):
+        messages.append({"role": "system",
+                         "content": "There is a saved task for this chat from earlier. "
+                                    f"Status: {active.get('status') or 'running'}. "
+                                    f"Detail: {active['detail']}. Continue it unless the user changed the subject."})
     messages.append({"role": "user", "content": turn})
 
     tool_map = a._tools_for(sender, group_jid if is_group else "", is_group)
@@ -151,9 +182,13 @@ def run_agent(user_message, sender, is_group, group_jid, mentioned, reply_to, no
     state._LAST_PROGRESS_EMIT_AT = 0.0
     a._LAST_PROGRESS_EMIT_AT = 0.0
     trace = {"events": []}
+    tool_failures = []
+    task_started = False
 
     def finish(text, store=True):
         cleaned = _clean_reply(text or "")
+        if tool_failures and _claims_success(cleaned):
+            cleaned = ("That didn't go through. " + "; ".join(tool_failures[:2])).strip()
         if not cleaned:
             store = False
         text = cleaned or FALLBACK_TEXT
@@ -177,7 +212,8 @@ def run_agent(user_message, sender, is_group, group_jid, mentioned, reply_to, no
         if remaining <= 2:
             break
         _t = time.monotonic()
-        msg = a.call_model(messages, sender, tools=schemas, budget=min(70, remaining))
+        msg = a.call_model(messages, sender, tools=schemas,
+                           budget=min(a.CALL_BUDGET, remaining))
         steps_done += 1
         brain_used = msg.pop("_brain", None)
         msg.pop("_model", None)
@@ -204,9 +240,11 @@ def run_agent(user_message, sender, is_group, group_jid, mentioned, reply_to, no
             try:
                 args = _parse_args(fn.get("arguments"))
             except ValueError as e:
+                failure = f"bad tool arguments: {e}"
+                tool_failures.append(f"{name or 'unknown'}: {failure[:160]}")
                 messages.append({"role": "tool", "tool_call_id": call_id,
                                  "name": name or "unknown",
-                                 "content": f"bad tool arguments: {e}"})
+                                 "content": failure})
                 calls_done += 1
                 continue
             key = (name, json.dumps(args, sort_keys=True, ensure_ascii=False, default=str))
@@ -218,6 +256,9 @@ def run_agent(user_message, sender, is_group, group_jid, mentioned, reply_to, no
                 result = f"{cache[key]} (already done - not repeated)"
             else:
                 if name in SLOW_TOOLS:
+                    if not task_started:
+                        a.set_active_task(chat_key, "running", turn[:1200])
+                        task_started = True
                     now = time.monotonic()
                     if now - state._LAST_PROGRESS_AT >= _env_int("LIAM_PROGRESS_GAP", 20, 5, 600):
                         a._emit_progress(a._auto_progress_text(name))
@@ -236,21 +277,28 @@ def run_agent(user_message, sender, is_group, group_jid, mentioned, reply_to, no
                                         "ms": int((time.monotonic() - _t) * 1000)})
                 cache[key] = result
             calls_done += 1
+            if _tool_failed(result):
+                tool_failures.append(f"{name}: {str(result)[:160]}")
             if len(result) > TOOL_RESULT_MAX:
                 result = result[:TOOL_RESULT_MAX] + "\n… [truncated]"
             messages.append({"role": "tool", "tool_call_id": call_id,
                              "name": name or "unknown", "content": result})
             if _stop_requested():
                 _clear_stop()
+                a.clear_active_task(chat_key)
                 return finish("Okay, I stopped.")
             if calls_done >= MAX_TOOL_CALLS:
                 break
         if calls_done >= MAX_TOOL_CALLS:
             break
 
-    remaining = max(5, min(70, turn_deadline - time.monotonic()))
+    remaining = max(5, min(a.CALL_BUDGET, turn_deadline - time.monotonic()))
+    if tool_failures:
+        messages.append({"role": "system",
+                         "content": "Tool failures this turn: " + "; ".join(tool_failures) +
+                                    ". Do not claim any of them succeeded. Say what failed plainly."})
     messages.append({"role": "user",
-                     "content": "Stop using tools. Reply to me now in one short message."})
+                     "content": "Stop using tools. Reply to me now in one complete message. Finish the thought; do not answer with one word."})
     _t = time.monotonic()
     final = a.call_model(messages, sender, tools=None, budget=remaining)
     final_brain = final.pop("_brain", None)
