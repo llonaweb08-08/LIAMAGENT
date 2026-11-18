@@ -290,7 +290,7 @@ MAX_OUTPUT_TOKENS = _env_int("LIAM_MAX_OUTPUT_TOKENS", 16384, 1, 131072)
 FALLBACK_ORDER = ["moonmath", "hcn", "agnes"]
 # HCNSec answers in ~30s but times out below that, so a 20s cap made it look
 # dead. Give it enough room, while the per-step budget above still bounds a turn.
-BRAIN_TIMEOUT = {"moonmath": 20, "agnes": 30, "hcn": 35}
+BRAIN_TIMEOUT = {"moonmath": 20, "agnes": 35, "hcn": 35}
 OFFLINE = os.environ.get("LIAM_OFFLINE") == "1"
 
 

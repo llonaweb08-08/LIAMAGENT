@@ -1277,6 +1277,54 @@ class LogFixRegressionTests(unittest.TestCase):
         self.assertIn("can't set an exact voice-note duration", out)
 
 
+class ClippedReplyTests(unittest.TestCase):
+    """A small model can emit a fragment and stop; the guard must catch it."""
+
+    def test_looks_clipped_detects_fragments(self):
+        from liam_agent.loop import _looks_clipped
+        for bad in ("L", "I", "I'm", "I see", "I'm on Ag", "Here"):
+            with self.subTest(bad=bad):
+                self.assertTrue(_looks_clipped(bad))
+        for good in ("Here.", "Done, babe - it's live now.",
+                     "Hey there, darling.", ""):
+            with self.subTest(good=good):
+                self.assertFalse(_looks_clipped(good))
+
+    def test_prompt_has_no_brevity_exception_or_deletion_program(self):
+        self.assertNotIn("brevity is only okay", agent.PROMPT)
+        self.assertNotIn("deletion program", agent.PROMPT)
+        self.assertIn("even when the question itself is one word", agent.PROMPT)
+        self.assertIn("IDENTITY LOCK", agent.PROMPT)
+
+    def test_finish_uses_retry_when_retry_is_complete(self):
+        replies = [
+            {"role": "assistant", "content": "I'm", "_brain": "agnes"},
+            {"role": "assistant",
+             "content": "Hey there, darling - what's on your mind?",
+             "_brain": "agnes"},
+        ]
+        with mock.patch.object(agent, "call_model", side_effect=replies):
+            out = agent.run_agent("Liam", OWNER, False, "", False, False)
+        self.assertEqual(out, "Hey there, darling - what's on your mind?")
+
+    def test_finish_falls_back_when_retry_is_also_clipped(self):
+        replies = [
+            {"role": "assistant", "content": "L", "_brain": "agnes"},
+            {"role": "assistant", "content": "I'm", "_brain": "agnes"},
+        ]
+        with mock.patch.object(agent, "call_model", side_effect=replies):
+            out = agent.run_agent("Liam", OWNER, False, "", False, False)
+        self.assertEqual(out, agent.FALLBACK_TEXT)
+
+    def test_clipped_guard_skips_when_no_brain_answered(self):
+        # _brain "none" means call_model already returned FALLBACK_TEXT; do not
+        # waste a retry on a dead provider chain.
+        replies = [{"role": "assistant", "content": "L", "_brain": "none"}]
+        with mock.patch.object(agent, "call_model", side_effect=replies):
+            out = agent.run_agent("Liam", OWNER, False, "", False, False)
+        self.assertEqual(out, "L")
+
+
 class KeyRotationTests(unittest.TestCase):
     """MoonMath key rotation and the MoonMath -> HCNSec -> Agnes chain."""
 
@@ -1291,6 +1339,10 @@ class KeyRotationTests(unittest.TestCase):
         self.assertGreaterEqual(agent.BRAIN_TIMEOUT["hcn"], 30)
         self.assertGreater(agent.CALL_BUDGET, 70)
         self.assertLessEqual(agent.BRAIN_TIMEOUT["hcn"], agent.CALL_BUDGET)
+
+    def test_agnes_timeout_is_raised(self):
+        self.assertGreaterEqual(agent.BRAIN_TIMEOUT["agnes"], 35)
+        self.assertLessEqual(agent.BRAIN_TIMEOUT["agnes"], agent.CALL_BUDGET)
 
     def test_quota_errors_flag_the_whole_key_for_24_hours(self):
         fake = {"base": "https://x", "model": "m", "keys": ["k1"], "label": "M"}

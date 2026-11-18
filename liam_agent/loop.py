@@ -68,6 +68,23 @@ def _claims_success(text):
     return any(m in value for m in markers)
 
 
+def _looks_clipped(text):
+    """Detect a reply cut off mid-thought instead of chosen short.
+
+    A small model can emit a token or two and stop with finish_reason='stop'.
+    That is not brevity - it is a broken reply, and must never reach WhatsApp.
+    """
+    value = str(text or "").strip()
+    if not value:
+        return False
+    if len(value) <= 2:
+        return True
+    # A few words with no ending punctuation is a fragment, not a full reply.
+    if len(value) <= 16 and not any(ch in value for ch in ".!?…"):
+        return True
+    return False
+
+
 def _history_get(key):
     a = agent_mod()
     if not key:
@@ -185,10 +202,30 @@ def run_agent(user_message, sender, is_group, group_jid, mentioned, reply_to, no
     tool_failures = []
     task_started = False
 
-    def finish(text, store=True):
+    def finish(text, store=True, brain=None, retry_messages=None):
         cleaned = _clean_reply(text or "")
         if tool_failures and _claims_success(cleaned):
             cleaned = ("That didn't go through. " + "; ".join(tool_failures[:2])).strip()
+        # A real brain can emit a one- or two-word fragment and stop. Never
+        # deliver that to the owner: retry once with a strict instruction,
+        # then fall back to an honest complete message.
+        if brain and brain != "none" and _looks_clipped(cleaned):
+            if retry_messages is not None and time.monotonic() < turn_deadline - 3:
+                retry = list(retry_messages) + [{"role": "system", "content":
+                    "Your last reply was cut off mid-sentence. Reply again now "
+                    "in one complete sentence of at least six words. Do not "
+                    "stop after one or two words."}]
+                try:
+                    left = max(5, min(a.CALL_BUDGET, turn_deadline - time.monotonic()))
+                    again = a.call_model(retry, sender, tools=None, budget=left)
+                    candidate = _clean_reply((again.get("content") or "").strip())
+                    if candidate and not _looks_clipped(candidate):
+                        cleaned = candidate
+                except Exception:
+                    pass
+            if _looks_clipped(cleaned):
+                cleaned = FALLBACK_TEXT
+                store = False
         if not cleaned:
             store = False
         text = cleaned or FALLBACK_TEXT
@@ -226,7 +263,8 @@ def run_agent(user_message, sender, is_group, group_jid, mentioned, reply_to, no
             last_text = text
         calls = msg.get("tool_calls") or []
         if not calls:
-            return finish(text, store=(brain_used != "none"))
+            return finish(text, store=(brain_used != "none"),
+                          brain=brain_used, retry_messages=messages)
 
         for tc in calls:
             if calls_done >= MAX_TOOL_CALLS:
@@ -298,7 +336,7 @@ def run_agent(user_message, sender, is_group, group_jid, mentioned, reply_to, no
                          "content": "Tool failures this turn: " + "; ".join(tool_failures) +
                                     ". Do not claim any of them succeeded. Say what failed plainly."})
     messages.append({"role": "user",
-                     "content": "Stop using tools. Reply to me now in one complete message. Finish the thought; do not answer with one word."})
+                     "content": "Stop using tools. Reply now in one complete message with full sentences. Never answer with a single word or cut a sentence in half - even if the question was one word."})
     _t = time.monotonic()
     final = a.call_model(messages, sender, tools=None, budget=remaining)
     final_brain = final.pop("_brain", None)
@@ -306,7 +344,8 @@ def run_agent(user_message, sender, is_group, group_jid, mentioned, reply_to, no
     trace["events"].append({"k": "model", "ms": int((time.monotonic() - _t) * 1000),
                             "calls": 0, "final": True, "brain": final_brain})
     return finish((final.get("content") or "").strip() or last_text,
-                  store=(final_brain != "none"))
+                  store=(final_brain != "none"), brain=final_brain,
+                  retry_messages=messages)
 
 
 def main():
