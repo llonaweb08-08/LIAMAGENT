@@ -303,21 +303,19 @@ class AgentToolTests(unittest.TestCase):
         self.assertNotIn(ADMIN, member_prompt)
         self.assertEqual(agent._people_block(False), "")
 
-    def test_browser_work_prefers_the_vm_and_falls_back_locally(self):
+    def test_browser_work_prefers_the_vm(self):
         agent._vps_browser_note(True)
         with mock.patch.dict(os.environ, {"INSTABOX_API_KEY": "k", "LIAM_VPS_BROWSER": "1"}):
             self.assertTrue(agent._vps_browser_enabled())
             with mock.patch.object(agent, "_remote_browser_task", return_value="remote out") as remote:
                 self.assertEqual(agent.browser_task("print(1)"), "remote out")
             remote.assert_called_once()
+            # A failed box attempt must not silently fall back to running
+            # Chromium on the WhatsApp host.
             with mock.patch.object(agent, "_remote_browser_task", side_effect=RuntimeError("nope")):
-                with mock.patch.object(agent.subprocess, "run") as run:
-                    run.return_value = types.SimpleNamespace(returncode=0, stdout="local out", stderr="")
-                    self.assertEqual(agent.browser_task("print(1)"), "local out")
-            # The failed attempt parks the VM path for a while, so the next call
-            # goes straight to the local browser.
-            self.assertFalse(agent._vps_browser_enabled())
-        agent._vps_browser_note(True)
+                with self.assertRaises(RuntimeError):
+                    agent.browser_task("print(1)")
+            self.assertTrue(agent._vps_browser_enabled())
 
     def test_browser_offload_is_off_without_a_key_or_when_disabled(self):
         agent._vps_browser_note(True)
@@ -1095,11 +1093,10 @@ class SearchAndFetchTests(unittest.TestCase):
         self.assertEqual(check.call_args.args[0], "https://example.com:443")
 
     def test_shell_arguments_use_posix_quoting(self):
-        result = types.SimpleNamespace(returncode=0, stdout="a b\n", stderr="")
-        with mock.patch.object(agent.subprocess, "run", return_value=result) as run:
+        # shell_exec now runs on the InstaBox VM through the bridge tool endpoint.
+        with mock.patch.object(agent.wa, "vps_exec", return_value="exit=0\na b\n") as run:
             self.assertIn("a b", agent.shell_exec('printf "a b"'))
-        self.assertEqual(run.call_args.args[0], ["printf", "a b"])
-        self.assertFalse(run.call_args.kwargs["shell"])
+        self.assertEqual(run.call_args.args[0], 'printf "a b"')
 
     def test_email_read_only_takes_folder_and_limit(self):
         self.assertEqual(list(inspect.signature(agent.email_read).parameters), ["folder", "limit"])

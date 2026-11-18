@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import html
 import http.client
-import imaplib
 import ipaddress
 import json
 import os
@@ -14,7 +13,7 @@ import urllib.request
 
 import liam_keys
 
-from .runtime import BASE_DIR, FILE_READ_MAX, SHELL_OUTPUT_MAX, _atomic_write_text, _env_int
+from .runtime import BASE_DIR, FILE_READ_MAX, _atomic_write_text, _env_int
 from .state import _clamp_timeout
 
 _BLOCKED_HOST_SUFFIXES = (".local", ".internal", ".localhost", ".home", ".lan")
@@ -348,103 +347,164 @@ def web_search(query):
     return "search failed - " + "; ".join(failures[:3])
 
 
+def _box_exec(command, timeout=120, sender=None):
+    """Run a command on the InstaBox VM through the bridge tool endpoint.
+
+    Shell and file work no longer run on the local host, the machine that holds
+    the WhatsApp socket; they run on the box so that host keeps memory for the
+    socket, the agent and its turn state.
+    """
+    from ._compat import agent_mod
+    agent = agent_mod()
+    seconds = _generous_timeout("LIAM_SHELL_TIMEOUT", float(timeout or 3600))
+    return str(agent.wa.vps_exec(
+        str(command or ""), timeout=seconds, cwd="", sender=sender or agent.OWNERS[0],
+        chat=agent.OWNERS[0], group=False) or "")
+
+
+def _box_script_exec(script, timeout=120, sender=None) -> str:
+    """Stage a python script on the box and run it there, returning its output."""
+    from . import integrations as _integrations
+    from ._compat import agent_mod
+    agent = agent_mod()
+    path = _integrations._vps_stage("liam_tool_%s.py" % os.urandom(6).hex(), str(script or ""))
+    out = agent.wa.vps_exec(
+        "cd %s && PYTHONPATH=%s python3 %s" % (
+            shlex.quote(_integrations.VPS_BROWSER_DIR),
+            shlex.quote(_integrations.VPS_PYLIB_DIR),
+            shlex.quote(path)),
+        timeout=_integrations._clamp_timeout(_integrations._env_int("LIAM_BROWSER_TIMEOUT", 1800, 10, 3600)),
+        cwd="", sender=sender or agent.OWNERS[0], chat=agent.OWNERS[0], group=False)
+    out_text = str(out or "")
+    if not _integrations._vps_ok(out_text):
+        raise RuntimeError("remote tool failed")
+    idx = out_text.find("\n")
+    text = out_text[idx + 1:] if idx > 0 and out_text[:idx].startswith("exit=") else out_text
+    return text.strip()[:8000]
+
+
 def file_read(path):
+    p = str(path or "").strip()
+    if not p:
+        return "read failed: empty path"
+    script = (
+        "import os\n"
+        "p = " + repr(p) + "\n"
+        "if not os.path.isfile(p):\n"
+        '    raise SystemExit(3)\n'
+        "with open(p, 'r', encoding='utf-8', errors='replace') as handle:\n"
+        "    print(handle.read(" + str(FILE_READ_MAX) + ")[:"
+        + str(FILE_READ_MAX) + "])\n"
+    )
     try:
-        with open(path, encoding="utf-8", errors="replace") as handle:
-            return handle.read(FILE_READ_MAX)[:FILE_READ_MAX]
+        return _box_script_exec(script, timeout=600) or "read failed: empty"
     except Exception as e:
         return f"read failed: {type(e).__name__}"
 
 
 def file_write(path, content):
+    p = str(path or "").strip()
+    value = str(content or "")
+    if not p:
+        return "write failed: empty path"
+    script = (
+        "import os\n"
+        "p = " + repr(p) + "\n"
+        "c = " + repr(value) + "\n"
+        "os.makedirs(os.path.dirname(p) or '.', exist_ok=True)\n"
+        "with open(p, 'w') as handle:\n"
+        "    handle.write(c)\n"
+    )
     try:
-        value = str(content or "")
-        _atomic_write_text(path, value, mode=0o600)
-        return f"wrote {len(value)} bytes to {path}"
+        _box_script_exec(script, timeout=600)
+        return f"wrote {len(value)} bytes to {p}"
     except Exception as e:
         return f"write failed: {type(e).__name__}"
 
 
 def shell_exec(command, timeout=None):
-    from ._compat import agent_mod
-    sp = agent_mod().subprocess
+    if isinstance(command, (list, tuple)):
+        text = " ".join(str(x) for x in command).strip()
+    else:
+        text = str(command or "").strip()
+    if not text:
+        return "empty command"
+    if len(text) > 8000:
+        return "command is too long"
     try:
-        if isinstance(command, (list, tuple)):
-            args = [str(x) for x in command]
-        else:
-            text = str(command or "").strip()
-            if not text:
-                return "empty command"
-            if len(text) > 4000:
-                return "command is too long"
-            args = shlex.split(text, posix=True)
-        if not args:
-            return "empty command"
-        timeout = _generous_timeout("LIAM_SHELL_TIMEOUT", int(timeout or 3600))
-        result = sp.run(
-            args, shell=False, capture_output=True, text=True, timeout=timeout)
-        output = ((result.stdout or "") + (result.stderr or ""))[:SHELL_OUTPUT_MAX]
-        return f"exit={result.returncode}\n{output}"
-    except sp.TimeoutExpired:
-        return "command timed out"
+        return _box_exec(text, timeout if timeout is not None else 3600)
     except Exception as e:
         return f"exec failed: {type(e).__name__}"
 
 
 def email_read(folder="INBOX", limit=5):
-    """Read recent mail; credentials always come from LIAM_EMAIL_* env vars."""
-    host = str(os.environ.get("LIAM_EMAIL_HOST") or "").strip()
-    username = str(os.environ.get("LIAM_EMAIL_USER") or "").strip()
-    password = str(os.environ.get("LIAM_EMAIL_PASSWORD") or "")
-    folder = str(folder or os.environ.get("LIAM_EMAIL_FOLDER") or "INBOX").strip() or "INBOX"
-    if not host or not username or not password:
-        return "email is not configured (set LIAM_EMAIL_HOST, LIAM_EMAIL_USER and LIAM_EMAIL_PASSWORD)"
-    mail = None
+    """Read recent mail through a script that runs on the InstaBox VM.
+
+    The mailbox credentials come from the environment the script runs with, so
+    the IMAP session itself now happens on the box instead of the host that
+    holds the WhatsApp socket.
+    """
+    folder_value = str(folder or os.environ.get("LIAM_EMAIL_FOLDER") or "INBOX").strip() or "INBOX"
+    limit_value = max(1, min(20, int(limit or 5)))
+    script_lines = [
+        "import os, imaplib, email, sys",
+        "host = os.environ.get('LIAM_EMAIL_HOST') or ''",
+        "user = os.environ.get('LIAM_EMAIL_USER') or ''",
+        "pw = os.environ.get('LIAM_EMAIL_PASSWORD') or ''",
+        "folder = " + repr(folder_value) + "",
+        "limit = " + repr(limit_value) + "",
+        "if not host or not user or not pw:",
+        "    raise SystemExit(4)",
+        "mail = None",
+        "out = []",
+        "try:",
+        "    mail = imaplib.IMAP4_SSL(host, int(os.environ.get('LIAM_EMAIL_PORT') or 993), timeout=30)",
+        "    mail.login(user, pw)",
+        "    status, _ = mail.select(folder, readonly=True)",
+        "    if status != 'OK':",
+        "        raise SystemExit(5)",
+        "    status, data = mail.search(None, 'ALL')",
+        "    if status != 'OK' or not data:",
+        "        raise SystemExit(6)",
+        "    ids = (data[0] or b'').split()[-limit:]",
+        "    for message_id in ids:",
+        "        status, message_data = mail.fetch(message_id, '(RFC822)')",
+        "        if status != 'OK' or not message_data:",
+        "            continue",
+        "        raw = next((part[1] for part in message_data if isinstance(part, tuple) and len(part) > 1), b'')",
+        "        message = email.message_from_bytes(raw)",
+        "        body = ''",
+        "        if message.is_multipart():",
+        "            for part in message.walk():",
+        "                if part.get_content_type() != 'text/plain':",
+        "                    continue",
+        "                if 'attachment' in str(part.get('Content-Disposition') or '').lower():",
+        "                    continue",
+        "                payload = part.get_payload(decode=True) or b''",
+        "                body = payload.decode(part.get_content_charset() or 'utf-8', 'replace')",
+        "                break",
+        "        else:",
+        "            payload = message.get_payload(decode=True) or b''",
+        "            body = payload.decode(message.get_content_charset() or 'utf-8', 'replace')",
+        "        sender = str(message.get('From') or '')",
+        "        subject = str(message.get('Subject') or '')",
+        "        entry = sender + ' | Subject: ' + subject + ' | ' + str(body)[:500])",
+        "        out.append(entry)",
+        "finally:",
+        "    if mail is not None:",
+        "        try:",
+        "            mail.logout()",
+        "        except Exception:",
+        "            pass",
+        "if not out:",
+        "    raise SystemExit(7)",
+        "sys.stdout.write(chr(10).join(out))",
+    ]
+    email_script = "\n".join(script_lines)
     try:
-        import email
-        port = _env_int("LIAM_EMAIL_PORT", 993, 1, 65535)
-        timeout = _generous_timeout("LIAM_EMAIL_TIMEOUT")
-        limit = max(1, min(20, int(limit or 5)))
-        mail = imaplib.IMAP4_SSL(host, port, timeout=timeout)
-        mail.login(username, password)
-        status, _ = mail.select(folder, readonly=True)
-        if status != "OK":
-            return f"could not open folder {folder}"
-        status, data = mail.search(None, "ALL")
-        if status != "OK" or not data:
-            return "could not search the mailbox"
-        ids = (data[0] or b"").split()[-limit:]
-        out = []
-        for message_id in ids:
-            status, message_data = mail.fetch(message_id, "(RFC822)")
-            if status != "OK" or not message_data:
-                continue
-            raw = next((part[1] for part in message_data
-                        if isinstance(part, tuple) and len(part) > 1), b"")
-            message = email.message_from_bytes(raw)
-            body = ""
-            if message.is_multipart():
-                for part in message.walk():
-                    if part.get_content_type() != "text/plain":
-                        continue
-                    if "attachment" in str(part.get("Content-Disposition") or "").lower():
-                        continue
-                    payload = part.get_payload(decode=True) or b""
-                    body = payload.decode(part.get_content_charset() or "utf-8", "replace")
-                    break
-            else:
-                payload = message.get_payload(decode=True) or b""
-                body = payload.decode(message.get_content_charset() or "utf-8", "replace")
-            out.append(f"From: {message.get('From')}\nSubject: {message.get('Subject')}\n{body[:500]}")
-        return "\n---\n".join(out) if out else "no messages"
+        return _box_script_exec(email_script, timeout=60)
     except Exception as e:
         return f"email read failed: {type(e).__name__}"
-    finally:
-        if mail is not None:
-            try:
-                mail.logout()
-            except Exception:
-                pass
 
 
 def create_tool(name, code):

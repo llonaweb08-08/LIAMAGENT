@@ -407,13 +407,12 @@ def browser_task(script, sender=None, chat="", group=False):
     remote = getattr(a, "_remote_browser_task", _remote_browser_task)
     note = getattr(a, "_vps_browser_note", _vps_browser_note)
     if enabled():
-        try:
-            result = remote(script)
-            note(True)
-            return result
-        except Exception as e:
-            note(False)
-            _log(f"warn: remote browser task failed, using the local browser: {type(e).__name__}")
+        # The browser runs on the InstaBox VM. When a box is configured the
+        # local host must not quietly run Chromium: that would starve the
+        # WhatsApp socket and the agent on the same container.
+        result = remote(script)
+        note(True)
+        return result
     path = _unique_file(".py")
     try:
         with open(path, "w", encoding="utf-8") as f:
