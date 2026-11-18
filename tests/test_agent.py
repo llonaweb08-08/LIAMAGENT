@@ -8,12 +8,15 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import http.client
 import importlib.util
+import inspect
 import io
 import json
 import os
 import re
 import socket
+import sys
 import tempfile
 import time
 import types
@@ -37,6 +40,8 @@ import liam_google  # noqa: E402
 import liam_keys  # noqa: E402
 import liam_voice  # noqa: E402
 import whatsapp_liam as wa  # noqa: E402
+from liam_agent import web as agent_web  # noqa: E402
+from scripts import doctor, scan_secrets  # noqa: E402
 
 OWNER = agent.OWNERS[0]
 ADMIN = next(iter(agent.ADMS))
@@ -92,6 +97,34 @@ class ToolClientTests(unittest.TestCase):
         self.assertEqual(kwargs["json"], {"action": "send", "to": "123", "text": "hi"})
         self.assertEqual(kwargs["headers"]["Authorization"], "Bearer " + "a" * 64)
         self.assertIn("timeout", kwargs)
+
+    def test_post_uses_owner_token_for_owner_sender(self):
+        owner_token = "b" * 64
+        response = FakeResponse(200, {"ok": True, "msg": "exit=0"})
+        with mock.patch.dict(os.environ, {"LIAM_OWNER_TOKEN": owner_token}), \
+                mock.patch.object(wa.requests, "post", return_value=response) as post:
+            self.assertEqual(
+                wa._post("vps_exec", sender=OWNER, command="id"), "exit=0")
+        self.assertEqual(
+            post.call_args.kwargs["headers"]["Authorization"], "Bearer " + owner_token)
+
+    def test_post_keeps_tool_token_for_member_actions(self):
+        owner_token = "c" * 64
+        response = FakeResponse(200, {"ok": True, "msg": "approval requested"})
+        with mock.patch.dict(os.environ, {"LIAM_OWNER_TOKEN": owner_token}), \
+                mock.patch.object(wa.requests, "post", return_value=response) as post:
+            wa._post("vps_exec", sender=MEMBER, command="id")
+        self.assertEqual(
+            post.call_args.kwargs["headers"]["Authorization"], "Bearer " + "a" * 64)
+
+    def test_post_falls_back_to_tool_token_without_owner_token(self):
+        response = FakeResponse(200, {"ok": True, "msg": "exit=0"})
+        with mock.patch.dict(os.environ, {}, clear=False), \
+                mock.patch.object(wa.requests, "post", return_value=response) as post:
+            os.environ.pop("LIAM_OWNER_TOKEN", None)
+            wa._post("vps_exec", sender=OWNER, command="id")
+        self.assertEqual(
+            post.call_args.kwargs["headers"]["Authorization"], "Bearer " + "a" * 64)
 
     def test_http_error_returns_safe_message(self):
         response = FakeResponse(500, {"ok": False, "msg": "the WhatsApp action failed"})
@@ -219,6 +252,12 @@ class AgentToolTests(unittest.TestCase):
     def tearDown(self):
         agent.set_brain("moonmath")
         wa.set_stop(False)
+
+    def _reset_progress(self):
+        agent._LAST_PROGRESS_AT = 0.0
+        agent._LAST_PROGRESS_TEXT = ""
+        agent._LAST_PROGRESS_EMIT_AT = 0.0
+        agent._PROGRESS_COUNT = 0
 
     def test_config_owners_and_admins_are_shared(self):
         self.assertIn(OWNER, agent.OWNERS)
@@ -464,16 +503,61 @@ class AgentToolTests(unittest.TestCase):
             self.assertEqual(agent._tools_for(OWNER)["report_progress"]("hi"), "sent")
         report.assert_called_once_with("hi", sender=OWNER)
 
+    def test_member_send_voice_ignores_an_arbitrary_recipient(self):
+        jid = "120363000000000000@g.us"
+        with mock.patch.object(agent, "send_voice", return_value="sent") as send:
+            result = agent._tools_for(MEMBER, jid, True)["send_voice"](to=OWNER, text="hello")
+        self.assertEqual(result, "sent")
+        send.assert_called_once_with(jid, "hello", sender=MEMBER, chat=jid, group=True)
+
     def test_progress_tool_is_available_to_members_and_writes_a_json_line(self):
         schemas = {s["function"]["name"] for s in agent._schemas_for(MEMBER)}
         self.assertIn("progress", schemas)
+        self._reset_progress()
         buf = io.StringIO()
+        agent._REQUEST_ID = None
         with contextlib.redirect_stdout(buf):
             self.assertEqual(agent._tools_for(MEMBER)["progress"]("  I'm on the signup page  "), "sent")
+        line = json.loads(buf.getvalue().strip())
+        self.assertEqual(line["progress"], "I'm on the signup page")
+        self.assertIsNone(line["id"])
+
+    def test_progress_line_echoes_the_turn_request_id(self):
+        self._reset_progress()
+        buf = io.StringIO()
+        agent._REQUEST_ID = "req-br10"
+        try:
+            with contextlib.redirect_stdout(buf):
+                self.assertEqual(agent._emit_progress("working on it"), "sent")
+        finally:
+            agent._REQUEST_ID = None
         self.assertEqual(json.loads(buf.getvalue().strip()),
-                         {"progress": "I'm on the signup page"})
+                         {"progress": "working on it", "id": "req-br10"})
+
+    def test_loop_main_stores_the_request_id_from_the_payload(self):
+        self._reset_progress()
+        payload = {"u": "hi", "s": OWNER, "i": "req-loop"}
+        stdin = io.StringIO(json.dumps(payload) + "\n")
+        buf = io.StringIO()
+
+        def fake_run_agent(message, sender, is_group, group_jid, mentioned, reply_to, no_history=False):
+            agent._emit_progress("from the turn")
+            return "ok"
+
+        try:
+            with mock.patch.object(sys, "stdin", stdin), \
+                    mock.patch.object(agent, "run_agent", side_effect=fake_run_agent), \
+                    contextlib.redirect_stdout(buf):
+                agent.main()
+        finally:
+            agent._REQUEST_ID = None
+        lines = [json.loads(line) for line in buf.getvalue().splitlines() if line.strip()]
+        self.assertEqual(lines[0], {"ready": True})
+        progress = [line for line in lines if "progress" in line]
+        self.assertEqual(progress, [{"progress": "from the turn", "id": "req-loop"}])
 
     def test_emit_progress_ignores_blank_and_truncates_long_text(self):
+        self._reset_progress()
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             self.assertEqual(agent._emit_progress("   "), "nothing to report")
@@ -510,7 +594,6 @@ class AgentToolTests(unittest.TestCase):
         self.assertIn("browser", emitted[0].lower())
 
     def test_auto_progress_is_throttled_between_slow_tools(self):
-        emitted = []
         steps = {"n": 0}
 
         def fake_model(messages, sender, **kwargs):
@@ -524,21 +607,17 @@ class AgentToolTests(unittest.TestCase):
                         "name": "browser_task",
                         "arguments": json.dumps({"script": "print(2)"})}},
                 ]}
-            return {"role": "assistant", "content": "done", "_brain": "moonmath"}
+            return {"role": "assistant", "content": "All done.", "_brain": "moonmath"}
 
-        def fake_emit(text):
-            emitted.append(text)
-            agent._LAST_PROGRESS_AT = time.monotonic()  # a fresh update just went out
-            return "sent"
-
-        try:
-            with mock.patch.object(agent, "call_model", side_effect=fake_model), \
-                    mock.patch.dict(agent.TOOLS, {"browser_task": lambda script="": "ok"}), \
-                    mock.patch.object(agent, "_emit_progress", side_effect=fake_emit):
-                agent.run_agent("do it", OWNER, False, "", False, False)
-        finally:
-            agent._LAST_PROGRESS_AT = 0.0
-        self.assertEqual(len(emitted), 1, "the second slow tool must be throttled")
+        self._reset_progress()
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), \
+                mock.patch.object(agent, "call_model", side_effect=fake_model), \
+                mock.patch.dict(agent.TOOLS, {"browser_task": lambda script="": "ok"}):
+            agent.run_agent("do it", OWNER, False, "", False, False)
+        lines = [json.loads(line) for line in buf.getvalue().splitlines() if line.strip()]
+        self.assertEqual(len(lines), 1, "the second slow tool must be throttled")
+        self.assertIn("browser", lines[0]["progress"].lower())
 
     def test_brain_switch_is_owner_only(self):
         self.assertIn("only the owner", agent.switch_brain("moon", MEMBER))
@@ -807,7 +886,17 @@ class AgentToolTests(unittest.TestCase):
             agent._DEADLINE = time.monotonic() + 5
             self.assertLessEqual(agent._clamp_timeout(90), 5.5)
             agent._DEADLINE = time.monotonic() - 10
-            self.assertEqual(agent._clamp_timeout(90), 2.0)
+            self.assertEqual(agent._clamp_timeout(90), 1.0)
+        finally:
+            agent._DEADLINE = None
+
+    def test_facade_state_forwards_to_the_shared_module(self):
+        from liam_agent import state
+        try:
+            agent._DEADLINE = 123.0
+            self.assertEqual(state._DEADLINE, 123.0)
+            state._DEADLINE = None
+            self.assertIsNone(agent._DEADLINE)
         finally:
             agent._DEADLINE = None
 
@@ -986,6 +1075,44 @@ class SearchAndFetchTests(unittest.TestCase):
             out = agent._search_duckduckgo("hello")
         self.assertIn("https://example.com/page", out[0])
 
+    def test_safe_url_carries_the_vetted_address(self):
+        info = (2, 1, 6, "", ("93.184.216.34", 0))
+        with mock.patch.object(agent_web.socket, "getaddrinfo", return_value=[info]):
+            safe = agent_web._safe_url("https://example.com/page")
+        self.assertEqual(str(safe), "https://example.com/page")
+        self.assertEqual(safe.pinned_ip, "93.184.216.34")
+
+    def test_pinned_connection_dials_the_validated_address(self):
+        safe = agent_web._SafeUrl("https://example.com:443")
+        safe.pinned_ip = "93.184.216.34"
+        with mock.patch.object(agent_web, "_safe_url", return_value=safe) as check, \
+                mock.patch.object(agent_web.socket, "create_connection",
+                                  return_value=object()) as dial:
+            cls = agent_web._pinned_connection("https", http.client.HTTPConnection)
+            conn = cls("example.com", 443, timeout=5)
+            conn._create_connection(("example.com", 443), 5, None)
+        dial.assert_called_once_with(("93.184.216.34", 443), 5, None)
+        self.assertEqual(check.call_args.args[0], "https://example.com:443")
+
+    def test_shell_arguments_use_posix_quoting(self):
+        result = types.SimpleNamespace(returncode=0, stdout="a b\n", stderr="")
+        with mock.patch.object(agent.subprocess, "run", return_value=result) as run:
+            self.assertIn("a b", agent.shell_exec('printf "a b"'))
+        self.assertEqual(run.call_args.args[0], ["printf", "a b"])
+        self.assertFalse(run.call_args.kwargs["shell"])
+
+    def test_email_read_only_takes_folder_and_limit(self):
+        self.assertEqual(list(inspect.signature(agent.email_read).parameters), ["folder", "limit"])
+
+    def test_web_fetch_decodes_html_entities(self):
+        class Context(SearchAndFetchTests._Context):
+            headers = types.SimpleNamespace(get_content_charset=lambda: "utf-8")
+
+        page = b"<html><script>bad()</script><p>Tom &amp; Jerry</p></html>"
+        with mock.patch.object(agent, "_safe_url", side_effect=lambda value: value), \
+                mock.patch.object(agent, "_open_url", return_value=Context(page)):
+            self.assertEqual(agent.web_fetch("https://example.com"), "Tom & Jerry")
+
     def test_redirects_are_revalidated(self):
         handler = agent._SafeRedirectHandler()
         request = urllib.request.Request("https://example.com/")
@@ -996,7 +1123,7 @@ class SearchAndFetchTests(unittest.TestCase):
     def test_local_image_must_live_inside_the_data_directory(self):
         with self.assertRaises(ValueError):
             agent._local_image_data_url("C:/Windows/win.ini")
-        image = Path(agent.DATA_DIR) / "analysis.png"
+        image = Path(agent.OUTBOX_DIR) / "analysis.png"
         image.write_bytes(b"PNGDATA")
         try:
             url = agent._local_image_data_url(str(image))
@@ -1004,6 +1131,7 @@ class SearchAndFetchTests(unittest.TestCase):
             with mock.patch.object(agent, "call_model", return_value={"content": "a cat"}) as cm:
                 self.assertEqual(agent.analyze_image(str(image), "what is it?"), "a cat")
             self.assertEqual(cm.call_args.kwargs["brain"], "moonmath")
+            self.assertEqual(cm.call_args.kwargs["fallbacks"], ())
         finally:
             image.unlink(missing_ok=True)
 
@@ -1158,6 +1286,19 @@ class HygieneTests(unittest.TestCase):
                                   side_effect=[(False, "HTTP 429"), (True, "")]) as probe:
             self.assertEqual(debug_probe.probe("moonmath", timeout=1), (True, ""))
         self.assertEqual(probe.call_count, 2)
+
+    def test_debug_probe_reports_every_failed_key_by_index(self):
+        fake = dict(agent.BRAINS["moonmath"])
+        fake["keys"] = ["one", "two", "three"]
+        with mock.patch.dict(agent.BRAINS, {"moonmath": fake}), \
+                mock.patch.object(agent, "_probe", side_effect=[
+                    (False, "HTTP 429"), (False, "timeout"), (False, "quota exhausted")]):
+            ok, why = debug_probe.probe("moonmath", timeout=1)
+        self.assertFalse(ok)
+        for token in ("key[0]", "key[1]", "key[2]", "HTTP 429", "timeout", "quota exhausted"):
+            self.assertIn(token, why)
+        for key in fake["keys"]:
+            self.assertNotIn(key, why)
 
     def test_debug_probe_output_has_no_keys(self):
         with mock.patch.object(debug_probe, "probe", return_value=(True, "")):
@@ -1483,6 +1624,63 @@ class KeyRotationTests(unittest.TestCase):
         self.assertIn("only the owner", agent.check_key("moonmath", 1, MEMBER))
         tools = agent._tools_for(MEMBER, "", False)
         self.assertIn("only the owner", tools["check_key"]("moonmath", 1))
+
+
+class ScriptDiagnosticTests(unittest.TestCase):
+    def test_scanner_allowlist_is_path_anchored(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "docs").mkdir()
+            (root / "notdocs").mkdir()
+            allowed = root / "docs" / "notes.txt"
+            blocked = root / "notdocs" / "notes.txt"
+            for path in (allowed, blocked):
+                path.write_text("MOON_KEYS = verylongplaintextvalue\n", encoding="utf-8")
+            with mock.patch.object(scan_secrets, "ROOT", root):
+                self.assertEqual(scan_secrets.scan_file(allowed, False), [])
+                self.assertTrue(scan_secrets.scan_file(blocked, False))
+
+    def test_scanner_checks_only_the_assigned_value(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "settings.py"
+            source.write_text(
+                "MOON_KEYS = os.environ.get('MOON_KEYS')  # getenv\n"
+                "AGNES_KEY = 'veryplaintextliteral'  # os.environ\n",
+                encoding="utf-8")
+            with mock.patch.object(scan_secrets, "ROOT", root):
+                findings = scan_secrets.scan_file(source, False)
+            self.assertEqual([kind for _, _, kind in findings], ["assignment:secret-name"])
+            self.assertEqual(findings[0][1], 2)
+
+    def test_doctor_probes_both_health_endpoints(self):
+        class Response:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def read(self, _limit=-1):
+                return b"ok"
+
+        seen = []
+
+        def fake_urlopen(request, timeout):
+            seen.append(request.full_url)
+            return Response()
+
+        with mock.patch.object(doctor.urllib.request, "urlopen", side_effect=fake_urlopen), \
+                contextlib.redirect_stdout(io.StringIO()):
+            ok, checks = doctor._check_health("https://liam.example/")
+        self.assertTrue(ok)
+        self.assertEqual(seen, ["https://liam.example/health", "https://liam.example/ready"])
+        self.assertEqual(len(checks), 2)
+
+    def test_doctor_uses_the_canonical_memory_database(self):
+        self.assertEqual(doctor._db_path(), Path(agent.DB))
 
 
 if __name__ == "__main__":

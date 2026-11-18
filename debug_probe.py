@@ -29,15 +29,18 @@ def probe_key(brain: str, key: str, timeout: float) -> tuple[bool, str]:
 
 
 def probe(name: str, timeout: float = 8.0) -> tuple[bool, str]:
-    """Return (ok, reason) for one brain, trying each configured key in order."""
+    """Return (ok, reason) for one brain, reporting every failed key by index."""
     brain = agent.BRAINS[name]
     reasons: list[str] = []
-    for key in brain["keys"]:
+    for index, key in enumerate(brain["keys"]):
+        if not key:
+            reasons.append(f"key[{index}]: empty slot")
+            continue
         ok, why = probe_key(name, key, timeout)
         if ok:
             return True, ""
-        reasons.append(why or "unreachable")
-    return False, reasons[0] if reasons else "no key configured"
+        reasons.append(f"key[{index}]: {why or 'unreachable'}")
+    return False, "; ".join(reasons) if reasons else "no key configured"
 
 
 def per_key(name: str, timeout: float = 8.0) -> list[dict]:

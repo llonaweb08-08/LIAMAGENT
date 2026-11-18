@@ -20,9 +20,14 @@ services:
       - key: LIAM_BOT_PHONE
         value: "447881161023"
       # Stable secret for the /qr and /pair pages. Render generates and keeps it
-      # across deploys; the pairing URL is printed in the deploy logs.
+      # across deploys, but logs only a redacted token: build the full URL from
+      # this value in the dashboard (see docs/DEPLOY_RENDER.md).
       - key: LIAM_PAIR_TOKEN
         generateValue: true
+      # WhatsApp rate-limits code requests hard. Wait 5 minutes between new
+      # requests (the code itself is reused for the first 60 seconds).
+      - key: LIAM_PAIRING_COOLDOWN_MS
+        value: "300000"
       # Baileys log level: silent (default), error, warn, info, debug or trace.
       # Set it in the dashboard (e.g. to debug a connection) without render.yaml
       # resetting it back on the next deploy.
@@ -119,11 +124,12 @@ services:
       # --- Staying linked ----------------------------------------------------
       # WhatsApp drops the socket (428) when this container cannot answer its
       # keep-alives - which is what a memory spike or a stalled event loop looks
-      # like from WhatsApp's side. Recycle the WhatsApp socket (keeping the
-      # login) before the 512 MiB limit is hit, and ping a little more often so
-      # one missed beat is not fatal.
+      # like from WhatsApp's side. Recycle just the WhatsApp socket (keeping the
+      # login) at 320 MiB to leave headroom under the 512 MiB free-plan limit.
+      # This is NOT a guarantee: the guard cannot undo a Chromium spike from a
+      # local browser task, which is why LIAM_VPS_BROWSER=1 below is important.
       - key: LIAM_MEM_LIMIT_MB
-        value: "400"
+        value: "320"
       - key: LIAM_WA_KEEPALIVE_MS
         value: "25000"
       # Run headless Chromium on the InstaBox VM instead of this container, so

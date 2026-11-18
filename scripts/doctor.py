@@ -25,6 +25,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import liam_keys  # noqa: E402
+from liam_agent.memory import DB as MEMORY_DB  # noqa: E402
 
 
 def _flag(value: str) -> str:
@@ -41,8 +42,7 @@ def _data_dir() -> Path:
 
 
 def _db_path() -> Path:
-    override = os.environ.get("LIAM_DB")
-    return Path(override) if override else ROOT / "liam_memory.db"
+    return Path(MEMORY_DB)
 
 
 def _node_version() -> str:
@@ -70,19 +70,27 @@ def _check_db(path: Path, errors: list[str], warnings: list[str]) -> None:
         errors.append(f"memory database is unreadable ({path}): {exc}")
 
 
-def _check_health(base: str) -> bool:
+def _check_health(base: str) -> tuple[bool, list[str]]:
+    """Probe both endpoints and report the combined result."""
     base = base.rstrip("/")
+    checks: list[str] = []
+    healthy: list[bool] = []
     for path in ("/health", "/ready"):
         try:
             request = urllib.request.Request(base + path, headers={"User-Agent": "liam-doctor"})
             with urllib.request.urlopen(request, timeout=15) as response:
                 body = response.read(4000).decode("utf-8", "replace")
-                print(f"  {path}: HTTP {response.status} {body[:300]}")
+                status = getattr(response, "status", 200)
+                print(f"  {path}: HTTP {status} {body[:300]}")
+                checks.append(f"{path}: HTTP {status}")
+                healthy.append(200 <= status < 300)
         except Exception as exc:
-            print(f"  {path}: unreachable ({type(exc).__name__})")
-            if path == "/health":
-                return False
-    return True
+            code = getattr(exc, "code", None)
+            detail = f"HTTP {code}" if code else f"unreachable ({type(exc).__name__})"
+            print(f"  {path}: {detail}")
+            checks.append(f"{path}: {detail}")
+            healthy.append(False)
+    return all(healthy), checks
 
 
 def _run_secret_scan(include_local: bool = False) -> tuple[int, str]:
@@ -116,7 +124,10 @@ def main(argv: list[str] | None = None) -> int:
     scan_rc, scan_msg = _run_secret_scan(include_local=False)
     print(f"  secret scan (tracked): {'ok' if scan_rc == 0 else 'findings/error'}")
     if scan_rc == 1:
-        errors.append("tracked secret scan reported findings; run `python scripts/scan_secrets.py` for redacted details")
+        errors.append(
+            "tracked secret scan reported findings; run "
+            "`python scripts/scan_secrets.py` for redacted details"
+        )
     elif scan_rc not in (0, 1):
         warnings.append(f"could not complete tracked secret scan ({scan_msg})")
 
@@ -206,8 +217,10 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.url:
         print(f"  deployment probe: {args.url}")
-        if not _check_health(args.url):
-            errors.append(f"deployment /health is unreachable: {args.url}")
+        ok, checks = _check_health(args.url)
+        print("  health checks: " + "; ".join(checks))
+        if not ok:
+            errors.append("deployment health probe failed: " + "; ".join(checks))
 
     if warnings:
         print("\nWarnings:")

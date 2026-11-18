@@ -1,6 +1,20 @@
 repos:
   - repo: local
     hooks:
+      - id: ruff
+        name: Ruff (E, W, F, B)
+        entry: python -m ruff check .
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-commit]
+      - id: npm-test
+        name: Node tests
+        entry: npm test
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-commit]
       - id: scan-secrets
         name: Scan for likely plaintext secrets
         entry: python scripts/scan_secrets.py

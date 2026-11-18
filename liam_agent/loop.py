@@ -4,19 +4,41 @@ import json
 import random
 import time
 
+from . import state
 from ._compat import agent_mod
+from .integrations import AUTO_PROGRESS_TOOLS, SLOW_TOOLS
 from .memory import _clean_reply, _facts
 from .people import ADMS, OWNERS, PETNAMES, _norm_user, _people_block
 from .registry import FALLBACK_TEXT, PROMPT, _brain_block, _email_block
-from .runtime import _env_int, _log
-from .state import _remaining_budget
+from .runtime import HISTORY_MESSAGES, MAX_STEPS, MAX_TOOL_CALLS, TOOL_RESULT_MAX, _env_int, _log
+
+
+def _begin_stop_tracking():
+    """Snapshot the stop flag for one turn; consume a stale flag from an older turn.
+
+    The bridge still writes a single "1" into stop_flag, so the token (when the
+    payload supplies one) wins and the file's mtime is the backward-compatible
+    fallback. A flag written *before* this turn belongs to an older request.
+    """
+    try:
+        raw, stamp = agent_mod().wa.get_stop_state()
+    except Exception:
+        raw, stamp = "", 0.0
+    state._STOP_BASELINE = (raw, float(stamp or 0.0))
+    if raw and raw != "0":
+        _clear_stop()
+        state._STOP_BASELINE = ("0", time.time_ns())
 
 
 def _stop_requested():
+    token = state._STOP_TOKEN
     try:
-        return bool(agent_mod().wa.get_stop())
+        raw, stamp = agent_mod().wa.get_stop_state()
     except Exception:
         return False
+    if token and raw == str(token):
+        return True
+    return bool(raw) and raw != "0" and float(stamp or 0.0) > float(state._STOP_BASELINE[1] or 0.0)
 
 
 def _clear_stop():
@@ -24,6 +46,7 @@ def _clear_stop():
         agent_mod().wa.set_stop(False)
     except Exception:
         pass
+    state._STOP_TOKEN = None
 
 
 def _parse_args(raw):
@@ -37,10 +60,31 @@ def _parse_args(raw):
     try:
         value = json.loads(s)
     except json.JSONDecodeError as e:
-        raise ValueError(f"invalid JSON ({e.msg})")
+        raise ValueError(f"invalid JSON ({e.msg})") from e
     if not isinstance(value, dict):
         raise ValueError("arguments must be a JSON object")
     return value
+
+
+def _validate_tool_args(name, args, schema_map):
+    """Check required/unknown keys before dispatch.
+
+    Tool calls come from a model, but a prompt injection can still smuggle in
+    kwargs. Schemas are closed objects, so reject anything the schema does not
+    declare instead of letting it override a wrapped tool's parameters.
+    """
+    spec = schema_map.get(name)
+    if spec is None:
+        return None  # unknown tool is reported by the caller
+    properties = spec.get("properties")
+    properties = properties if isinstance(properties, dict) else {}
+    unknown = sorted(str(k) for k in args if k not in properties)
+    if unknown:
+        return "unexpected argument(s): " + ", ".join(unknown)
+    missing = [str(k) for k in (spec.get("required") or []) if k not in args]
+    if missing:
+        return "missing required argument(s): " + ", ".join(missing)
+    return None
 
 
 def _tool_failed(result):
@@ -95,18 +139,19 @@ def _history_get(key):
             h = a.load_chat_history(key, a.HISTORY_MESSAGES)
         except Exception:
             h = []
-        h = list(h)
-        # Only cache non-empty history so probe/no-store turns and empty chats
-        # don't leave phantom entries (and so tests/startups stay clean). Normal
-        # turns persist via _history_add/save_chat_history.
-        if h:
-            a._HISTORY[key] = h
-            # keep cache bounded
-            while len(a._HISTORY) > 1000:
-                del a._HISTORY[next(iter(a._HISTORY))]
-        else:
-            return []
+        # Cache the result even when it is empty, so repeated turns do not
+        # re-read the database. No-store turns drop the empty entry in finish().
+        a._HISTORY[key] = list(h)
+        while len(a._HISTORY) > 1000:
+            del a._HISTORY[next(iter(a._HISTORY))]
     return [dict(m) for m in a._HISTORY.get(key, ())]
+
+
+def _forget_empty_history(key):
+    """Remove a cached empty entry left by a turn that stored nothing."""
+    a = agent_mod()
+    if key and a._HISTORY.get(key) == []:
+        a._HISTORY.pop(key, None)
 
 
 def _history_add(key, user_text, reply_text):
@@ -116,7 +161,6 @@ def _history_add(key, user_text, reply_text):
     h = a._HISTORY.setdefault(key, [])
     h.append({"role": "user", "content": user_text[:1200]})
     h.append({"role": "assistant", "content": reply_text[:1200]})
-    from .runtime import HISTORY_MESSAGES
     h[:] = h[-HISTORY_MESSAGES:]
     while len(a._HISTORY) > 1000:
         del a._HISTORY[next(iter(a._HISTORY))]
@@ -158,12 +202,14 @@ def _system_prompt(sender, is_group, mentioned, reply_to, group_jid=""):
 def run_agent(user_message, sender, is_group, group_jid, mentioned, reply_to, no_history=False):
     a = agent_mod()
     sender = _norm_user(sender)
+    _begin_stop_tracking()
     if _stop_requested():
         _clear_stop()
     if not sender:
         return "I couldn't confirm who sent that message, so I didn't run it."
 
-    chat_key = group_jid if is_group else sender
+    # A group turn with no JID would otherwise key history/tasks on "".
+    chat_key = group_jid if (is_group and group_jid) else sender
     turn = str(user_message or "")
     if is_group and sender:
         turn = f"{ADMS.get(sender, {}).get('name') or sender}: {turn}"
@@ -182,6 +228,8 @@ def run_agent(user_message, sender, is_group, group_jid, mentioned, reply_to, no
 
     tool_map = a._tools_for(sender, group_jid if is_group else "", is_group)
     schemas = a._schemas_for(sender)
+    schema_map = {s["function"]["name"]: (s["function"].get("parameters") or {})
+                  for s in schemas}
     allowed = {schema["function"]["name"] for schema in schemas}
     cache = {}
     calls_done = 0
@@ -189,17 +237,12 @@ def run_agent(user_message, sender, is_group, group_jid, mentioned, reply_to, no
     steps_done = 0
     t0 = time.monotonic()
     turn_deadline = t0 + _env_int("LIAM_TURN_BUDGET", 3300, 20, 7200)
-    from . import state
     a._DEADLINE = turn_deadline
     state._DEADLINE = turn_deadline
     state._LAST_PROGRESS_AT = 0.0
-    a._LAST_PROGRESS_AT = 0.0
     state._LAST_PROGRESS_TEXT = ""
-    a._LAST_PROGRESS_TEXT = ""
     state._LAST_PROGRESS_EMIT_AT = 0.0
-    a._LAST_PROGRESS_EMIT_AT = 0.0
     state._PROGRESS_COUNT = 0
-    a._PROGRESS_COUNT = 0
     trace = {"events": []}
     tool_failures = []
     task_started = False
@@ -233,8 +276,12 @@ def run_agent(user_message, sender, is_group, group_jid, mentioned, reply_to, no
         text = cleaned or FALLBACK_TEXT
         if store and not no_history:
             _history_add(chat_key, turn, text)
+        else:
+            _forget_empty_history(chat_key)
         a._DEADLINE = None
         state._DEADLINE = None
+        state._REQUEST_ID = None  # BR-10: no turn is running any more
+        state._STOP_TOKEN = None
         trace["totalMs"] = int((time.monotonic() - t0) * 1000)
         trace["steps"] = steps_done
         trace["tools"] = sum(1 for e in trace["events"] if e.get("k") == "tool")
@@ -242,9 +289,6 @@ def run_agent(user_message, sender, is_group, group_jid, mentioned, reply_to, no
         a._LAST_TRACE = trace
         state._LAST_TRACE = trace
         return text
-
-    from .runtime import MAX_STEPS, MAX_TOOL_CALLS, TOOL_RESULT_MAX
-    from .integrations import AUTO_PROGRESS_TOOLS, SLOW_TOOLS
 
     for _step in range(MAX_STEPS):
         remaining = turn_deadline - time.monotonic()
@@ -265,13 +309,14 @@ def run_agent(user_message, sender, is_group, group_jid, mentioned, reply_to, no
             last_text = text
         calls = msg.get("tool_calls") or []
         if not calls:
-            return finish(text, store=(brain_used != "none"),
+            # "offline" is a diagnostic reply, not a real assistant turn.
+            return finish(text, store=(brain_used not in ("none", "offline")),
                           brain=brain_used, retry_messages=messages)
 
         for tc in calls:
             if calls_done >= MAX_TOOL_CALLS:
                 break
-            left = _remaining_budget()
+            left = state._remaining_budget()
             if left is not None and left <= 3:
                 break
             fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
@@ -287,6 +332,14 @@ def run_agent(user_message, sender, is_group, group_jid, mentioned, reply_to, no
                                  "content": failure})
                 calls_done += 1
                 continue
+            bad_args = _validate_tool_args(name, args, schema_map)
+            if bad_args:
+                result = f"tool error: {bad_args}"
+                tool_failures.append(f"{name or 'unknown'}: {result[:160]}")
+                messages.append({"role": "tool", "tool_call_id": call_id,
+                                 "name": name or "unknown", "content": result})
+                calls_done += 1
+                continue
             key = (name, json.dumps(args, sort_keys=True, ensure_ascii=False, default=str))
             if name not in allowed:
                 result = f"that tool isn't available to you: {name or '(missing name)'}"
@@ -300,15 +353,13 @@ def run_agent(user_message, sender, is_group, group_jid, mentioned, reply_to, no
                         a.set_active_task(chat_key, "running", turn[:1200])
                         task_started = True
                     if name in AUTO_PROGRESS_TOOLS:
-                        now = time.monotonic()
-                        if now - state._LAST_PROGRESS_AT >= _env_int("LIAM_PROGRESS_GAP", 20, 5, 600):
-                            a._emit_progress(a._auto_progress_text(name, args))
-                            ts = time.monotonic()
-                            state._LAST_PROGRESS_AT = ts
-                            a._LAST_PROGRESS_AT = ts
+                        # One throttle lives in _emit_progress; the loop does
+                        # not keep a second copy of the progress timing state.
+                        a._emit_progress(a._auto_progress_text(name, args))
                 _t = time.monotonic()
                 try:
-                    result = str(tool_map[name](**args))
+                    value = tool_map[name](**args)
+                    result = "" if value is None else str(value)
                 except TypeError as e:
                     result = f"tool error: wrong arguments ({e})"
                 except Exception as e:
@@ -327,7 +378,7 @@ def run_agent(user_message, sender, is_group, group_jid, mentioned, reply_to, no
             if _stop_requested():
                 _clear_stop()
                 a.clear_active_task(chat_key)
-                return finish("Okay, I stopped.")
+                return finish("Okay, I stopped.", store=False)
             if calls_done >= MAX_TOOL_CALLS:
                 break
         if calls_done >= MAX_TOOL_CALLS:
@@ -338,8 +389,17 @@ def run_agent(user_message, sender, is_group, group_jid, mentioned, reply_to, no
         messages.append({"role": "system",
                          "content": "Tool failures this turn: " + "; ".join(tool_failures) +
                                     ". Do not claim any of them succeeded. Say what failed plainly."})
-    messages.append({"role": "user",
-                     "content": "Stop using tools. Reply now in one complete message with full sentences. Never answer with a single word or cut a sentence in half - even if the question was one word."})
+    # role="user" is deliberate: after a tool round some providers keep
+    # tool-calling when the next message is "assistant", so the nudge is sent
+    # as a fresh user turn and tools are disabled on the final call below.
+    messages.append({
+        "role": "user",
+        "content": (
+            "Stop using tools. Reply now in one complete message with full sentences. "
+            "Never answer with a single word or cut a sentence in half - even if "
+            "the question was one word."
+        ),
+    })
     _t = time.monotonic()
     final = a.call_model(messages, sender, tools=None, budget=remaining)
     final_brain = final.pop("_brain", None)
@@ -347,7 +407,7 @@ def run_agent(user_message, sender, is_group, group_jid, mentioned, reply_to, no
     trace["events"].append({"k": "model", "ms": int((time.monotonic() - _t) * 1000),
                             "calls": 0, "final": True, "brain": final_brain})
     return finish((final.get("content") or "").strip() or last_text,
-                  store=(final_brain != "none"), brain=final_brain,
+                  store=(final_brain not in ("none", "offline")), brain=final_brain,
                   retry_messages=messages)
 
 
@@ -357,9 +417,11 @@ def main():
     print(json.dumps({"ready": True}), flush=True)
     while True:
         line = sys.stdin.readline()
-        if not line: break
+        if not line:
+            break
         line = line.strip()
-        if not line: continue
+        if not line:
+            continue
         try:
             if line.startswith("{"):
                 d = json.loads(line)
@@ -370,11 +432,19 @@ def main():
                 mentioned = bool(d.get("m"))
                 reply_to = bool(d.get("r"))
                 no_history = bool(d.get("n"))
+                # BR-10: the bridge's request id tags progress frames. "st" is
+                # an optional per-turn stop token; legacy stop_flag files still
+                # work when it is absent.
+                state._REQUEST_ID = d.get("i") or d.get("id")
+                state._STOP_TOKEN = d.get("st") or d.get("stop_token") or None
                 reply = a.run_agent(user_message, sender, is_group, group_jid, mentioned,
                                     reply_to, no_history=no_history)
             else:
+                state._REQUEST_ID = None
+                state._STOP_TOKEN = None
                 reply = a.run_agent(line, a.OWNERS[0], False, "", False, False)
-            if not isinstance(reply, str): reply = "" if reply is None else str(reply)
+            if not isinstance(reply, str):
+                reply = "" if reply is None else str(reply)
             print(json.dumps({"reply": reply, "trace": a._LAST_TRACE}), flush=True)
         except Exception as e:
             _log(f"[agent] {type(e).__name__}: {e}")

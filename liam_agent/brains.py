@@ -23,10 +23,22 @@ PREFERRED_KEY_STATE = os.path.join(DATA_DIR, "preferred_keys.json")
 # tried again (the daily allowance has had time to reset).
 QUOTA_COOLDOWN = 86400
 BRAINS = {
-    "moonmath":  {"base": liam_keys.MOON_BASE,  "model": liam_keys.MOON_MODEL,    "keys": list(liam_keys.MOON_KEYS), "label": "MoonMath DeepSeek"},
-    "unorouter": {"base": liam_keys.UNO_BASE,   "model": liam_keys.UNO_MODELS[0], "keys": list(liam_keys.UNO_KEYS),  "label": "Unorouter"},
-    "agnes":     {"base": liam_keys.AGNES_BASE, "model": liam_keys.AGNES_MODEL,   "keys": [liam_keys.AGNES_KEY],     "label": "Agnes"},
-    "hcn":       {"base": liam_keys.HCN_BASE,   "model": liam_keys.HCN_MODEL,     "keys": [liam_keys.HCN_KEY],       "label": "HCNSec DeepSeek"},
+    "moonmath": {
+        "base": liam_keys.MOON_BASE, "model": liam_keys.MOON_MODEL,
+        "keys": list(liam_keys.MOON_KEYS), "label": "MoonMath DeepSeek",
+    },
+    "unorouter": {
+        "base": liam_keys.UNO_BASE, "model": liam_keys.UNO_MODELS[0],
+        "keys": list(liam_keys.UNO_KEYS), "label": "Unorouter",
+    },
+    "agnes": {
+        "base": liam_keys.AGNES_BASE, "model": liam_keys.AGNES_MODEL,
+        "keys": [liam_keys.AGNES_KEY], "label": "Agnes",
+    },
+    "hcn": {
+        "base": liam_keys.HCN_BASE, "model": liam_keys.HCN_MODEL,
+        "keys": [liam_keys.HCN_KEY], "label": "HCNSec DeepSeek",
+    },
 }
 _BRAIN_ALIASES = {
     "moonmath": "moonmath", "moon": "moonmath", "deepseek": "moonmath", "deepseek v4": "moonmath",
@@ -120,6 +132,10 @@ def check_status():
     A key in quota cooldown must not be called alive. A timeout still means
     unreachable, but a 402/429 is reported as a quota problem so the owner
     does not get told the brain is fine while real calls fail.
+
+    Several keys may be probed per brain, but the result is intentionally one
+    row per brain (any responding key makes it usable). For per-key detail use
+    check_key or `debug_probe.py --keys`, which never print key values.
     """
     a = agent_mod()
     def probe(name, key):
@@ -155,7 +171,7 @@ def check_tokens():
     a = agent_mod()
     lines = [f"Current brain: {get_brain()} ({a.BRAINS[get_brain()]['model']})",
              "Provider quotas are not exposed to this agent, so exact remaining requests are unknown."]
-    for name, p in a.BRAINS.items():
+    for p in a.BRAINS.values():
         lines.append(f"- {p['label']}: {len([k for k in p['keys'] if k])} configured key slot(s), model {p['model']}")
     return "\n".join(lines)
 
@@ -289,6 +305,8 @@ MAX_ATTEMPTS = 8
 MAX_OUTPUT_TOKENS = _env_int("LIAM_MAX_OUTPUT_TOKENS", 16384, 1, 131072)
 # Requested chain: MoonMath keys 1-3, then HCNSec, then Agnes as the last resort.
 FALLBACK_ORDER = ["moonmath", "hcn", "agnes"]
+# Captured once at import on purpose: this is a process-level test switch.
+# Runtime toggles in tests use agent.OFFLINE via _is_offline(), not this value.
 OFFLINE = os.environ.get("LIAM_OFFLINE") == "1"
 
 
@@ -397,10 +415,13 @@ def _attempt_plan(brain):
                 if a._key_exhausted("moonmath", k, model):
                     continue
                 plan.append(("moonmath", model, k))
-        seen = set(); out = []
+        seen = set()
+        out = []
         for item in plan:
-            if item in seen: continue
-            seen.add(item); out.append(item)
+            if item in seen:
+                continue
+            seen.add(item)
+            out.append(item)
         return out
     if brain == "unorouter":
         if not keys:
@@ -417,7 +438,12 @@ def _attempt_plan(brain):
             if not a._key_exhausted(brain, keys[i], p["model"])]
 
 
-def call_model(messages, sender, brain=None, tools=None, budget=None):
+def call_model(messages, sender, brain=None, tools=None, budget=None, fallbacks=None):
+    """Call a brain with optional fallbacks.
+
+    ``fallbacks=None`` uses the normal chain; pass an empty sequence to keep a
+    capability-specific call (for example vision) on one brain only.
+    """
     a = agent_mod()
     if _is_offline():
         return {"role": "assistant", "content": "offline test reply", "_brain": "offline"}
@@ -428,7 +454,8 @@ def call_model(messages, sender, brain=None, tools=None, budget=None):
         # allowed to fall through. Hard-pinning admins here is what turned one
         # bad agnes turn into FALLBACK_TEXT while other brains were healthy.
         brain = "agnes"
-    order = [brain] + [b for b in FALLBACK_ORDER if b != brain]
+    chain = FALLBACK_ORDER if fallbacks is None else fallbacks
+    order = [brain] + [b for b in chain if b != brain]
 
     seconds = CALL_BUDGET if not budget else max(3, min(CALL_BUDGET, float(budget)))
     deadline = time.monotonic() + seconds
@@ -454,8 +481,10 @@ def call_model(messages, sender, brain=None, tools=None, budget=None):
                     return out
                 except urllib.error.HTTPError as e:
                     status = e.code
-                    try: detail = e.read(200).decode("utf-8", "replace").replace("\n", " ")[:160]
-                    except Exception: detail = ""
+                    try:
+                        detail = e.read(200).decode("utf-8", "replace").replace("\n", " ")[:160]
+                    except Exception:
+                        detail = ""
                     last_err = f"{b}/{model} HTTP {status}"
                     _log(f"[brain] {last_err} {detail}")
                     if status in (402, 429):
@@ -466,6 +495,9 @@ def call_model(messages, sender, brain=None, tools=None, budget=None):
                         a._mark_exhausted(b, key, None, ttl=QUOTA_COOLDOWN)
                         break
                     if status == 400 and use_tools:
+                        # Some providers reject a tool schema outright. Retry
+                        # the same key/model once as plain chat; the second 400
+                        # (use_tools already False) falls through to the next.
                         use_tools = False
                         continue
                     if _is_transient(status) and retry == 0 and deadline - time.monotonic() > 3:

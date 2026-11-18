@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import re
 import sqlite3
@@ -59,7 +60,25 @@ def _init_db():
         c.commit()
 
 
-_init_db()
+try:
+    _init_db()
+except Exception as exc:
+    # A corrupt or locked database must not take the whole agent down at import.
+    # Every read/write path already degrades to an honest "unavailable" reply.
+    _log(f"[memory] init failed: {type(exc).__name__}: {exc}")
+
+
+def _chat_key(chat):
+    """One canonical key per conversation.
+
+    Person JIDs collapse to a bare number, but a WhatsApp group JID (…@g.us)
+    must keep its full address: stripping the suffix would merge unrelated
+    groups. Read and write paths both use this helper.
+    """
+    value = str(chat or "").strip()
+    if value.lower().endswith("@g.us"):
+        return value
+    return _norm_user(value)
 
 
 def _clean_fact(fact, limit=500):
@@ -236,7 +255,7 @@ def clear_memory(user=None, sender=None):
 
 
 def load_chat_history(chat, limit=10):
-    chat = _norm_user(chat) or str(chat or "").strip()
+    chat = _chat_key(chat)
     if not chat:
         return []
     try:
@@ -246,7 +265,7 @@ def load_chat_history(chat, limit=10):
                 (chat,)).fetchone()
         if not row:
             return []
-        data = __import__("json").loads(row[0] or "[]")
+        data = json.loads(row[0] or "[]")
         if not isinstance(data, list):
             return []
         clean = []
@@ -260,7 +279,7 @@ def load_chat_history(chat, limit=10):
 
 
 def save_chat_history(chat, messages, limit=10):
-    chat = _norm_user(chat) or str(chat or "").strip()
+    chat = _chat_key(chat)
     if not chat:
         return
     try:
@@ -268,7 +287,7 @@ def save_chat_history(chat, messages, limit=10):
         for m in list(messages or [])[-limit:]:
             if isinstance(m, dict) and m.get("role") in ("user", "assistant"):
                 clean.append({"role": m["role"], "content": str(m.get("content") or "")[:1200]})
-        payload = __import__("json").dumps(clean, ensure_ascii=False)
+        payload = json.dumps(clean, ensure_ascii=False)
         with closing(_connect()) as c:
             c.execute(
                 "INSERT INTO chat_history(chat,messages,updated) VALUES(?,?,?) "
@@ -284,7 +303,7 @@ def save_chat_history(chat, messages, limit=10):
 
 def set_active_task(chat, status="running", detail=""):
     """Persist what this chat was doing so a reconnect cannot erase it."""
-    chat = _norm_user(chat) or str(chat or "").strip()
+    chat = _chat_key(chat)
     if not chat:
         return "no chat to attach a task to"
     value = " ".join(str(detail or "").split())[:1200]
@@ -305,7 +324,7 @@ def set_active_task(chat, status="running", detail=""):
 
 def get_active_task(chat):
     """Return the last saved task for this chat, or None."""
-    chat = _norm_user(chat) or str(chat or "").strip()
+    chat = _chat_key(chat)
     if not chat:
         return None
     try:
@@ -323,7 +342,7 @@ def get_active_task(chat):
 
 
 def clear_active_task(chat):
-    chat = _norm_user(chat) or str(chat or "").strip()
+    chat = _chat_key(chat)
     if not chat:
         return "no chat to clear"
     try:

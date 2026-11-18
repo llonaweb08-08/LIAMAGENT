@@ -1,7 +1,11 @@
 # Liam runs one Node process (WhatsApp bridge) plus one Python process (agent)
 # in the same small container. Render free gives us 512 MB RAM, so avoid
 # unnecessary build layers and never install the dev/test toolchain here.
-FROM node:20-bookworm-slim
+#
+# Python is pinned to 3.12 everywhere (see .python-version / pyproject.toml).
+# Debian bookworm ships 3.11, so start from the official Python 3.12 slim image
+# and add Node 20 from NodeSource instead of using apt's older interpreter.
+FROM python:3.12-slim-bookworm
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
@@ -14,12 +18,14 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PORT=5678 \
     PLAYWRIGHT_BROWSERS_PATH=/home/liam/.cache/ms-playwright
 
-# python3 is Debian's Python 3.11; sqlite3 gives the bridge a WAL-safe snapshot
-# tool, and ffmpeg converts Liam's synthesized voice to a WhatsApp OGG/Opus
-# voice note (edge-tts returns MP3).
+# sqlite3 gives the bridge a WAL-safe snapshot tool, and ffmpeg converts the
+# voice to OGG/Opus (edge-tts returns MP3). curl is used by the HEALTHCHECK.
+# The official Python image already provides ensurepip, so python3-pip and
+# python3-venv are not needed.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates curl ffmpeg gzip python3 python3-pip python3-venv \
-        sqlite3 tar \
+        ca-certificates curl ffmpeg gzip sqlite3 tar \
+    && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*
 
 RUN useradd --create-home --home-dir /home/liam --shell /usr/sbin/nologin liam \
@@ -33,8 +39,8 @@ WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
 
-# Python dependencies in a venv so Debian's externally-managed Python is left
-# untouched. Playwright's Chromium is only used by the screenshot/browser tools.
+# Python dependencies in a venv so the image's Python is left untouched.
+# Playwright's Chromium is only used by the screenshot/browser tools.
 COPY requirements.txt ./
 RUN python3 -m venv /opt/venv \
     && /opt/venv/bin/pip install --no-cache-dir --upgrade pip \
@@ -49,5 +55,9 @@ RUN chown -R liam:liam /app /data /home/liam
 
 USER liam
 
+# EXPOSE is informational. Render injects PORT=10000 at runtime and the bridge
+# binds that value; 5678 is only the default for local `docker run` use.
 EXPOSE 5678
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+    CMD curl -fsS "http://127.0.0.1:${PORT:-5678}/health" >/dev/null || exit 1
 CMD ["npm", "start"]

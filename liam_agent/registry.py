@@ -1,3 +1,4 @@
+# ruff: noqa: E501
 from __future__ import annotations
 
 import os
@@ -215,8 +216,11 @@ def _tools_for(sender, chat_jid="", is_group=False):
     def _send_voice(to=None, text="", duration_seconds=None):
         if duration_seconds not in (None, ""):
             return "I can't set an exact voice-note duration; the length comes from the text"
+        # Members may only speak in their current chat. Without this backstop a
+        # prompt-injected 'to' would let them send a voice note to any number.
+        target = _recipient(to if owner else None)
         return a.send_voice(
-            _recipient(to), text, sender=me,
+            target, text, sender=me,
             chat=chat_jid or me, group=bool(is_group))
     t["send_voice"] = _send_voice
     t["switch_voice"] = lambda voice: a.switch_voice(voice, sender=me)

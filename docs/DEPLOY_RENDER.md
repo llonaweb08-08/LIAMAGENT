@@ -12,7 +12,7 @@ storage bucket, and one UptimeRobot monitor.
 | Memory (`liam_memory.db`) | `/data/liam_memory.db` | yes, `VACUUM INTO` snapshot |
 | Tool token, pair token | `/data/` | no (set `LIAM_PAIR_TOKEN` in Render) |
 | `dm_open`, known members | `/data/` | no |
-| Group permissions, pending approvals | memory | no |
+| Group permissions, pending approvals, held replies | memory + `/data/bridge_state.json` | yes, as `bridge_state.json` |
 
 Render free has an ephemeral filesystem, 0.1 CPU, 512 MB RAM, and spins down
 after 15 minutes without HTTP traffic. The Supabase archive is what makes a
@@ -48,7 +48,8 @@ and the SQLite database is small.
    WhatsApp browser download.
 5. Render keeps `LIAM_PAIR_TOKEN` stable because the blueprint uses
    `generateValue: true`. If you created the service manually, set it yourself
-   to a long random string.
+   to a long random string. The logs deliberately show only a redacted token,
+   so copy the real value from the Render dashboard when you need the URL.
 
 The service listens on Render's `PORT` (the image default is 5678) and binds
 `0.0.0.0`. Render health-checks `/health`, which stays 200 while WhatsApp is
@@ -69,7 +70,9 @@ npm run seed:supabase
 ```
 
 The script validates the archive before uploading, snapshots the memory DB
-safely, and exits non-zero unless the WhatsApp login itself uploaded. The local
+safely, and exits non-zero unless the WhatsApp login itself uploaded - it also
+fails on a real DB upload error and prints the reason. A benign skip (no local
+DB, or nothing changed) is reported but does not fail the command. The local
 profile is not modified.
 
 Then restart (or redeploy) the Render service. The logs should say
@@ -78,13 +81,18 @@ upload did not reach the configured bucket.
 
 ## 4. Pair on Render
 
-Open the deploy logs and find:
+The deploy log shows a **redacted** token, never the full secret:
 
 ```
-🔗 Pairing page: https://<service>.onrender.com/pair?token=<LIAM_PAIR_TOKEN>
+🔗 Pairing page: https://<service>.onrender.com/pair?token=<redacted> (token abcd…wxyz)
 ```
 
-Pairing uses an **8-character phone code**. There is no QR scan.
+Copy `LIAM_PAIR_TOKEN` from the Render dashboard (Environment tab) and build
+the real URL yourself: `https://<service>.onrender.com/pair?token=<full token>`.
+You can also open the plain `/pair` page and paste the token into the form - the
+token is then held in a secure cookie and no longer appears in the URL.
+
+Pairing uses an **8-digit phone code**. There is no QR scan.
 
 1. First remove stale devices: on the bot phone open WhatsApp **Business** ->
    **Settings** -> **Linked devices** and delete every old **Liam** entry.
@@ -93,16 +101,16 @@ Pairing uses an **8-character phone code**. There is no QR scan.
 2. On the phone open **Linked devices** -> **Link a device** ->
    **Link with phone number instead**. Leave that screen waiting.
 3. On the Render pairing page, confirm the number (default `447881161023`) and
-   press **Get pairing code** once.
-4. Type the code on the phone immediately. Do not reload the page or press the
-   button again while you type: that cancels the handshake and leaves a zombie
-   device.
+   press **Get pairing code** once (`POST /pair`).
+4. Type the 8-digit code on the phone immediately. Do not reload the page or
+   press the button again while you type: that cancels the handshake and leaves
+   a zombie device.
 
 Opening or reloading `/pair` never creates a code; only the button does, so a
 refresh cannot burn one of WhatsApp's few allowed attempts. A code is reused for
-60 seconds and a new request is refused for 120 seconds
-(`LIAM_PAIRING_COOLDOWN_MS`). If WhatsApp answers `429 rate-overlimit`, wait
-10-15 minutes before trying again.
+60 seconds and a new request is refused for **5 minutes**
+(`LIAM_PAIRING_COOLDOWN_MS=300000` in `render.yaml`). If WhatsApp answers
+`429 rate-overlimit`, wait 10-15 minutes before trying again.
 
 A successful code entry normally closes the socket with `restartRequired`
 (515). The bridge reconnects immediately with the same credentials; that is not
@@ -113,12 +121,18 @@ A session is only kept when `liam_session/session/creds.json` and
 `wa_linked.json` both exist. On boot, a profile without them is deleted so a
 half-finished link or a corrupt restore can never poison the next attempt.
 
-If a link attempt gets stuck, two token-protected helpers exist:
+If a link attempt gets stuck, two token-protected helpers exist. They are
+**POST** endpoints (a GET with `?token=` only establishes a cookie and redirects
+to the clean URL; it does not change state):
 
-- `/cancelpair?token=<LIAM_PAIR_TOKEN>` — discard the half-finished code
-  attempt, wipe the unlinked profile, and wait for a fresh button press.
-- `/reset?token=<LIAM_PAIR_TOKEN>` — close the socket, delete the local login,
-  and start a clean connection without restarting Render.
+- `POST /cancelpair` — discard the half-finished code attempt, wipe the
+  unlinked profile, and wait for a fresh button press.
+- `POST /reset` — close the socket, delete the local login, and start a clean
+  connection without restarting Render.
+
+Send the token in the JSON/form body (or use the cookie from an authenticated
+`/pair` visit). Diagnostics stay at `GET /diag` behind the same token/cookie;
+there is no token-driven GET that mutates state.
 
 If the session is restored successfully, pairing is not needed at all.
 
@@ -209,17 +223,24 @@ catches dependency mistakes before Render does:
 
 ```powershell
 docker build -t liam:local .
+# .env is loaded here by Docker's --env-file flag, not by the app itself.
+# For a direct local run, export the variables in your shell instead.
 docker run --rm -p 5678:5678 --env-file .env -v liam-data:/data liam:local
 ```
 
-Then open <http://127.0.0.1:5678/health>.
+Then open <http://127.0.0.1:5678/health>. The image's `HEALTHCHECK` uses the
+injected `PORT` (or 5678 locally); Render uses the `healthCheckPath` in
+`render.yaml` instead.
 
 ## 9. Free-tier limits
 
 - **Instance hours:** 750 per month. One always-awake service uses about 720.
 - **RAM:** 512 MB. The Baileys bridge is small, but a Playwright screenshot or
   browser task creates its own Chromium and can exceed the limit; run browser
-  tasks one at a time and avoid full-page screenshots.
+  tasks one at a time and avoid full-page screenshots. `LIAM_MEM_LIMIT_MB=320`
+  recycles only the WhatsApp socket before the limit; it cannot prevent an OOM
+  kill caused by a local Chromium spike, so `LIAM_VPS_BROWSER=1` is set in the
+  blueprint.
 - **CPU:** 0.1. Model calls are network-bound, but heavy scraping will be slow.
 - **Disk:** ephemeral. Supabase restore is mandatory for continuity.
 - **Spin-down:** 15 minutes without traffic. UptimeRobot keeps it warm.

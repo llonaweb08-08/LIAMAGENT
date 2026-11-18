@@ -9,7 +9,7 @@
   "scripts": {
     "start": "node whatsapp_bridge.js",
     "check": "node --check whatsapp_bridge.js && node --check supabase_sync.js",
-    "test": "node --test \"tests/**/*.test.js\"",
+    "test": "node --test",
     "doctor": "python scripts/doctor.py",
     "seed:supabase": "node scripts/seed_supabase.js",
     "verify": "node scripts/verify_deployment.js"

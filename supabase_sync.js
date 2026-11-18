@@ -1,14 +1,17 @@
 const fs = require("fs");
 const path = require("path");
-const { execFile } = require("child_process");
+const { execFile, spawn } = require("child_process");
+const readline = require("readline");
 const { Readable, Transform } = require("stream");
 const { pipeline } = require("stream/promises");
 
-// A mistyped numeric env var (e.g. "5m") makes Number.parseInt return NaN, and
-// NaN in Math.max stays NaN - which turns a timeout into an instant abort or a
-// backup interval into a tight loop. envInt() always falls back to the default.
+// a mistyped numeric env var (e.g. "5m") must not be accepted as 5:
+// Number.parseInt ignores trailing junk, and NaN in Math.max turns a timeout
+// into an instant abort or a backup interval into a tight loop. only a whole
+// decimal integer is accepted; anything else falls back to the default.
 function envInt(name, fallback, min, max) {
-  const parsed = Number.parseInt(process.env[name], 10);
+  const raw = String(process.env[name] === undefined ? "" : process.env[name]).trim();
+  const parsed = /^[+-]?\d+$/.test(raw) ? Number(raw) : NaN;
   let value = Number.isFinite(parsed) ? parsed : fallback;
   if (min !== undefined) value = Math.max(min, value);
   if (max !== undefined) value = Math.min(max, value);
@@ -28,6 +31,15 @@ const FETCH_TIMEOUT_MS = envInt("LIAM_SUPABASE_TIMEOUT_MS", 120000, 5000);
 const MAX_ARCHIVE_BYTES = envInt("LIAM_MAX_ARCHIVE_BYTES", 300 * 1024 * 1024, 16 * 1024 * 1024);
 const MAX_DB_BYTES = 200 * 1024 * 1024;
 const MAX_ARCHIVE_ENTRIES = 250000;
+// buffering a whole upload in memory is only safe for small, non-session
+// objects; a 300 MB session archive can exhaust a 512 MB container.
+const MAX_BUFFERED_UPLOAD_BYTES = 16 * 1024 * 1024;
+// cap the sum of uncompressed member sizes so a tiny, highly compressible
+// archive cannot fill /data during extraction.
+const MAX_UNCOMPRESSED_BYTES = envInt("LIAM_MAX_UNCOMPRESSED_BYTES", 1024 * 1024 * 1024, 0);
+// one retry layer with exponential backoff; env override keeps tests fast.
+const UPLOAD_ATTEMPTS = 2;
+const UPLOAD_RETRY_BASE_MS = envInt("LIAM_UPLOAD_RETRY_MS", 500, 0);
 const CHROME_LOCK_NAMES = new Set([
   "SingletonLock", "SingletonSocket", "SingletonCookie", "lockfile", "LOCK",
   "DevToolsActivePort", "RunningChromeVersion",
@@ -86,14 +98,17 @@ async function supabaseFetch(p, opts = {}) {
   }, opts.headers || {});
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), Math.max(5000, FETCH_TIMEOUT_MS));
+  const onAbort = () => controller.abort();
   if (opts.signal) {
     if (opts.signal.aborted) controller.abort();
-    else opts.signal.addEventListener("abort", () => controller.abort(), { once: true });
+    else opts.signal.addEventListener("abort", onAbort, { once: true });
   }
   try {
     return await fetch(url, Object.assign({}, opts, { headers, signal: controller.signal }));
   } finally {
     clearTimeout(timeout);
+    // remove the listener so a long-lived caller's signal does not retain us.
+    if (opts.signal) opts.signal.removeEventListener("abort", onAbort);
   }
 }
 
@@ -175,7 +190,7 @@ async function downloadToFile(res, dest, maxBytes) {
   }
 }
 
-async function uploadOnce(urlPath, file, contentType, stat) {
+async function uploadOnce(urlPath, file, contentType, stat, canBuffer) {
   const attempt = async (body) => supabaseFetch(urlPath, {
     method: "POST",
     headers: {
@@ -186,20 +201,25 @@ async function uploadOnce(urlPath, file, contentType, stat) {
     body,
     ...(body && typeof body.pipe === "function" ? { duplex: "half" } : {}),
   });
+  let stream = null;
   try {
-    return await attempt(fs.createReadStream(file));
+    stream = fs.createReadStream(file);
+    return await attempt(stream);
   } catch (e) {
-    // Some HTTP stacks refuse streamed bodies; fall back to a buffer when it
-    // is safe (the DB is small; sessions are only buffered under 300 MB).
-    if (stat.size > MAX_ARCHIVE_BYTES) throw e;
+    // some http stacks refuse streamed bodies; fall back to a small buffer
+    // only for non-session objects. buffering a session archive (up to 300 MB)
+    // can exhaust a 512 MB container, so those uploads fail instead.
+    if (!canBuffer || stat.size > MAX_BUFFERED_UPLOAD_BYTES) throw e;
     return await attempt(fs.readFileSync(file));
+  } finally {
+    // a response may arrive before the request stream is fully consumed.
+    if (stream) stream.destroy();
   }
 }
 
-// A dropped connection, a 5xx, or a 429 is transient. Without a retry a single
-// blip lost a whole backup cycle, and the next one is up to 30 minutes away, so
-// the last good copy could be stale for a long time. A permanent failure (auth,
-// too large) is returned at once and not retried.
+// a dropped connection, a 5xx, or a 429 is transient. without a retry a single
+// blip lost a whole backup cycle, and the next one is up to 30 minutes away.
+// a permanent failure (auth, too large) is returned at once and not retried.
 function transientUpload(res) {
   return !res || res.status === 429 || res.status >= 500;
 }
@@ -208,45 +228,57 @@ async function uploadPath(objectName, file, contentType) {
   await ensureBucket();
   const stat = fs.statSync(file);
   const urlPath = "/storage/v1/object/" + encodeURIComponent(SUPABASE_BUCKET) + "/" + encodeURIComponent(objectName);
-  let res = null;
-  try {
-    res = await uploadOnce(urlPath, file, contentType, stat);
-  } catch (e) {
-    if (stat.size > MAX_ARCHIVE_BYTES) throw e;
-    res = null;
-  }
-  if (!res || !res.ok) {
-    if (transientUpload(res)) {
-      await sleep(1500);
-      try {
-        res = await uploadOnce(urlPath, file, contentType, stat);
-      } catch (e) {
-        if (!res) throw e;
-      }
+  const canBuffer = objectName !== SESSION_ARCHIVE;
+  let lastError = null;
+  let lastReason = "no response";
+  // the only retry layer: one initial attempt plus exponentially spaced retries.
+  for (let attempt = 1; attempt <= UPLOAD_ATTEMPTS; attempt++) {
+    if (attempt > 1) await sleep(UPLOAD_RETRY_BASE_MS * 2 ** (attempt - 2));
+    let res = null;
+    try {
+      res = await uploadOnce(urlPath, file, contentType, stat, canBuffer);
+      lastError = null;
+      lastReason = res ? `status ${res.status}` : "no response";
+      if (res && res.ok) return { ok: true };
+      if (!transientUpload(res)) return { ok: false, reason: lastReason };
+    } catch (e) {
+      // a thrown retry replaces any earlier status; never report a stale res.
+      lastError = e;
+      res = null;
     }
   }
-  if (res && res.ok) return { ok: true };
-  const reason = res ? `status ${res.status}` : "no response";
-  return { ok: false, reason };
+  if (lastError) {
+    const message = String(lastError && lastError.message ? lastError.message : lastError);
+    return { ok: false, reason: message, error: message };
+  }
+  return { ok: false, reason: lastReason };
 }
 
 // Small JSON blobs (currently the bridge's held replies and group permissions)
 // ride to Supabase the same way the session and DB do. On Render's free plan the
 // disk is wiped on every redeploy, so Supabase is the only copy that survives.
-const MAX_STATE_BYTES = 8 * 1024 * 1024;
+const MAX_STATE_BYTES = envInt("LIAM_MAX_STATE_BYTES", 8 * 1024 * 1024, 0);
 
 async function uploadState(dataDir, objectName, value) {
   if (!configured()) return { ok: false, reason: "not configured" };
   const base = baseDir(dataDir);
-  const tmp = path.join(base, objectName + ".upload.tmp");
+  let dir = null;
   try {
     fs.mkdirSync(base, { recursive: true });
-    fs.writeFileSync(tmp, JSON.stringify(value), { mode: 0o600 });
+    // a unique temp dir keeps a debounced save and a shutdown save from
+    // clobbering each other's file during a redeploy.
+    dir = fs.mkdtempSync(path.join(base, ".upload-"));
+    const json = JSON.stringify(value);
+    if (Buffer.byteLength(json, "utf8") > MAX_STATE_BYTES) {
+      return { ok: false, reason: "state object too large" };
+    }
+    const tmp = path.join(dir, path.basename(objectName));
+    fs.writeFileSync(tmp, json, { mode: 0o600 });
     return await uploadPath(objectName, tmp, "application/json");
   } catch (e) {
     return { ok: false, error: String(e && e.message ? e.message : e) };
   } finally {
-    try { fs.rmSync(tmp, { force: true }); } catch (e) {}
+    if (dir) { try { fs.rmSync(dir, { recursive: true, force: true }); } catch (e) {} }
   }
 }
 
@@ -260,7 +292,10 @@ async function downloadState(objectName) {
       return { restored: false, reason: "state object too large" };
     }
     const text = await res.text();
-    if (text.length > MAX_STATE_BYTES) return { restored: false, reason: "state object too large" };
+    // text.length counts UTF-16 units, not bytes; emoji need up to 4 UTF-8 bytes.
+    if (Buffer.byteLength(text, "utf8") > MAX_STATE_BYTES) {
+      return { restored: false, reason: "state object too large" };
+    }
     return { restored: true, value: JSON.parse(text) };
   } catch (e) {
     return { restored: false, error: String(e && e.message ? e.message : e) };
@@ -306,6 +341,17 @@ function looksLikeSqlite(file) {
   }
 }
 
+async function sqliteIntegrityOk(file) {
+  const python = process.env.LIAM_PYTHON || (process.platform === "win32" ? "python" : "python3");
+  const script = "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); print(c.execute('PRAGMA integrity_check').fetchone()[0])";
+  try {
+    const result = await execFileAsync(python, ["-c", script, file], { timeout: 120000 });
+    return String(result.stdout || "").trim() === "ok";
+  } catch (e) {
+    return false;
+  }
+}
+
 async function restoreDb(dataDir) {
   if (!configured()) return { restored: false, reason: "not configured" };
   const dbFile = defaultDbFile(dataDir);
@@ -318,9 +364,17 @@ async function restoreDb(dataDir) {
     }
     await downloadToFile(res, tmp, MAX_DB_BYTES);
     if (!looksLikeSqlite(tmp)) throw new Error("remote db is not a SQLite database");
+    // the 16-byte magic alone cannot detect a truncated or corrupt cloud copy.
+    if (!(await sqliteIntegrityOk(tmp))) throw new Error("remote db failed SQLite integrity_check");
     fs.mkdirSync(path.dirname(dbFile), { recursive: true });
     for (const suffix of ["-wal", "-shm"]) {
       try { fs.rmSync(dbFile + suffix, { force: true }); } catch (e) {}
+    }
+    // memory is not safely re-derivable after a bad restore; keep a copy.
+    if (fs.existsSync(dbFile)) {
+      const rollback = dbFile + ".old." + Date.now();
+      try { fs.copyFileSync(dbFile, rollback); }
+      catch (e) { throw new Error("could not keep a db rollback copy: " + (e && e.message ? e.message : e)); }
     }
     fs.renameSync(tmp, dbFile);
     try { fs.chmodSync(dbFile, 0o600); } catch (e) {}
@@ -380,33 +434,69 @@ function unsafeEntry(entry) {
   return parts.includes("..");
 }
 
+// metadata is written one json line per member and streamed to a file: a
+// 250k-entry `tar -tvzf` listing overflows a fixed 64 MB exec buffer.
+const ARCHIVE_LIST_SCRIPT = String.raw`
+import json, sys, tarfile
+with tarfile.open(sys.argv[1], "r:gz") as tf:
+    for m in tf:
+        print(json.dumps({"name": m.name, "type": m.type.decode("ascii"), "size": m.size}))
+`;
+
 async function validateArchive(archiveFile, sessionName) {
-  const listing = await execFileAsync("tar", ["-tzf", archiveFile], { timeout: 60000 });
-  const entries = String(listing.stdout || "").split(/\r?\n/).filter(Boolean);
-  if (!entries.length) throw new Error("archive is empty");
-  if (entries.length > MAX_ARCHIVE_ENTRIES) throw new Error("archive has too many entries");
+  const python = process.env.LIAM_PYTHON || (process.platform === "win32" ? "python" : "python3");
+  const listing = archiveFile + ".listing.tmp";
+  const child = spawn(python, ["-c", ARCHIVE_LIST_SCRIPT, archiveFile]);
+  let stderr = "";
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (chunk) => { if (stderr.length < 8192) stderr += chunk; });
+  const exited = new Promise((resolve, reject) => {
+    child.on("error", reject);
+    child.on("close", (code) => {
+      if (code === 0) resolve();
+      else reject(new Error(`archive listing failed (status ${code}): ${stderr.trim()}`));
+    });
+  });
+  const result = { entries: 0, links: 0, uncompressedBytes: 0 };
   const top = sessionName + "/";
-  for (const entry of entries) {
-    if (unsafeEntry(entry)) throw new Error(`unsafe archive entry: ${entry}`);
-    if (entry !== sessionName && !entry.startsWith(top)) {
-      throw new Error(`archive entry is outside ${sessionName}: ${entry}`);
+  try {
+    await Promise.all([pipeline(child.stdout, fs.createWriteStream(listing)), exited]);
+    const input = fs.createReadStream(listing);
+    const rl = readline.createInterface({ input, crlfDelay: Infinity });
+    try {
+      for await (const line of rl) {
+        if (!line.trim()) continue;
+        const member = JSON.parse(line);
+        const name = String(member.name || "");
+        result.entries += 1;
+        if (result.entries > MAX_ARCHIVE_ENTRIES) throw new Error("archive has too many entries");
+        if (unsafeEntry(name)) throw new Error(`unsafe archive entry: ${name}`);
+        if (name !== sessionName && !name.startsWith(top)) {
+          throw new Error(`archive entry is outside ${sessionName}: ${name}`);
+        }
+        // any type other than regular file ("0") or directory ("5") is
+        // special: links, devices, fifos and sockets all need safe extraction.
+        if (member.type !== "0" && member.type !== "5") result.links += 1;
+        result.uncompressedBytes += Number(member.size) || 0;
+        if (result.uncompressedBytes > MAX_UNCOMPRESSED_BYTES) {
+          throw new Error(`archive expands beyond ${MAX_UNCOMPRESSED_BYTES} bytes`);
+        }
+      }
+    } finally {
+      rl.close();
+      input.destroy();
     }
+    if (!result.entries) throw new Error("archive is empty");
+    return result;
+  } finally {
+    child.kill();
+    try { fs.rmSync(listing, { force: true }); } catch (e) {}
   }
-  const verbose = await execFileAsync("tar", ["-tvzf", archiveFile], { timeout: 60000 });
-  // The first column is the tar type flag: `l` is a symlink and `h` a hard
-  // link. Do not inspect names for "->": a legitimate file could contain it.
-  // Links are counted rather than rejected: older Linux-made archives contain
-  // harmless Chromium lock links, and we can extract everything else safely.
-  let links = 0;
-  for (const line of String(verbose.stdout || "").split(/\r?\n/)) {
-    if (/^[lh]/i.test(line)) links += 1;
-  }
-  return { entries: entries.length, links };
 }
 
-// Extract a profile without ever creating a symlink or hard link. This is used
-// for older archives that contain Chromium lock links; links are skipped and
-// every regular file is still restored safely inside the staging directory.
+// Extract a profile without ever creating a symlink, hard link, device, fifo or
+// socket. This is used for archives that contain special entries; they are
+// skipped and every regular file is still restored safely inside staging.
 const EXTRACT_LINKS_SCRIPT = String.raw`
 import json, os, sys, tarfile
 
@@ -430,7 +520,7 @@ def safe_target(name):
 with tarfile.open(archive, "r:gz") as tf:
     for member in tf:
         target = safe_target(member.name)
-        if member.issym() or member.islnk() or member.isdev() or member.isfifo():
+        if member.issym() or member.islnk() or member.isdev() or member.isfifo() or member.type == b"s":
             skipped += 1
             continue
         if member.isdir():
@@ -472,10 +562,31 @@ async function extractArchiveWithoutLinks(archiveFile, destination) {
   return JSON.parse(line);
 }
 
+// a crash between moving the old session aside and installing the new one
+// leaves no profile; boot restore puts the most recent .old. copy back.
+function recoverInterruptedSessionSwap(targetSession) {
+  if (fs.existsSync(targetSession)) return;
+  const parent = path.dirname(targetSession);
+  const name = path.basename(targetSession);
+  let old = null;
+  try {
+    old = fs.readdirSync(parent)
+      .filter((entry) => entry.startsWith(name + ".old."))
+      .sort()
+      .pop();
+  } catch (e) { return; }
+  if (!old) return;
+  try {
+    fs.renameSync(path.join(parent, old), targetSession);
+    console.log(`info: recovered session from ${old}`);
+  } catch (e) {}
+}
+
 async function restoreSession(dataDir, sessionDir) {
   if (!configured()) return { restored: false, reason: "not configured" };
   const base = baseDir(dataDir);
   const targetSession = sessionDir || defaultSessionDir(base);
+  recoverInterruptedSessionSwap(targetSession);
   const sessionName = path.basename(targetSession);
   const tmp = path.join(base, SESSION_ARCHIVE + ".restore.tmp");
   let staging = null;
@@ -493,7 +604,7 @@ async function restoreSession(dataDir, sessionDir) {
     if (archiveInfo.links > 0) {
       const detail = await extractArchiveWithoutLinks(tmp, staging);
       console.log(
-        `session archive contained ${archiveInfo.links} link entries; ` +
+        `session archive contained ${archiveInfo.links} special entries; ` +
         `skipped them safely (${detail.files || 0} files restored)`);
     } else {
       await execFileAsync("tar", ["-xzf", tmp, "-C", staging], { timeout: 180000 });
@@ -504,6 +615,8 @@ async function restoreSession(dataDir, sessionDir) {
     }
     sanitizeChromeLocks(extracted);
 
+    // custom sessionDir values can be nested deeper than the data dir.
+    fs.mkdirSync(path.dirname(targetSession), { recursive: true });
     const old = targetSession + ".old." + Date.now();
     const hadOld = fs.existsSync(targetSession);
     if (hadOld) fs.renameSync(targetSession, old);
@@ -583,7 +696,7 @@ let lastBackupSig = { session: "", db: "" };
 function statSig(file) {
   try {
     const s = fs.statSync(file);
-    return `${s.size}:${Math.round(s.mtimeMs)}`;
+    return `${s.size}:${s.mtimeMs}`;
   } catch (e) {
     return "";
   }
@@ -596,36 +709,34 @@ const CACHE_PREFIXES = CACHE_EXCLUDES
   .filter((n) => n.endsWith("*"))
   .map((n) => n.split("/").pop().slice(0, -1).toLowerCase());
 
-// Count files, total size and the newest mtime under a profile, skipping the
-// same caches and locks the archive drops. Walking is far cheaper than the
-// archive it lets us avoid.
+// a sorted per-path list catches same-size content changes even when the
+// newest mtime does not move; full mtimeMs precision catches sub-ms edits.
+// caches and locks the archive drops are skipped, as before.
 function sessionSignature(dir) {
-  let count = 0;
-  let total = 0;
-  let maxMtime = 0;
-  const walk = (current) => {
+  const parts = [];
+  const walk = (current, rel) => {
     let entries;
     try { entries = fs.readdirSync(current, { withFileTypes: true }); }
     catch (e) { return; }
     for (const entry of entries) {
       const lower = entry.name.toLowerCase();
+      const relPath = rel ? rel + "/" + entry.name : entry.name;
       if (entry.isDirectory()) {
         if (CACHE_SEGMENTS.has(lower)) continue;
         if (CACHE_PREFIXES.some((p) => p && lower.startsWith(p))) continue;
-        walk(path.join(current, entry.name));
+        walk(path.join(current, entry.name), relPath);
         continue;
       }
       if (CHROME_LOCK_NAMES.has(entry.name)) continue;
       try {
         const s = fs.statSync(path.join(current, entry.name));
-        count += 1;
-        total += s.size;
-        if (s.mtimeMs > maxMtime) maxMtime = s.mtimeMs;
+        parts.push(`${relPath}:${s.size}:${s.mtimeMs}`);
       } catch (e) {}
     }
   };
-  walk(dir);
-  return `${count}:${total}:${Math.round(maxMtime)}`;
+  walk(dir, "");
+  parts.sort();
+  return parts.join("|");
 }
 
 async function backupNow(dataDir, sessionDir, dbDir, options = {}) {
@@ -689,5 +800,5 @@ module.exports = {
   sanitizeChromeLocks, startPeriodicBackup, stopPeriodicBackup,
   configured, vacuumInto, validateArchive, archiveExcludes, defaultDbFile,
   looksLikeSqlite, unsafeEntry, CACHE_EXCLUDES, sessionLooksLinked,
-  sessionSignature, uploadState, downloadState,
+  sessionSignature, uploadState, downloadState, uploadPath, envInt,
 };

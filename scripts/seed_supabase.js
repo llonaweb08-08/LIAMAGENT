@@ -24,6 +24,16 @@ function dataDir() {
   return path.join(process.env.LOCALAPPDATA || os.homedir(), 'LiamWhatsApp');
 }
 
+function describeUpload(part) {
+  if (!part) return { text: 'NO (no result returned)', failed: true };
+  if (part.ok) return { text: 'yes', failed: false };
+  const reason = part.reason || part.error || 'unknown error';
+  // "skipped" is informational (no local DB, or nothing changed); a failed
+  // upload is a real error and must make the command exit non-zero.
+  if (part.skipped) return { text: `no (${reason})`, failed: false };
+  return { text: `NO (${reason})`, failed: true };
+}
+
 async function main() {
   if (!sync.configured()) {
     console.error('SUPABASE_URL and SUPABASE_SECRET_KEY must both be set.');
@@ -48,13 +58,15 @@ async function main() {
   console.log(`Uploading ${session} and the memory DB to Supabase...`);
   const result = await sync.backupNow(base, session, dbDir);
   console.log('');
-  console.log('WhatsApp login uploaded:', result && result.session && result.session.ok ? 'yes' : 'NO');
-  console.log('Memory database uploaded:', result && result.db && result.db.ok ? 'yes' : 'no (memory starts empty)');
+  const sessionUpload = describeUpload(result && result.session);
+  const dbUpload = describeUpload(result && result.db);
+  console.log('WhatsApp login uploaded:', sessionUpload.text);
+  console.log('Memory database uploaded:', dbUpload.text);
   if (result && result.session && result.session.entries) {
     console.log('Login files saved:', result.session.entries);
   }
   if (!result || !result.ok) console.log(JSON.stringify(result, null, 2));
-  if (!result || !result.session || !result.session.ok) process.exitCode = 1;
+  if (!result || sessionUpload.failed || dbUpload.failed) process.exitCode = 1;
 }
 
 main().catch((error) => {

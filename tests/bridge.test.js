@@ -11,6 +11,8 @@ const os = require('node:os');
 const path = require('node:path');
 const { test, after } = require('node:test');
 const { once } = require('node:events');
+const { execFile } = require('node:child_process');
+const { promisify } = require('node:util');
 
 const ROOT = path.resolve(__dirname, '..');
 const APP = fs.mkdtempSync(path.join(os.tmpdir(), 'liam-bridge-test-'));
@@ -180,7 +182,15 @@ test('bridge endpoint security and actions', async (t) => {
   assert.ok(fake, 'a fake Baileys socket should exist');
   const { port } = bridge.server.address();
   const token = fs.readFileSync(path.join(DATA, 'tool_token'), 'utf8').trim();
-  const post = (body, extra = {}) => request(port, { body, token, ...extra });
+  // BR-17: owner-scoped actions need the separate owner token that the bridge
+  // gives only to its own agent process. The normal loop token still works for
+  // everyone else and for approval requests.
+  const ownerPhones = new Set((Array.isArray(CONFIG.owners) ? CONFIG.owners : [])
+    .map((p) => String(p).split('@')[0]));
+  const post = (body, extra = {}) => {
+    const sender = body && typeof body === 'object' ? String(body.sender || '').split('@')[0] : '';
+    return request(port, { body, token: ownerPhones.has(sender) ? bridge.OWNER_TOKEN : token, ...extra });
+  };
 
   await t.test('accepts an authenticated message to an owner', async () => {
     const response = await post({ action: 'send', to: OWNER, text: 'hello', sender: OWNER });
@@ -567,18 +577,43 @@ test('bridge endpoint security and actions', async (t) => {
     bridge.pendingTools.clear();
   });
 
-  await t.test('group permission prompts stay in the group, never a DM', async () => {
+  await t.test('group approval prompts DM owners with context when no owner is in the group', async () => {
     bridge.pendingPerms.clear();
     const group = '2348000000000-123@g.us';
     const member = '2348999999999';
+    const sock = bridge.getSock();
+    sock.groupMetadata = async () => ({ participants: [{ id: `${member}@s.whatsapp.net` }] });
     fake.sent.length = 0;
     const p = await bridge.createPermissionRequest(group, member, 'hello there', { key: { id: 'TRIGGER' } });
     assert.ok(p, 'request should be created');
+    const dms = fake.sent.filter((m) => String(m.to).endsWith('@s.whatsapp.net'));
+    assert.equal(dms.length, CONFIG.owners.length, 'every owner is DMd');
+    for (const owner of CONFIG.owners) {
+      assert.ok(dms.some((m) => m.to === `${owner}@s.whatsapp.net`), `${owner} must be DMd`);
+    }
+    const sent = dms.at(-1);
+    assert.match(sent.content.text, /Group approval needed/);
+    assert.match(sent.content.text, /hello there/, 'the DM must include the actual request');
+    assert.ok(sent.content.text.includes(group), 'the DM must identify the group');
+    assert.equal(fake.sent.some((m) => m.to === group), false, 'a group with no owner would never see a group-only prompt');
+    bridge.pendingPerms.clear();
+  });
+
+  await t.test('group approval prompts stay in the group when an owner is present', async () => {
+    bridge.pendingPerms.clear();
+    const group = '2348000000000-124@g.us';
+    const member = '2348999999999';
+    const sock = bridge.getSock();
+    sock.groupMetadata = async () => ({
+      participants: [{ id: `${member}@s.whatsapp.net` }, { id: `${OWNER}@s.whatsapp.net` }],
+    });
+    fake.sent.length = 0;
+    const p = await bridge.createPermissionRequest(group, member, 'hello there', { key: { id: 'TRIGGER2' } });
+    assert.ok(p, 'request should be created');
     const sent = fake.sent.at(-1);
-    assert.equal(sent.to, group, 'prompt must go to the group');
+    assert.equal(sent.to, group, 'prompt must go to the group when an owner is there');
     assert.match(sent.content.text, /Group permission needed/);
-    const dm = fake.sent.some((m) => String(m.to).endsWith('@s.whatsapp.net'));
-    assert.equal(dm, false, 'no owner DM may be sent for a group request');
+    assert.equal(fake.sent.some((m) => m.to === `${OWNER}@s.whatsapp.net`), false, 'no owner DM when the prompt is in the group');
     bridge.pendingPerms.clear();
   });
 
@@ -658,10 +693,12 @@ test('bridge endpoint security and actions', async (t) => {
     bridge.setDmOpen(false);
   });
 
-  await t.test('re-sends a permission prompt when the request changes', async () => {
+  await t.test('re-sends a changed permission prompt up to the cap, then requires a fresh request', async () => {
     bridge.pendingPerms.clear();
-    const group = '2348000000000-123@g.us';
+    const group = '2348000000000-125@g.us';
     const member = '2348999999999';
+    const sock = bridge.getSock();
+    sock.groupMetadata = async () => ({ participants: [{ id: `${OWNER}@s.whatsapp.net` }] });
     fake.sent.length = 0;
     const p1 = await bridge.createPermissionRequest(group, member, 'first', { key: { id: 'T1' } });
     assert.equal(fake.sent.length, 1, 'the first request sends one prompt');
@@ -672,8 +709,14 @@ test('bridge endpoint security and actions', async (t) => {
     assert.equal(fake.sent.length, 2, 'a changed request is re-sent');
     await bridge.createPermissionRequest(group, member, 'third', { key: { id: 'T4' } });
     assert.equal(fake.sent.length, 3);
-    await bridge.createPermissionRequest(group, member, 'fourth', { key: { id: 'T5' } });
-    assert.equal(fake.sent.length, 3, 're-sends are capped so a chatty member cannot spam');
+    // Past the cap, later edits must be rejected rather than silently approved
+    // against a prompt the owner never saw.
+    await assert.rejects(
+      () => bridge.createPermissionRequest(group, member, 'fourth', { key: { id: 'T5' } }),
+      (e) => e && e.code === 'permission_reprompt_limit',
+    );
+    assert.equal(fake.sent.length, 3, 'no extra prompt is sent after the cap');
+    assert.equal(bridge.pendingPerms.size, 0, 'the rejected request is dropped so a fresh one is required');
     bridge.pendingPerms.clear();
   });
 
@@ -774,9 +817,89 @@ test('bridge endpoint security and actions', async (t) => {
     assert.equal(bridge.TEMP[group]['2348444444444'] > 0, true);
     delete bridge.TEMP[group];
   });
+
+  await t.test('a loopback tool token cannot claim an owner identity', async () => {
+    const response = await request(port, {
+      body: { action: 'send', to: OWNER, text: 'hello', sender: OWNER },
+      token,
+    });
+    assert.equal(response.status, 403);
+    assert.match(response.json.msg, /owner token/);
+  });
+
+  await t.test('GET pairing actions only bootstrap a cookie; the action needs POST', async () => {
+    for (const actionPath of ['/cancelpair', '/reset']) {
+      const forbidden = await request(port, { method: 'GET', path: actionPath, token: bridge.PAIR_TOKEN });
+      assert.equal(forbidden.status, 405, `${actionPath} with a header token must require POST`);
+      const bootstrap = await request(port, {
+        method: 'GET', path: `${actionPath}?token=${bridge.PAIR_TOKEN}`,
+      });
+      assert.equal(bootstrap.status, 302, `${actionPath} query token bootstraps a session`);
+      assert.equal(bootstrap.headers.location, actionPath);
+      const cookie = (bootstrap.headers['set-cookie'] || [])
+        .map((c) => String(c).split(';')[0]).join('; ');
+      const withCookie = await request(port, { method: 'GET', path: actionPath, cookie });
+      assert.equal(withCookie.status, 405, `${actionPath} cookie GET must not run the action`);
+    }
+  });
+
+  await t.test('pair POST rejects a cross-site origin', async () => {
+    const response = await request(port, {
+      method: 'POST', path: '/pair', body: { phone: OWNER },
+      token: bridge.PAIR_TOKEN,
+      headers: { Origin: 'https://evil.example' },
+    });
+    assert.equal(response.status, 403);
+  });
+
+  await t.test('diagnostic sends only target the owner', async () => {
+    bridge.outboundLog.length = 0;
+    bridge._setState('ready', 'test');
+    try {
+      const diag = (to) => request(port, {
+        method: 'GET', path: `/diag?probe=send&to=${to}`, token: bridge.PAIR_TOKEN,
+      });
+      const blocked = await diag('2348999999999');
+      assert.equal(blocked.status, 200);
+      assert.equal(blocked.json.sendProbe.ok, false);
+      assert.match(blocked.json.sendProbe.error, /owner/);
+      const allowed = await diag(OWNER);
+      assert.equal(allowed.status, 200);
+      assert.equal(allowed.json.sendProbe.ok, true);
+    } finally {
+      bridge._setState('starting', '');
+    }
+  });
+
+  await t.test('captioned media keeps its caption and its attachment hint', async () => {
+    assert.equal(bridge.displayText({ imageMessage: { caption: 'look' } }, 'imageMessage'), '[sent an image]: look');
+    assert.equal(bridge.displayText({ imageMessage: {} }, 'imageMessage'), '[sent an image]');
+    assert.equal(bridge.displayText({ conversation: 'hi' }, 'conversation'), 'hi');
+    assert.equal(bridge.displayText({ extendedTextMessage: { text: 'yo' } }, 'extendedTextMessage'), 'yo');
+  });
+
+  await t.test('a burst from one new LID shares one network lookup', async () => {
+    const lid = '100000000000099@lid';
+    const sock = bridge.getSock();
+    let calls = 0;
+    sock.groupMetadata = async () => {
+      calls += 1;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      return { participants: [{ id: lid, jid: '2348999999999@s.whatsapp.net' }] };
+    };
+    const key = { remoteJid: GROUP };
+    const results = await Promise.all([
+      bridge.resolvePhone(lid, { key }),
+      bridge.resolvePhone(lid, { key }),
+      bridge.resolvePhone(lid, { key }),
+    ]);
+    assert.deepEqual(results, ['2348999999999', '2348999999999', '2348999999999']);
+    assert.equal(calls, 1, 'concurrent lookups for one LID must be coalesced');
+  });
 });
 
 test('a reply survives a socket that is briefly closed', async (t) => {
+  const fake = bridge.getSock();
   await t.test('retries once after a connection-closed error', async () => {
     const original = fake.sendMessage.bind(fake);
     let calls = 0;
@@ -808,4 +931,46 @@ test('a reply survives a socket that is briefly closed', async (t) => {
       fake.sendMessage = original;
     }
   });
+});
+
+// TS-8: the keep-alive test above only checked typeof and "does not throw".
+// Verify the real behaviour in a subprocess: with a public URL and the agent
+// guards off, startKeepAlive() must actually ping /health. The 10-minute default
+// interval is fired immediately by a local setInterval shim so this stays fast.
+test('keep-alive pings the public /health URL', async () => {
+  const probePath = path.join(APP, 'keepalive_probe.js');
+  fs.writeFileSync(probePath, [
+    "'use strict';",
+    "const http = require('node:http');",
+    "let hits = 0;",
+    "const server = http.createServer((req, res) => {",
+    "  if (req.url === '/health') hits += 1;",
+    "  res.writeHead(200); res.end('ok');",
+    "});",
+    "server.listen(0, '127.0.0.1', () => {",
+    "  process.env.LIAM_PUBLIC_URL = 'http://127.0.0.1:' + server.address().port;",
+    "  delete process.env.LIAM_DISABLE_AGENT;",
+    "  delete process.env.LIAM_DISABLE_KEEPALIVE;",
+    "  delete process.env.LIAM_KEEPALIVE_MS;",
+    "  const realSetInterval = global.setInterval;",
+    "  global.setInterval = (fn, ms, ...args) => {",
+    "    if (ms === 600000) { setImmediate(fn); return { unref() {} }; }",
+    "    return realSetInterval(fn, ms, ...args);",
+    "  };",
+    "  const bridge = require('./whatsapp_bridge.js');",
+    "  bridge.startKeepAlive();",
+    "  setTimeout(() => { process.stdout.write('KEEPALIVE_RESULT:' + JSON.stringify({ hits }) + '\\n'); process.exit(0); }, 400);",
+    "});",
+  ].join('\n'));
+
+  const run = promisify(execFile);
+  const { stdout } = await run(process.execPath, [probePath], {
+    cwd: APP,
+    env: { ...process.env, LIAM_DATA_DIR: DATA, LIAM_PORT: '0' },
+    timeout: 10000,
+  });
+  const match = /KEEPALIVE_RESULT:(\{.*\})/.exec(stdout);
+  assert.ok(match, 'the probe should report its result');
+  const { hits } = JSON.parse(match[1]);
+  assert.ok(hits >= 1, 'keep-alive should ping /health at least once');
 });

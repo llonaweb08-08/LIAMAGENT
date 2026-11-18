@@ -1,3 +1,9 @@
+> **OBSOLETE — ARCHIVED PLAN.** This document described an early architecture
+> (Supabase Postgres / `DATABASE_URL` memory migration, QR linking) that was
+> never shipped. The current deployment uses Supabase **Storage** only with a
+> SQLite snapshot, Baileys phone-code pairing, and the runbook in
+> [`../DEPLOY_RENDER.md`](../DEPLOY_RENDER.md). Kept for historical context.
+
 # Plan: Deploy Liam on Render (free) with Supabase persistence
 
 ## Goal

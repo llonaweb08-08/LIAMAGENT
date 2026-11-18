@@ -33,9 +33,11 @@ SKIP_DIRS = {
 SKIP_FILES = {
     "package-lock.json",  # hashes/URLs, low value and noisy
 }
-# Files where placeholder/example values are expected.
-ALLOWLIST_PATH_PARTS = {
-    ".env.example", "README", "docs/", "tests/", "scan_secrets.py",
+# Paths where placeholder/example values are expected. Matching is anchored so
+# a directory merely named "docs" elsewhere cannot silence a real finding.
+ALLOWLIST_PREFIXES = ("docs/", "tests/")
+ALLOWLIST_EXACT = {
+    ".env.example", "README", "README.md", "scripts/scan_secrets.py",
 }
 
 SECRET_PATTERNS = [
@@ -60,6 +62,10 @@ SECRET_NAMES = (
 ASSIGN_RE = re.compile(
     r"^\s*(?:export\s+)?(?:" + "|".join(map(re.escape, SECRET_NAMES)) + r")\s*[:=]\s*(.+?)\s*$"
 )
+# Only the assigned value may whitelist a retrieval; a comment on the line must
+# not hide an inline plaintext secret.
+SECRET_RETRIEVAL_RE = re.compile(
+    r"(?:os\.)?environ|getenv|_secret\s*\(|_keys\s*\(", re.IGNORECASE)
 PLACEHOLDER_RE = re.compile(
     r"^(?:\"\"|''|\"your[_-].*\"|'your[_-].*'|<.*>|changeme|replace.?me|example|xxx+|none|null|false|0|\[\]|\(\)|sync:\s*false|generateValue:\s*true)$",
     re.IGNORECASE,
@@ -82,7 +88,11 @@ def _should_skip_path(path: Path) -> bool:
 
 def _allowlisted(path: Path) -> bool:
     rel = path.relative_to(ROOT).as_posix()
-    return any(part in rel for part in ALLOWLIST_PATH_PARTS)
+    if rel.startswith(ALLOWLIST_PREFIXES):
+        return True
+    if rel in ALLOWLIST_EXACT:
+        return True
+    return rel.endswith("/.env.example")
 
 
 def _read_text(path: Path) -> str | None:
@@ -128,11 +138,12 @@ def scan_file(path: Path, include_local: bool) -> list[tuple[str, int, str]]:
             if m:
                 rhs = m.group(1).strip()
                 value = rhs.strip('"').strip("'")
+                # Inspect only the code part of the right-hand side; a trailing
+                # comment mentioning os.environ must not hide a literal secret.
+                code_rhs = rhs.split(" #", 1)[0].strip()
                 # Skip safe retrievals/defaults; flag only obvious inline plaintext.
                 if value and not PLACEHOLDER_RE.match(rhs):
-                    if any(tok in line for tok in ("os.environ", "getenv", "_secret(", "_keys(")):
-                        continue
-                    if value in ("", "null", "None"):
+                    if SECRET_RETRIEVAL_RE.search(code_rhs):
                         continue
                     findings.append((rel, i, "assignment:secret-name"))
     # Special local-file warning: liam_secrets.py with non-trivial content.
@@ -205,7 +216,10 @@ def main(argv: list[str] | None = None) -> int:
         for rel, line, kind in uniq:
             print(f"  - {rel}:{line} [{kind}]")
         print(f"\n{len(uniq)} finding(s). Review and remediate before commit/deploy.")
-        print("If a real key was exposed, rotate/revoke it at the provider and remove it from history/backups as appropriate.")
+        print(
+            "If a real key was exposed, rotate/revoke it at the provider and "
+            "remove it from history/backups as appropriate."
+        )
         return 1
     print("Secret scan: no findings.")
     return 0

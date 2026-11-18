@@ -6,11 +6,19 @@
 //   node scripts/verify_deployment.js https://liam-whatsapp-agent.onrender.com
 //   LIAM_PUBLIC_URL=https://... npm run verify
 //
+// An explicit URL argument wins over LIAM_PUBLIC_URL, with a warning if both
+// are set to different values (values are never echoed).
+//
 // Exit code 0 means /health is 200 and /ready is 200 (WhatsApp linked and the
 // Python agent is running). --allow-not-ready exits 0 when only /health is up;
 // useful right after a deploy, before pairing.
 
-const base = (process.env.LIAM_PUBLIC_URL || process.argv[2] || '').replace(/\/+$/, '');
+const cliUrl = process.argv.slice(2).find((value) => /^https?:\/\//i.test(value)) || '';
+const envUrl = String(process.env.LIAM_PUBLIC_URL || '');
+if (cliUrl && envUrl && cliUrl.replace(/\/+$/, '') !== envUrl.replace(/\/+$/, '')) {
+  console.warn('warning: URL argument takes precedence over LIAM_PUBLIC_URL; ignoring the environment value.');
+}
+const base = (cliUrl || envUrl).replace(/\/+$/, '');
 const allowNotReady = process.argv.includes('--allow-not-ready');
 
 if (!/^https?:\/\//i.test(base)) {
@@ -62,8 +70,9 @@ async function verify(target) {
 
   console.error('\nLiam is alive but not ready.');
   if (status.json && status.json.needsQr) {
-    console.error('WhatsApp is not linked. Open the pairing page printed in the Render logs:');
-    console.error('  https://<your-service>.onrender.com/pair?token=<LIAM_PAIR_TOKEN>');
+    console.error('WhatsApp is not linked. Build the /pair URL from LIAM_PAIR_TOKEN');
+    console.error('in the Render dashboard (logs show only a redacted token), or open');
+    console.error('/pair and paste the token into the form to get an 8-digit code.');
   } else if (status.json && status.json.hasSessionData) {
     console.error('A WhatsApp session is present but the client is not ready yet; check the logs.');
   } else {

@@ -22,7 +22,7 @@ archived to a private Supabase bucket and restored on boot. See
 ## Requirements
 
 - Node.js **20+** (24.x tested)
-- Python **3.10+** (3.12 tested)
+- Python **3.12** (pinned in `.python-version`, `pyproject.toml`, CI and Docker)
 - npm 10+
 - Windows is the primary local target (the launch scripts are `.bat`), but the
   code is cross-platform and runs in the provided Docker image.
@@ -42,7 +42,10 @@ Chromium is optional and is only needed for screenshots and browser tasks.
 
 No API keys are stored in tracked source files. Set environment variables, or
 create a local `liam_secrets.py` (git-ignored) that defines the same names.
-Environment variables take precedence. Copy `.env.example` for the full list.
+Environment variables take precedence. `.env.example` is a **reference list**:
+the app does not load `.env` by itself, so export the values in your shell
+(e.g. `Get-Content .env.example` to review, then `$env:NAME="value"` in
+PowerShell) before starting Liam.
 
 ```python
 MOON_KEYS = ["...", "..."]
@@ -81,32 +84,40 @@ or:
 npm start
 ```
 
-On first run, open the pairing page printed in the logs and press the button once
-to get an 8-character code. There is no QR scan. `npm run doctor` checks the
+On first run, build the pairing URL from `LIAM_PAIR_TOKEN` (or read the value
+from your shell / `liam_secrets.py`) and open it, then press the button once to
+get an 8-digit code. The startup log prints only a **redacted** token, e.g.
+`🔗 Pairing page: http://127.0.0.1:5678/pair?token=<redacted> (token abcd…wxyz)`;
+it never prints the full secret. There is no QR scan. `npm run doctor` checks the
 local login, providers, and memory database without printing any secret values.
 
 ## Pairing
 
-Pairing uses an **8-character phone code** only - there is no QR scan:
+Pairing uses an **8-digit phone code** only - there is no QR scan:
 
-- Open `/pair?token=...` and press the button once. It returns a code for the
-  bot's phone number (`LIAM_BOT_PHONE`, default `447881161023`).
+- Open `/pair?token=<LIAM_PAIR_TOKEN>` and press the button once. It returns a
+  code for the bot's phone number (`LIAM_BOT_PHONE`, default `447881161023`).
 - On the bot phone (WhatsApp **Business**): Settings -> Linked devices ->
   Link a device -> **Link with phone number instead**, then type the code.
 - WhatsApp allows at most 4 linked devices; remove old **Liam** entries there
   before a new attempt.
-- `/qr?token=...` only explains this; it no longer renders a QR code.
+- `/qr` only explains this; it no longer renders a QR code.
 
 `LIAM_PAIR_TOKEN` comes from the environment. If it is not set, a random token
 is generated in `LIAM_DATA_DIR/pair_token`; that file is not archived, so set
 the variable on Render to keep a stable pairing URL across restarts.
-`render.yaml` uses `generateValue: true`, and the URL is printed in the deploy
-logs.
+`render.yaml` uses `generateValue: true`. **The deploy log masks the token**:
+it prints `/pair?token=<redacted>` plus a 4-digit prefix/suffix, never the full
+value. Copy the token from the Render dashboard (or your local environment) to
+build the real URL; you can also open `/pair` and paste the token into the form.
 
 A code request is rate-limited by WhatsApp. The bridge reuses a code for 60
-seconds and then enforces a 2-minute cooldown (`LIAM_PAIRING_COOLDOWN_MS`).
-`/cancelpair` discards a half-finished attempt; `/reset` starts from a clean
-login.
+seconds and then enforces a **5-minute** cooldown (`LIAM_PAIRING_COOLDOWN_MS`,
+set explicitly in `render.yaml`). State-changing helpers use **POST**, not GET:
+`POST /cancelpair` discards a half-finished attempt and `POST /reset` starts
+from a clean login. Send the token in the request body or a secure pairing
+session (an initial `?token=` only sets a cookie and redirects to the clean
+URL).
 
 ## Runtime data
 
@@ -219,7 +230,7 @@ profile cannot be imported; pair on Render instead (see the runbook).
 
 ```powershell
 python -m unittest discover -s tests -v
-node --test "tests/**/*.test.js"
+npm test                    # node --test: default discovery finds tests/*.test.js
 python -m ruff check .
 npm run check
 npm audit --omit=dev
@@ -228,7 +239,7 @@ npm run doctor
 
 The bridge tests run against a temporary copy of `whatsapp_bridge.js` with a
 stubbed Baileys socket, so they never touch a real session or send messages.
-The Supabase tests use a local mock storage server.
+The Supabase and deployment-verifier tests use local mock HTTP servers.
 
 ## Deployment
 
@@ -239,7 +250,9 @@ The short version:
 2. Apply `render.yaml` on Render and fill in the `sync: false` secrets.
 3. Optionally seed an existing **Baileys** profile with
    `npm run seed:supabase` (a Chromium profile cannot be imported).
-4. Open the `/pair` URL from the Render logs and link the bot phone.
+4. Build the `/pair?token=...` URL from the `LIAM_PAIR_TOKEN` value in the
+   Render dashboard (logs show a redacted token) and link the bot phone with
+   the 8-digit code.
 5. Point UptimeRobot at `/health` every 5 minutes to keep the free instance
    awake, and at `/ready` if you want an alert when Liam is not linked.
 
@@ -254,6 +267,9 @@ steps, are in [docs/DEPLOY_RENDER.md](docs/DEPLOY_RENDER.md).
 - A Playwright screenshot or browser task can still exceed 512 MB because the
   Python agent creates its own Chromium. Keep browser work sequential and avoid
   large screenshots; the WhatsApp bridge itself uses only a few tens of MB.
+  `LIAM_MEM_LIMIT_MB=320` on Render only recycles the WhatsApp socket early - it
+  cannot undo a local Chromium spike (hence `LIAM_VPS_BROWSER=1` in the
+  blueprint).
 - Group permissions, pending approvals, and held replies now survive a restart
   (they ride to Supabase as `bridge_state.json`). A held reply that is released
   after a restart is delivered as a normal message rather than a quoted reply,

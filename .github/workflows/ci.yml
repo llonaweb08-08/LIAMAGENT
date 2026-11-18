@@ -16,9 +16,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Full history is required for the secret scan below.
+          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.12"
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
@@ -26,9 +29,30 @@ jobs:
       - name: Lint (undefined names and unused imports)
         run: python -m ruff check .
       - name: Compile check
-        run: python -m compileall -q agent.py whatsapp_liam.py liam_keys.py liam_google.py debug_probe.py scripts/doctor.py scripts/scan_secrets.py
-      - name: Secret scan (tracked files)
+        run: python -m compileall -q .
+      - name: Secret scan (working tree)
         run: python scripts/scan_secrets.py
+      # gitleaks scans every commit, not just the current tree. Its allowlist
+      # uses paths anchored at the repository root (the in-tree scanner's
+      # substring allowlist is broader and is tracked separately).
+      - name: Secret scan (full git history)
+        uses: gitleaks/gitleaks-action@v3
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+          GITLEAKS_CONFIG_TOML: |
+            title = "Liam history secret scan"
+            [extend]
+            useDefault = true
+            [[allowlists]]
+            description = "Placeholders in root-anchored example, docs and test paths only"
+            paths = [
+              '''^\.env\.example$''',
+              '''^README\.md$''',
+              '''^docs/''',
+              '''^tests/''',
+              '''^scripts/scan_secrets\.py$''',
+            ]
       - name: Unit tests
         run: python -m unittest discover -s tests -v
 
@@ -46,8 +70,8 @@ jobs:
         run: echo "Baileys is pure JavaScript; no browser download is needed in CI"
       - name: Syntax check
         run: npm run check && node --check scripts/seed_supabase.js && node --check scripts/verify_deployment.js
-      - name: Bridge and sync tests
-        run: node --test "tests/**/*.test.js"
+      - name: Node tests (bridge, sync, InstaBox, deployment verifier)
+        run: npm test
       - name: Audit (fail only on critical)
         run: npm audit --omit=dev --audit-level=critical
 

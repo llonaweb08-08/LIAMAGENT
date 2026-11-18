@@ -18,6 +18,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import types
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -89,23 +90,36 @@ from liam_agent.runtime import (
 )
 from liam_agent.state import _clamp_timeout, _remaining_budget
 from liam_agent.web import (
-    _BLOCKED_HOST_SUFFIXES, _SafeRedirectHandler, _ddg_clean_title, _ddg_parse_html,
-    _generous_timeout,
-    _ddg_parse_lite, _ddg_target, _http_json, _open_url, _safe_url, _search_brave,
+    _BLOCKED_HOST_SUFFIXES, _SafeRedirectHandler, _SafeUrl, _build_opener,
+    _ddg_clean_title, _ddg_parse_html, _ddg_parse_lite, _ddg_target, _generous_timeout,
+    _http_json, _open_url, _pinned_connection, _safe_url, _search_brave,
     _search_duckduckgo, _search_serper, _search_tavily, create_tool, email_read,
     file_read, file_write, shell_exec, web_fetch, web_search,
 )
 
-# Keep shared mutable state as the same objects on the facade.
-_HISTORY = state._HISTORY
-_LAST_TRACE = state._LAST_TRACE
-_DEADLINE = state._DEADLINE
-_LAST_PROGRESS_AT = state._LAST_PROGRESS_AT
-_LAST_PROGRESS_TEXT = state._LAST_PROGRESS_TEXT
-_LAST_PROGRESS_EMIT_AT = state._LAST_PROGRESS_EMIT_AT
-_PROGRESS_COUNT = state._PROGRESS_COUNT
-_EXHAUSTED = state._EXHAUSTED
-_vps_browser_retry_at = state._vps_browser_retry_at
+# Shared turn state lives only in liam_agent.state. Forward facade reads and
+# writes there so agent.X and state.X can never drift apart.
+class _FacadeModule(types.ModuleType):
+    _STATE_NAMES = frozenset({
+        "_HISTORY", "_LAST_TRACE", "_DEADLINE", "_LAST_PROGRESS_AT",
+        "_LAST_PROGRESS_TEXT", "_LAST_PROGRESS_EMIT_AT", "_PROGRESS_COUNT",
+        "_EXHAUSTED", "_vps_browser_retry_at", "_REQUEST_ID",
+        "_STOP_BASELINE", "_STOP_TOKEN",
+    })
+
+    def __getattr__(self, name):
+        if name in self._STATE_NAMES:
+            return getattr(state, name)
+        raise AttributeError(f"module {self.__name__!r} has no attribute {name!r}")
+
+    def __setattr__(self, name, value):
+        if name in self._STATE_NAMES:
+            setattr(state, name, value)
+            return
+        super().__setattr__(name, value)
+
+
+sys.modules[__name__].__class__ = _FacadeModule
 
 
 if __name__ == "__main__":

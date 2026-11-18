@@ -50,7 +50,14 @@ def voice_file() -> str:
 
 
 def _db_path() -> str:
-    return os.environ.get("LIAM_DB") or os.path.join(_data_dir(), "liam_memory.db")
+    # The canonical memory database is liam_agent.memory.DB (LIAM_DB, else the
+    # repository base directory). Read it lazily so voice settings follow the
+    # same database the agent uses instead of a second DATA_DIR copy.
+    try:
+        from liam_agent.memory import DB
+        return DB
+    except Exception:
+        return os.environ.get("LIAM_DB") or os.path.join(_data_dir(), "liam_memory.db")
 
 
 def _connect():
@@ -99,21 +106,8 @@ def _read_file() -> str | None:
 
 
 def _write_file(key: str) -> None:
-    path = voice_file()
-    directory = os.path.dirname(path) or "."
-    os.makedirs(directory, exist_ok=True)
-    fd, temporary = tempfile.mkstemp(prefix=".voice_", dir=directory)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(key)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, path)
-    finally:
-        try:
-            os.remove(temporary)
-        except OSError:
-            pass
+    from liam_agent.runtime import _atomic_write_text
+    _atomic_write_text(voice_file(), key)
 
 
 def get_voice() -> str:

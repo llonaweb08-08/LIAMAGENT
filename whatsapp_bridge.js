@@ -21,6 +21,7 @@ const path = require("path");
 const fs = require("fs");
 const os = require("os");
 const http = require("http");
+const net = require("net");
 const crypto = require("crypto");
 const util = require("util");
 
@@ -57,14 +58,23 @@ let sync;
 try { sync = require("./supabase_sync"); }
 catch (e) { sync = { restoreSession: async()=>({restored:false}), restoreDb: async()=>({restored:false}), backupSession: async()=>({ok:false}), backupDb: async()=>({ok:false}), backupNow: async()=>({ok:false}), sanitizeChromeLocks: ()=>0, startPeriodicBackup: ()=>null, stopPeriodicBackup: ()=>{}, configured: ()=>false, uploadState: async()=>({ok:false}), downloadState: async()=>({restored:false}) }; }
 
-process.on("unhandledRejection", (r) => {
-  noteWaEvent("unhandledRejection", String(r && r.message ? r.message : r).slice(0, 180));
-  console.log("\n💀 UNHANDLED REJECTION:", String(r && r.stack ? r.stack : r));
-});
-process.on("uncaughtException", (e) => {
-  noteWaEvent("uncaughtException", String(e && e.message ? e.message : e).slice(0, 180));
-  console.log("\n💀 UNCAUGHT EXCEPTION:", String(e && e.stack ? e.stack : e));
-});
+// A fatal error must not leave a half-alive process that Render keeps routing
+// traffic to. Flush the small persisted state synchronously, then exit non-zero
+// so the supervisor restarts the service. Guard against running more than once.
+let fatalHandlersInstalled = false;
+function fatalFlushAndExit(kind, value) {
+  const detail = String(value && value.message ? value.message : value).slice(0, 200);
+  try { noteWaEvent(kind, detail); } catch (e) {}
+  console.log(`\n💀 ${kind}:`, String(value && value.stack ? value.stack : value));
+  if (fatalHandlersInstalled) return;
+  fatalHandlersInstalled = true;
+  try { saveBridgeStateLocal(); } catch (e) {}
+  try { if (sync && sync.stopPeriodicBackup) sync.stopPeriodicBackup(); } catch (e) {}
+  // Give an in-flight HTTP response a tick to complete before exiting.
+  setTimeout(() => process.exit(1), 250).unref?.();
+}
+process.on("unhandledRejection", (r) => fatalFlushAndExit("UNHANDLED REJECTION", r));
+process.on("uncaughtException", (e) => fatalFlushAndExit("UNCAUGHT EXCEPTION", e));
 
 // ---------------------------------------------------------------------------
 // Paths and shared config
@@ -79,7 +89,6 @@ const TOKEN_FILE = path.join(DATA_DIR, "tool_token");
 const PAIR_TOKEN_FILE = path.join(DATA_DIR, "pair_token");
 const KNOWN_MEMBERS_FILE = path.join(DATA_DIR, "known_members.json");
 const STOP_FILE = path.join(DATA_DIR, "stop_flag");
-const BRAIN_FILE = path.join(DATA_DIR, "brain_state");
 const QR_FILE = path.join(DATA_DIR, "qr.png");
 const DM_OPEN_FILE = path.join(DATA_DIR, "dm_open");
 
@@ -92,7 +101,12 @@ const OUTBOUND_MAX = 20;
 // NaN in Math.max stays NaN. That silently breaks a timer or a comparison, so
 // every configurable number goes through envInt() and falls back to the default.
 function envInt(name, fallback, min, max) {
-  const parsed = Number.parseInt(process.env[name], 10);
+  // A value like "10m" must be rejected, not silently parsed as 10. Number.parseInt
+  // accepts a leading integer and ignores the rest, which would set a wildly
+  // wrong timer, so require the whole string to be an integer first.
+  const raw = process.env[name];
+  const parsed = typeof raw === "string" && /^[+-]?\d+$/.test(raw.trim())
+    ? Number.parseInt(raw.trim(), 10) : NaN;
   let value = Number.isFinite(parsed) ? parsed : fallback;
   if (min !== undefined) value = Math.max(min, value);
   if (max !== undefined) value = Math.min(max, value);
@@ -105,10 +119,26 @@ const TOOL_APPROVAL_TTL_MS = envInt("LIAM_TOOL_APPROVAL_MS", 10 * 60 * 1000, 60_
 // Minimum gap between two pairing-code requests. WhatsApp blocks a number that
 // asks repeatedly, and each request restarts that block.
 const PAIRING_COOLDOWN_MS = envInt("LIAM_PAIRING_COOLDOWN_MS", 120000, 60_000);
+// WhatsApp's own rate-limit wait. One value drives both the reconnect delay and
+// the text shown to the operator, so the two can never disagree.
+const RATE_LIMIT_COOLDOWN_MS = envInt("LIAM_RATE_LIMIT_COOLDOWN_MS", 5 * 60 * 1000, 60_000);
 const MAX_PENDING = 40;
 
 function resolvePort() {
-  const raw = process.env.PORT || process.env.LIAM_PORT || "5678";
+  // "0" is a valid explicit value (an ephemeral port, used by the tests), so pick
+  // the first variable that is actually set rather than using ||, which would
+  // skip an empty string but is easy to get wrong for zero.
+  let raw = null;
+  for (const name of ["PORT", "LIAM_PORT"]) {
+    if (process.env[name] != null && String(process.env[name]).trim() !== "") {
+      raw = String(process.env[name]).trim();
+      break;
+    }
+  }
+  if (raw === null) raw = "5678";
+  if (!/^\d+$/.test(raw)) {
+    throw new Error("PORT/LIAM_PORT must be a TCP port between 0 and 65535");
+  }
   const port = Number.parseInt(raw, 10);
   if (!Number.isInteger(port) || port < 0 || port > 65535) {
     throw new Error("PORT/LIAM_PORT must be a TCP port between 0 and 65535");
@@ -144,34 +174,54 @@ const DM_ALLOW = new Set([
 
 // Known group members are people Liam has actually seen in a group. They are
 // only allowed to DM after the owner runs .allowdm.
+const KNOWN_MEMBERS_MAX = 5000;
 const knownMembers = new Set();
 try {
   const raw = JSON.parse(fs.readFileSync(KNOWN_MEMBERS_FILE, "utf8"));
   if (Array.isArray(raw)) raw.map(bareId).filter((p) => /^\d{6,20}$/.test(p)).forEach((p) => knownMembers.add(p));
 } catch (e) {}
+// Keep the in-memory set bounded too, not only the file. A long-lived process
+// that sees many group members otherwise grows this set without limit.
+function trimKnownMembers() {
+  while (knownMembers.size > KNOWN_MEMBERS_MAX) {
+    knownMembers.delete(knownMembers.values().next().value);
+  }
+}
+trimKnownMembers();
 function saveKnownMembers() {
+  trimKnownMembers();
   try {
-    fs.writeFileSync(KNOWN_MEMBERS_FILE, JSON.stringify([...knownMembers].slice(-5000)), { mode: 0o600 });
+    writeFileAtomic(KNOWN_MEMBERS_FILE, JSON.stringify([...knownMembers]));
   } catch (e) {}
 }
 function rememberKnownMember(phone) {
   const p = bareId(phone);
   if (!/^\d{6,20}$/.test(p) || knownMembers.has(p)) return;
   knownMembers.add(p);
+  trimKnownMembers();
   saveKnownMembers();
 }
 
 function copyLegacy(src, dest, mode = 0o600) {
   try {
-    if (fs.existsSync(dest) || !fs.existsSync(src)) return;
+    if (!fs.existsSync(src)) return;
+    if (fs.existsSync(dest)) {
+      // The migration already happened. Drop the source only when it is an
+      // identical leftover; a different file may contain newer user data.
+      try {
+        if (fs.readFileSync(src).equals(fs.readFileSync(dest))) fs.rmSync(src, { force: true });
+      } catch (e) {}
+      return;
+    }
     fs.copyFileSync(src, dest);
     try { fs.chmodSync(dest, mode); } catch (e) {}
     fs.rmSync(src, { force: true });
   } catch (e) { console.log("⚠️ could not migrate " + src + ": " + String(e)); }
 }
 
-// Move control files and session data out of the project directory.
-copyLegacy(path.join(BASE_DIR, ".brain_state"), BRAIN_FILE);
+// Move control files and session data out of the project directory. The brain
+// marker is only migrated here; the live agent keeps its own history in SQLite.
+copyLegacy(path.join(BASE_DIR, ".brain_state"), path.join(DATA_DIR, "brain_state"));
 copyLegacy(path.join(BASE_DIR, ".stop"), STOP_FILE);
 const LEGACY_SESSION = path.join(BASE_DIR, "liam_session");
 if (!fs.existsSync(SESSION_DIR) && fs.existsSync(LEGACY_SESSION)) {
@@ -212,6 +262,10 @@ function loadToken() {
   return token;
 }
 const TOOL_TOKEN = loadToken();
+// Owner-only tool actions need a second token that the normal loop token cannot
+// derive. It is regenerated on every bridge start and passed only to the spawned
+// agent, so a leaked tool token cannot claim sender=owner and run shell commands.
+const OWNER_TOKEN = crypto.randomBytes(32).toString("hex");
 
 function loadPairToken() {
   const fromEnv = String(process.env.LIAM_PAIR_TOKEN || "").trim();
@@ -232,7 +286,9 @@ const PUBLIC_URL = String(
   (process.env.RENDER_EXTERNAL_HOSTNAME ? "https://" + process.env.RENDER_EXTERNAL_HOSTNAME : "") ||
   ""
 ).replace(/\/+$/, "");
-const BOT_PHONE = String(process.env.LIAM_BOT_PHONE || "447881161023").replace(/\D/g, "");
+// No owner-specific number baked into the code. Prefer an explicit override,
+// then the first configured owner, then an empty value the page can leave blank.
+const BOT_PHONE = String(process.env.LIAM_BOT_PHONE || OWNERS[0] || "").replace(/\D/g, "");
 
 function writeFileAtomic(file, value) {
   const temp = file + "." + process.pid + "." + Date.now() + ".tmp";
@@ -332,7 +388,14 @@ function containerMemoryMiB() {
 // archive under the same "liam_session/session" path as before.
 const CREDS_FILE = path.join(SESSION_PROFILE_DIR, "creds.json");
 function profileHasCredentials() {
-  try { return fs.existsSync(CREDS_FILE); } catch (e) { return false; }
+  // A truncated or corrupt creds.json is worse than no credentials: it makes
+  // boot trust a half-written profile. Require a readable JSON object before
+  // treating the profile as usable.
+  try {
+    const raw = fs.readFileSync(CREDS_FILE, "utf8");
+    const data = JSON.parse(raw);
+    return !!(data && typeof data === "object" && !Array.isArray(data));
+  } catch (e) { return false; }
 }
 function hasSessionData() { return profileHasCredentials(); }
 
@@ -363,8 +426,14 @@ function removeQrFile() {
 }
 
 function loadDmOpen() {
-  if (process.env.LIAM_DM_OPEN != null) return String(process.env.LIAM_DM_OPEN || "0") === "1";
-  try { return fs.readFileSync(DM_OPEN_FILE, "utf8").trim() === "1"; } catch (e) { return false; }
+  // The persisted .allowdm / .disallowdm decision is authoritative. The env var
+  // is only a first-run default used when no saved decision file exists yet;
+  // otherwise an old env value would override what the owner last typed.
+  try { return fs.readFileSync(DM_OPEN_FILE, "utf8").trim() === "1"; }
+  catch (e) {
+    if (process.env.LIAM_DM_OPEN != null) return String(process.env.LIAM_DM_OPEN || "0") === "1";
+    return false;
+  }
 }
 let dmOpen = loadDmOpen();
 function saveDmOpen() {
@@ -493,24 +562,34 @@ function reachoutLockActive() {
   if (reachoutLock.endsAt && Date.parse(reachoutLock.endsAt) <= Date.now()) return false;
   return true;
 }
+let reachoutRefreshInFlight = null;
 async function refreshReachoutLock() {
-  try {
-    if (!sock || typeof sock.fetchAccountReachoutTimelock !== "function") return;
-    const info = await sock.fetchAccountReachoutTimelock();
-    reachoutLock = info ? {
-      isActive: !!info.isActive,
-      enforcementType: info.enforcementType || null,
-      endsAt: info.timeEnforcementEnds ? new Date(info.timeEnforcementEnds).toISOString() : null,
-      checkedAt: Date.now(),
-    } : null;
-    if (reachoutLock && reachoutLock.isActive) {
-      console.log(`warn: WhatsApp is blocking outgoing messages (${reachoutLock.enforcementType || "restriction"})`
-        + (reachoutLock.endsAt ? ` until ${reachoutLock.endsAt}` : ""));
-    } else if (!reachoutLockActive()) {
-      // The block has lifted: release anything we held back while it was on.
-      void flushHeldReplies();
-    }
-  } catch (e) { /* keep the last known value on a failed check */ }
+  if (reachoutRefreshInFlight) return reachoutRefreshInFlight;
+  reachoutRefreshInFlight = (async () => {
+    try {
+      if (!sock || typeof sock.fetchAccountReachoutTimelock !== "function") return;
+      const info = await sock.fetchAccountReachoutTimelock();
+      const checkedAt = Date.now();
+      const next = info ? {
+        isActive: !!info.isActive,
+        enforcementType: info.enforcementType || null,
+        endsAt: info.timeEnforcementEnds ? new Date(info.timeEnforcementEnds).toISOString() : null,
+        checkedAt,
+      } : { isActive: false, enforcementType: null, endsAt: null, checkedAt };
+      // A slower check started before a newer one must not overwrite it.
+      if (reachoutLock && Number(reachoutLock.checkedAt || 0) >= checkedAt) return;
+      reachoutLock = next;
+      if (reachoutLock && reachoutLock.isActive) {
+        console.log(`warn: WhatsApp is blocking outgoing messages (${reachoutLock.enforcementType || "restriction"})`
+          + (reachoutLock.endsAt ? ` until ${reachoutLock.endsAt}` : ""));
+      } else if (!reachoutLockActive()) {
+        // The block has lifted: release anything we held back while it was on.
+        void flushHeldReplies();
+      }
+    } catch (e) { /* keep the last known value on a failed check */ }
+  })();
+  try { return await reachoutRefreshInFlight; }
+  finally { reachoutRefreshInFlight = null; }
 }
 
 // While WhatsApp is time-locking the number, replies cannot be delivered, so
@@ -522,8 +601,17 @@ const HELD_REPLY_MAX = 20;
 const HELD_REPLY_TTL_MS = 3 * 60 * 60 * 1000;
 function holdReply(target, text, options) {
   try {
-    heldReplies.push({ target, text, options, at: Date.now() });
-    while (heldReplies.length > HELD_REPLY_MAX) heldReplies.shift();
+    const body = String(text || "");
+    // A retry after a failed send can reach here more than once for the same
+    // answer. Keeping one item avoids delivering it twice when the lock lifts.
+    const existing = heldReplies.find((h) => h.target === target && h.text === body);
+    if (existing) {
+      existing.at = Date.now();
+      if (options) existing.options = options;
+    } else {
+      heldReplies.push({ target, text: body, options, at: Date.now(), sentChunks: 0 });
+      while (heldReplies.length > HELD_REPLY_MAX) heldReplies.shift();
+    }
     scheduleBridgeStateSave();
     console.log(`warn: holding a reply for ${jidType(target)} until WhatsApp stops blocking sends`);
   } catch (e) {}
@@ -537,7 +625,12 @@ async function flushHeldReplies() {
       const item = heldReplies[0];
       if (Date.now() - item.at > HELD_REPLY_TTL_MS) { heldReplies.shift(); continue; }
       try {
-        const sent = await sendLong(item.target, item.text, item.options);
+        const sent = await sendLong(item.target, item.text, item.options, (sentChunks) => {
+          // If a fresh 463 arrives mid-reply, the next flush starts from the
+          // chunk after the last one WhatsApp accepted instead of resending all.
+          item.sentChunks = sentChunks;
+          scheduleBridgeStateSave();
+        }, item.sentChunks || 0);
         heldReplies.shift();
         console.log(`info: delivered a held reply to ${jidType(item.target)} (id ${messageId(sent) || "?"})`);
       } catch (e) {
@@ -563,6 +656,12 @@ const BRIDGE_STATE_OBJECT = "bridge_state.json";
 const BRIDGE_STATE_FILE = path.join(DATA_DIR, "bridge_state.json");
 let bridgeStateSaveTimer = null;
 
+const STATE_MAP_MAX = 5000;
+const STATE_LIAM_MAX = 200;
+function boundedEntries(map, max = STATE_MAP_MAX) {
+  return Object.fromEntries([...map.entries()].slice(0, max));
+}
+
 function bridgeStateSnapshot() {
   return {
     v: 1,
@@ -572,7 +671,7 @@ function bridgeStateSnapshot() {
     temp: Object.fromEntries(Object.entries(TEMP).map(([jid, map]) => [jid, { ...map }])),
     perms: [...pendingPerms.values()].map((p) => ({
       id: p.id, jid: p.jid, phone: p.phone, text: p.text, ts: p.ts,
-      promptedText: p.promptedText, promptCount: p.promptCount,
+      promptedText: p.promptedText, promptCount: p.promptCount, frozen: p.frozen,
     })),
     tools: [...pendingTools.values()].map((t) => ({
       id: t.id, action: t.action, payload: t.payload, actor: t.actor,
@@ -580,13 +679,34 @@ function bridgeStateSnapshot() {
     })),
     // The quoted message is intentionally dropped: it is a live Baileys object
     // that cannot be safely rehydrated after a restart, and delivering the text
-    // matters more than the quote.
-    held: heldReplies.map((h) => ({ target: h.target, text: h.text, at: h.at })),
+    // matters more than the quote. sentChunks keeps a partially delivered reply
+    // from being sent twice when the lock lifts.
+    held: heldReplies.map((h) => ({ target: h.target, text: h.text, at: h.at, sentChunks: h.sentChunks || 0 })),
+    // These used to be rebuilt from scratch on every redeploy, losing DM
+    // decisions, learned LID identities and reply-to context.
+    dmOpen,
+    known: [...knownMembers].slice(0, KNOWN_MEMBERS_MAX),
+    lids: {
+      cache: boundedEntries(lidCache),
+      contacts: boundedEntries(lidContacts),
+      sources: boundedEntries(lidSources),
+    },
+    lastLiam: Object.fromEntries(Object.entries(lastLiam).slice(0, STATE_LIAM_MAX)
+      .map(([jid, list]) => [jid, list.slice(-LAST_LIAM_MAX)])),
+    recentIds: [...recentMessageIds].slice(-500),
+    outbound: outboundLog.slice(-OUTBOUND_MAX),
   };
 }
 
 function applyBridgeState(state) {
   if (!state || typeof state !== "object") return;
+  // A state file is a full snapshot, not a delta. Applying twice must not
+  // duplicate held replies or resurrect approvals that were already deleted.
+  for (const key of Object.keys(TEMP)) delete TEMP[key];
+  pendingPerms.clear();
+  pendingTools.clear();
+  heldReplies.length = 0;
+
   if (state.temp && typeof state.temp === "object") {
     for (const [jid, map] of Object.entries(state.temp)) {
       if (map && typeof map === "object") TEMP[jid] = { ...map };
@@ -600,11 +720,56 @@ function applyBridgeState(state) {
   for (const t of Array.isArray(state.tools) ? state.tools : []) {
     if (t && t.id && t.payload && typeof t.action === "string") pendingTools.set(t.id, t);
   }
+  if (typeof state.dmOpen === "boolean") {
+    dmOpen = state.dmOpen;
+    saveDmOpen();
+  }
+  const known = Array.isArray(state.known) ? state.known : [];
+  knownMembers.clear();
+  for (const value of known.slice(0, KNOWN_MEMBERS_MAX)) {
+    const p = bareId(value);
+    if (/^\d{6,20}$/.test(p)) knownMembers.add(p);
+  }
+  trimKnownMembers();
+  if (state.lids && typeof state.lids === "object") {
+    const loadMap = (value, target) => {
+      if (!value || typeof value !== "object") return;
+      for (const [k, v] of Object.entries(value).slice(0, STATE_MAP_MAX)) {
+        target.set(bareId(k), v);
+      }
+    };
+    lidCache.clear();
+    lidContacts.clear();
+    lidSources.clear();
+    loadMap(state.lids.cache, lidCache);
+    loadMap(state.lids.contacts, lidContacts);
+    loadMap(state.lids.sources, lidSources);
+    saveLidMap();
+  }
+  for (const key of Object.keys(lastLiam)) delete lastLiam[key];
+  if (state.lastLiam && typeof state.lastLiam === "object") {
+    for (const [jid, list] of Object.entries(state.lastLiam).slice(0, STATE_LIAM_MAX)) {
+      if (Array.isArray(list)) lastLiam[jid] = list.slice(-LAST_LIAM_MAX);
+    }
+  }
+  recentMessageIds.clear();
+  for (const id of (Array.isArray(state.recentIds) ? state.recentIds : []).slice(-500)) {
+    if (id) recentMessageIds.add(String(id));
+  }
+  if (Array.isArray(state.outbound)) {
+    outboundLog.length = 0;
+    for (const at of state.outbound.slice(-OUTBOUND_MAX)) {
+      if (Number.isFinite(Number(at))) outboundLog.push(Number(at));
+    }
+  }
   const now = Date.now();
   for (const h of Array.isArray(state.held) ? state.held : []) {
     if (!h || !h.target || typeof h.text !== "string") continue;
     if (now - Number(h.at || 0) > HELD_REPLY_TTL_MS) continue;
-    heldReplies.push({ target: h.target, text: h.text, options: undefined, at: Number(h.at) || now });
+    heldReplies.push({
+      target: h.target, text: h.text, options: undefined, at: Number(h.at) || now,
+      sentChunks: Math.max(0, Number.parseInt(h.sentChunks, 10) || 0),
+    });
   }
   while (heldReplies.length > HELD_REPLY_MAX) heldReplies.shift();
   trimPending(pendingPerms);
@@ -619,10 +784,13 @@ function saveBridgeStateLocal() {
 // Debounced so a burst of changes (an approval that also flushes replies) makes
 // one local write and one Supabase upload, not several.
 function scheduleBridgeStateSave() {
+  // The local copy is cheap and must exist immediately. A crash or redeploy
+  // inside the debounce window would otherwise lose the change from both disk
+  // and the cloud. Only the remote upload waits.
+  saveBridgeStateLocal();
   if (bridgeStateSaveTimer) return;
   bridgeStateSaveTimer = setTimeout(() => {
     bridgeStateSaveTimer = null;
-    saveBridgeStateLocal();
     try {
       if (sync.uploadState) {
         sync.uploadState(DATA_DIR, BRIDGE_STATE_OBJECT, bridgeStateSnapshot())
@@ -720,17 +888,63 @@ async function withTimeout(promise, ms, message) {
   }
 }
 
-function pythonBin() {
+let pythonBinCache = null;
+let pythonBinResolved = false;
+function pythonBinCandidates() {
   const candidates = [];
   if (process.env.LIAM_PYTHON) candidates.push(process.env.LIAM_PYTHON);
   candidates.push("python3", "python");
-  for (const bin of candidates) {
-    try {
-      const r = spawnSync(bin, ["-c", "import sys;print(sys.executable)"], { encoding: "utf8", timeout: 8000 });
-      if (r.status === 0 && String(r.stdout || "").trim()) return bin;
-    } catch (e) {}
-  }
-  return process.platform === "win32" ? "python" : "python3";
+  return candidates;
+}
+function pythonBin() {
+  // Synchronous callers (the agent spawner and probes) must never block the
+  // event loop on a child process. Boot starts the async probe; until it finishes
+  // this returns a safe platform default.
+  if (!pythonBinCache) pythonBinCache = process.platform === "win32" ? "python" : "python3";
+  return pythonBinCache;
+}
+function resolvePythonBinAsync() {
+  if (pythonBinResolved) return Promise.resolve(pythonBinCache || pythonBin());
+  const candidates = pythonBinCandidates();
+  let index = 0;
+  return new Promise((resolve) => {
+    const tryNext = () => {
+      if (index >= candidates.length) {
+        pythonBinResolved = true;
+        pythonBinCache = pythonBin();
+        return resolve(pythonBinCache);
+      }
+      const bin = candidates[index++];
+      let proc;
+      try {
+        proc = spawn(bin, ["-c", "import sys;print(sys.executable)"], {
+          stdio: ["ignore", "pipe", "ignore"],
+        });
+      } catch (e) { return tryNext(); }
+      let done = false;
+      let out = "";
+      const finish = (found) => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        if (found) {
+          pythonBinResolved = true;
+          pythonBinCache = bin;
+          return resolve(bin);
+        }
+        tryNext();
+      };
+      const timer = setTimeout(() => {
+        try { proc.kill(); } catch (e) {}
+        finish(false);
+      }, 8000);
+      if (typeof timer.unref === "function") timer.unref();
+      proc.stdout.on("data", (d) => { out += String(d); });
+      proc.on("error", () => finish(false));
+      proc.on("close", (code) => finish(code === 0 && !!out.trim()));
+    };
+    tryNext();
+  });
 }
 
 // Run debug_probe.py and parse its JSON. Used by /diag?probe=brains so we can
@@ -788,6 +1002,7 @@ function startAgent() {
       PYTHONIOENCODING: "utf-8",
       PYTHONUNBUFFERED: "1",
       LIAM_DATA_DIR: DATA_DIR,
+      LIAM_OWNER_TOKEN: OWNER_TOKEN,
     },
     stdio: ["pipe", "pipe", "pipe"]
     });
@@ -824,6 +1039,10 @@ function startAgent() {
         continue;
       }
       if (Object.prototype.hasOwnProperty.call(msg, "progress")) {
+        // Ignore a progress frame that belongs to an older turn. An id is only
+        // present on agents that support request gating; an id-less frame is
+        // accepted for backward compatibility.
+        if (msg.id != null && (!agentPending || String(msg.id) !== String(agentPending.id))) continue;
         // An interim update from the agent. Post it to the chat where the task
         // was given so the person hears progress without re-triggering Liam.
         deliverProgress(msg.progress, agentPending && agentPending.progress)
@@ -838,6 +1057,7 @@ function startAgent() {
         const p = agentPending; agentPending = null;
         try { clearTimeout(p.timeout); } catch (e) {}
         lastAgentReplyAt = Date.now();
+        lastAgentError = "";
         if (msg.trace && typeof msg.trace === "object") lastAgentTrace = msg.trace;
         p.resolve(msg.reply == null ? "" : String(msg.reply));
       }
@@ -854,13 +1074,30 @@ function startAgent() {
   proc.on("exit", (code, signal) => {
     if (agentProc === proc) agentProc = null;
     failPending(new Error(`agent exited (${code ?? signal ?? "unknown"})`));
+    if (!proc.__liamStopping) scheduleAgentRestart();
   });
   proc.on("error", (e) => {
     if (agentProc === proc) agentProc = null;
     console.log("\n💀 AGENT SPAWN ERROR:", String(e));
     failPending(e);
+    if (!proc.__liamStopping) scheduleAgentRestart();
   });
   return proc;
+}
+
+let agentRestartTimer = null;
+function scheduleAgentRestart() {
+  // A crash must not make /ready fail just because the child died. WhatsApp is
+  // still healthy here, so bring the assistant back without recycling the whole
+  // container (which would drop the socket and held state).
+  if (agentRestartTimer || shuttingDown || waState !== "ready") return;
+  agentRestartTimer = setTimeout(() => {
+    agentRestartTimer = null;
+    if (shuttingDown || waState !== "ready" || agentProc) return;
+    console.log("warn: restarting the agent process after an unexpected exit");
+    startAgent();
+  }, 1000);
+  if (typeof agentRestartTimer.unref === "function") agentRestartTimer.unref();
 }
 
 function stopAgent() {
@@ -868,6 +1105,8 @@ function stopAgent() {
   agentProc = null;
   if (agentPending) { const p = agentPending; agentPending = null; try { clearTimeout(p.timeout); } catch (e) {} p.reject(new Error("agent stopped")); }
   if (!proc) return;
+  proc.__liamStopping = true;
+  if (agentRestartTimer) { try { clearTimeout(agentRestartTimer); } catch (e) {} agentRestartTimer = null; }
   try { proc.stdin.end(); } catch (e) {}
   if (process.platform === "win32" && proc.pid) {
     try { spawnSync("taskkill", ["/pid", String(proc.pid), "/t", "/f"], { stdio: "ignore" }); return; } catch (e) {}
@@ -878,12 +1117,15 @@ function stopAgent() {
 const LID_MAP_FILE = path.join(DATA_DIR, "lid_map.json");
 let lidCache = new Map();
 try { const raw = JSON.parse(fs.readFileSync(LID_MAP_FILE, "utf8")); for (const [k,v] of Object.entries(raw)) lidCache.set(k,v); } catch (e) {}
-function saveLidMap() { try { fs.writeFileSync(LID_MAP_FILE, JSON.stringify(Object.fromEntries(lidCache)), { mode: 0o600 }); } catch (e) {} }
+function saveLidMap() {
+  try { writeFileAtomic(LID_MAP_FILE, JSON.stringify(Object.fromEntries(lidCache))); } catch (e) {}
+}
 
 // WhatsApp now hides phone numbers behind LIDs in many chats. Permissions are
 // keyed by phone number, so keep the LID -> phone mapping learned from contact
 // updates and group metadata.
 const lidContacts = new Map();
+const lidSources = new Map();
 
 function isLidJid(value) { return String(value || "").includes("@lid"); }
 function barePhone(value) {
@@ -905,13 +1147,29 @@ function rememberLidContacts(contacts) {
       || barePhone(contact.id);
     const lid = String(contact.lid || (isLidJid(contact.id) ? contact.id : ""));
     if (!isLidJid(lid) || !phone) continue;
-    const lidBare = bareId(lid);
-    if (!lidBare || lidContacts.has(lidBare)) continue;
-    lidContacts.set(lidBare, phone);
-    lidCache.set(lidBare, phone);
-    changed = true;
+    if (rememberLidMapping(lid, phone, "contact")) changed = true;
   }
   if (changed) saveLidMap();
+}
+
+// A mapping learned from a weaker source must be allowed to change when a
+// stronger one (a message key or a contact update) says otherwise. Without a
+// rank, one stale lookup pinned that person to the wrong identity forever.
+const LID_SOURCE_RANK = { state: -1, lookup: 0, signal: 1, group: 2, contact: 3, key: 4 };
+function rememberLidMapping(lid, phone, source) {
+  const base = bareId(lid);
+  const p = barePhone(phone);
+  if (!base || !p) return false;
+  const prior = lidSources.get(base);
+  const rank = LID_SOURCE_RANK[source] === undefined ? 0 : LID_SOURCE_RANK[source];
+  const priorRank = prior && LID_SOURCE_RANK[prior] !== undefined ? LID_SOURCE_RANK[prior] : -1;
+  if (prior && priorRank > rank) return false;
+  if (lidCache.get(base) === p && lidContacts.get(base) === p && prior === source) return false;
+  lidContacts.set(base, p);
+  lidCache.set(base, p);
+  lidSources.set(base, source);
+  saveLidMap();
+  return true;
 }
 
 // Group participants carry both identities. Prefer the phone-number one. In
@@ -947,6 +1205,11 @@ function socketUserId() {
   try { return sock && sock.user ? String(sock.user.id || sock.user.jid || "") : ""; } catch (e) { return ""; }
 }
 
+// A burst of messages from one new LID must not start several independent
+// network lookups. Coalesce them onto one promise, keyed by the bare LID, and
+// drop it once it settles so a later (possibly successful) retry can happen.
+const lidResolutions = new Map();
+
 async function resolvePhone(id, message) {
   const raw = String(id || "");
   if (!raw) return null;
@@ -954,10 +1217,14 @@ async function resolvePhone(id, message) {
   const base = bareId(raw);
   const key = message && message.key ? message.key : {};
 
-  // The message key usually carries the phone-number alias.
+  // The key alias is the strongest evidence. It can override a stale mapping
+  // learned from a weaker source (group, signal, lookup or directory).
   for (const candidate of [key.participantAlt, key.participantPn, key.senderPn, key.remoteJidAlt]) {
     const phone = barePhone(candidate);
-    if (phone) return phone;
+    if (phone) {
+      rememberLidMapping(base, phone, "key");
+      return phone;
+    }
   }
   if (lidCache.has(base)) return lidCache.get(base);
   if (lidContacts.has(base)) {
@@ -967,6 +1234,17 @@ async function resolvePhone(id, message) {
     return phone;
   }
 
+  // Only the slow, network-backed path is deduplicated above. Every caller that
+  // arrives while it is in flight shares the single result.
+  if (lidResolutions.has(base)) return lidResolutions.get(base);
+  const pending = resolvePhoneRemote(base, raw, key).finally(() => {
+    lidResolutions.delete(base);
+  });
+  lidResolutions.set(base, pending);
+  return pending;
+}
+
+async function resolvePhoneRemote(base, raw, key) {
   // Group metadata pairs each LID with its phone-number JID.
   const chatJid = key.remoteJid || "";
   if (chatJid && isJidGroup(chatJid) && sock) {
@@ -978,9 +1256,8 @@ async function resolvePhone(id, message) {
         if (!phone) continue;
         if (lid === base || bareId(participant.id) === base
             || bareId(participant.jid) === base || phone === base) {
-          lidCache.set(base, phone);
-          saveLidMap();
-          return phone;
+          if (rememberLidMapping(base, phone, "group")) return phone;
+          return lidCache.get(base) || phone;
         }
       }
     } catch (e) {}
@@ -992,17 +1269,23 @@ async function resolvePhone(id, message) {
     if (mapping && typeof mapping.getPNForLID === "function") {
       const result = await mapping.getPNForLID(raw);
       const phone = barePhone(result && (result.id || result.phoneNumber || result));
-      if (phone) { lidCache.set(base, phone); saveLidMap(); return phone; }
+      if (phone) {
+        if (rememberLidMapping(base, phone, "signal")) return phone;
+        return lidCache.get(base) || phone;
+      }
     }
   } catch (e) {}
 
   // Last resort: ask WhatsApp about this identity.
   try {
-    const list = await sock.onWhatsApp(raw);
+    const list = sock && await sock.onWhatsApp(raw);
     if (Array.isArray(list)) {
       for (const hit of list) {
         const phone = barePhone(hit && (hit.jid || hit.pn || hit.phoneNumber));
-        if (phone) { lidCache.set(base, phone); saveLidMap(); return phone; }
+        if (phone) {
+          if (rememberLidMapping(base, phone, "lookup")) return phone;
+          return lidCache.get(base) || phone;
+        }
       }
     }
   } catch (e) { console.log("🔍 LID lookup failed:", String(e && e.message ? e.message : e)); }
@@ -1012,12 +1295,16 @@ async function resolvePhone(id, message) {
 
 // ---------------------------------------------------------------------------
 // Thin adapter so the rest of the bridge does not care that Baileys replaced
-// whatsapp-web.js. Targets are phone-number JIDs; groups and LIDs pass through.
+// whatsapp-web.js. Targets are phone-number JIDs; group, LID, broadcast and
+// newsletter JIDs are already complete addresses and pass through unchanged.
 // ---------------------------------------------------------------------------
+function isNewsletterJid(value) {
+  return /@newsletter(?::|$)/i.test(String(value || ""));
+}
 function jidForSend(value) {
   const raw = String(value || "").trim();
   if (!raw) throw new Error("missing recipient");
-  if (/@(?:g\.us|lid|broadcast|newsletter|s\.whatsapp\.net)$/i.test(raw)) return raw;
+  if (/@(?:g\.us|lid|broadcast|s\.whatsapp\.net)$/i.test(raw) || isNewsletterJid(raw)) return raw;
   if (/@c\.us$/i.test(raw)) return raw.replace(/@c\.us$/i, "@s.whatsapp.net");
   if (/^\d{6,20}(?::\d+)?$/.test(raw)) return raw.split(":")[0] + "@s.whatsapp.net";
   return raw;
@@ -1032,7 +1319,7 @@ function jidType(value) {
   if (raw.endsWith("@lid")) return "lid";
   if (raw.endsWith("@s.whatsapp.net")) return "pn";
   if (raw.endsWith("@broadcast")) return "broadcast";
-  if (raw.endsWith("@newsletter")) return "newsletter";
+  if (isNewsletterJid(raw)) return "newsletter";
   return raw ? "other" : "";
 }
 
@@ -1089,7 +1376,8 @@ const wa = {
     // "Cannot use 'in' operator to search for 'text'" when given a plain string.
     const payload = typeof content === "string" ? { text: content } : content;
     const target = jidForSend(jid);
-    lastSendTargetType = jidType(target);
+    const targetType = jidType(target);
+    lastSendTargetType = targetType;
     // While WhatsApp is time-locking the number, every send is refused with 463.
     // Do not spend the reach-out budget on messages that cannot arrive; hold the
     // reply until the lock lifts (re-checked in the background).
@@ -1111,13 +1399,13 @@ const wa = {
         const sent = await sock.sendMessage(target, payload, options);
         lastOutboundAt = Date.now();
         lastSendError = "";
-        recordSend(messageId(sent), lastSendTargetType);
+        recordSend(messageId(sent), targetType);
         return sent;
       } catch (e) {
         lastErr = e;
         const msg = String(e && e.message ? e.message : e);
         if (attempt < 2 && isConnectionGoneError(msg)) {
-          console.log(`warn: send to ${lastSendTargetType} failed (${msg.slice(0, 80)}); waiting for reconnect and retrying`);
+          console.log(`warn: send to ${targetType} failed (${msg.slice(0, 80)}); waiting for reconnect and retrying`);
           continue;
         }
         break;
@@ -1155,19 +1443,30 @@ function markReadAndTyping(jid, msg) {
     } catch (e) {}
   };
   ping();
-  if (!typingTimers.has(target)) {
+  // Refcount so an interleaved turn (or a progress update) cannot stop the
+  // "composing" indicator while another caller still needs it.
+  const entry = typingTimers.get(target);
+  if (entry) {
+    entry.refs += 1;
+  } else {
     const timer = setInterval(ping, 10000);
     if (typeof timer.unref === "function") timer.unref();
-    typingTimers.set(target, timer);
+    typingTimers.set(target, { timer, refs: 1 });
   }
 }
 function stopTyping(jid) {
   const target = jidForSend(jid);
-  const timer = typingTimers.get(target);
-  if (timer) {
-    try { clearInterval(timer); } catch (e) {}
-    typingTimers.delete(target);
+  const entry = typingTimers.get(target);
+  let lastRef = false;
+  if (entry) {
+    entry.refs -= 1;
+    if (entry.refs <= 0) {
+      try { clearInterval(entry.timer); } catch (e) {}
+      typingTimers.delete(target);
+      lastRef = true;
+    }
   }
+  if (!lastRef) return;
   try {
     if (sock && sock.sendPresenceUpdate) {
       Promise.resolve(sock.sendPresenceUpdate("paused", target)).catch(() => {});
@@ -1178,7 +1477,17 @@ function stopTyping(jid) {
 // showing it while presence updates arrive, so a forgotten timer looks like an
 // agent that is stuck. Called from every failure path.
 function stopAllTyping() {
-  for (const target of Array.from(typingTimers.keys())) stopTyping(target);
+  // Unlike stopTyping() this ignores the refcount: on a failure or close path
+  // every indicator must be cleared regardless of how many callers incremented.
+  for (const entry of typingTimers.values()) {
+    try { clearInterval(entry.timer); } catch (e) {}
+  }
+  typingTimers.clear();
+  try {
+    if (sock && sock.sendPresenceUpdate) {
+      Promise.resolve(sock.sendPresenceUpdate("paused")).catch(() => {});
+    }
+  } catch (e) {}
 }
 
 function askLiam(user, phone, isGroup, groupJid, mentioned, replyTo, opts = {}) {
@@ -1206,6 +1515,9 @@ function askLiam(user, phone, isGroup, groupJid, mentioned, replyTo, opts = {}) 
       j: groupJid || "",
       m: !!mentioned,
       r: !!replyTo,
+      // Echoed on progress frames so a late update from a timed-out turn cannot
+      // be delivered under a newer request.
+      i: id,
       // A diagnostic probe must not be remembered as a real conversation turn.
       n: !!opts.noHistory
     });
@@ -1244,6 +1556,17 @@ function tempDecision(jid, phone) {
   return entry > 0 ? "allow" : "deny";
 }
 
+// One place for every group-permission mutation, so a grant made through the
+// agent tool is persisted just like one made through an approval prompt.
+function setGroupPermission(jid, phone, allow, persist = true) {
+  const p = bareId(phone);
+  if (!jid || !/^\d{6,20}$/.test(p)) return false;
+  TEMP[jid] = TEMP[jid] || {};
+  TEMP[jid][p] = allow ? Date.now() : -Date.now();
+  if (persist) scheduleBridgeStateSave();
+  return true;
+}
+
 function makeId(prefix) {
   for (let i = 0; i < 20; i += 1) {
     const id = prefix + crypto.randomBytes(3).toString("hex");
@@ -1278,22 +1601,34 @@ async function ownerIdsInGroup(jid) {
 }
 
 async function sendApprovalPrompt(text, groupJid) {
-  // Group asks stay in the group. Never DM the owners for something that
-  // happened in a group: the owner replies in the group and everyone there can
-  // see that Liam is waiting for a yes/no.
+  // Group asks normally stay in the group: the owner replies there and everyone
+  // can see that Liam is waiting for a yes/no. But when no owner is in the
+  // group, a group-only prompt is never seen, so fall back to DMing the owners.
   if (groupJid) {
     const owners = await ownerIdsInGroup(groupJid);
-    const tags = owners.map((o) => "@" + o).join(" ");
-    const body = tags ? `${tags} ${text}`.trim() : text;
-    try {
-      await wa.sendMessage(groupJid, body, owners.length
-        ? { mentions: owners.map((o) => o + "@s.whatsapp.net") }
-        : undefined);
-      return true;
-    } catch (e) {
-      console.log("warn: group approval prompt failed:", String(e));
-      return false;
+    if (owners.length) {
+      const tags = owners.map((o) => "@" + o).join(" ");
+      const body = `${tags} ${text}`.trim();
+      try {
+        await wa.sendMessage(groupJid, body, {
+          mentions: owners.map((o) => o + "@s.whatsapp.net"),
+        });
+        return true;
+      } catch (e) {
+        console.log("warn: group approval prompt failed:", String(e));
+        return false;
+      }
     }
+    // No owner present in this group. DM them with enough context to act.
+    const dmText = `Group approval needed (${groupJid}):\n${text}`;
+    let sent = 0;
+    for (const owner of OWNERS) {
+      try {
+        await wa.sendMessage(owner + "@s.whatsapp.net", dmText);
+        sent += 1;
+      } catch (e) { console.log("warn: owner approval DM failed:", String(e)); }
+    }
+    return sent > 0;
   }
   let sent = 0;
   for (const owner of OWNERS) {
@@ -1310,7 +1645,7 @@ function toolApprovalText(p) {
   try { args = JSON.stringify(p.payload, Object.keys(p.payload || {}).sort()); } catch (e) { args = "{}"; }
   if (args.length > 900) args = args.slice(0, 900) + "…";
   return [
-    "Owner approval needed (one-time, valid 10 minutes).",
+    `Owner approval needed (one-time, valid ${humanWindow(TOOL_APPROVAL_TTL_MS)}).`,
     `From: ${p.actor || "unknown"}`,
     `Tool: ${p.action}`,
     `Args: ${args}`,
@@ -1349,12 +1684,16 @@ function humanWindow(ms) {
 }
 
 function permissionPromptText(p) {
+  // Show a short excerpt of what was asked, so the owner approves the same
+  // request that was re-prompted instead of an opaque id.
+  const excerpt = String(p.text || "").replace(/\s+/g, " ").trim().slice(0, 300);
   return [
     `Group permission needed (${humanWindow(PERMISSION_TTL_MS)}).`,
     `${p.phone} wants Liam to reply in this group.`,
+    excerpt ? `They asked: ${excerpt}${String(p.text || "").length > 300 ? "…" : ""}` : "",
     `Request ${p.id}.`,
     `Reply: yes ${p.id} / no ${p.id}`,
-  ].join("\n");
+  ].filter(Boolean).join("\n");
 }
 
 async function createPermissionRequest(jid, phone, text, quoted) {
@@ -1364,17 +1703,40 @@ async function createPermissionRequest(jid, phone, text, quoted) {
   for (const p of pendingPerms.values()) {
     if (p.jid === jid && p.phone === bare) {
       const changed = next.trim() !== String(p.promptedText || "").trim();
-      p.text = next;
-      p.quoted = quoted || p.quoted;
-      p.ts = Date.now();
       // The owner must approve exactly what they can see. If the member's
       // request changed after the prompt went out, re-send it (capped so a
-      // chatty member cannot spam the group with prompts).
-      if (changed && (p.promptCount || 1) < 3) {
-        p.promptedText = next;
-        p.promptCount = (p.promptCount || 1) + 1;
-        await sendApprovalPrompt(permissionPromptText(p), jid);
+      // chatty member cannot spam the group with prompts). Once the cap is
+      // reached, reject the new text and keep the version that was prompted,
+      // otherwise the owner would approve one question while Liam answers a
+      // different one they never saw.
+      if (changed) {
+        if ((p.promptCount || 1) < 3) {
+          // Build the prompt from a candidate so a failed send cannot make the
+          // owner approve text that was silently substituted afterwards.
+          const candidate = {
+            ...p,
+            text: next,
+            promptedText: next,
+            promptCount: (p.promptCount || 1) + 1,
+          };
+          const sent = await sendApprovalPrompt(permissionPromptText(candidate), jid);
+          if (!sent) throw new BadRequest("I couldn't reach an owner with the changed request, so nothing was approved");
+          p.text = next;
+          p.promptedText = next;
+          p.promptCount = candidate.promptCount;
+          p.quoted = quoted || p.quoted;
+        } else {
+          // The cap is intentional, but silently approving later edits would let
+          // a member swap the question after the owner last saw it. Drop this
+          // request and make them start a fresh one.
+          pendingPerms.delete(p.id);
+          scheduleBridgeStateSave();
+          const err = new BadRequest("that request was changed too many times; send a fresh request before I can answer");
+          err.code = "permission_reprompt_limit";
+          throw err;
+        }
       }
+      p.ts = Date.now();
       scheduleBridgeStateSave();
       return p;
     }
@@ -1474,16 +1836,12 @@ async function handleApprovalCommand(text, phone, chat, isGroup) {
     const p = pendingPerms.get(permId);
     pendingPerms.delete(permId);
     if (!allow) {
-      TEMP[p.jid] = TEMP[p.jid] || {};
-      TEMP[p.jid][p.phone] = -Date.now();
-      scheduleBridgeStateSave();
+      setGroupPermission(p.jid, p.phone, false);
       try { await wa.sendMessage(p.jid, `okay, I won't reply to ${p.phone} in this group.`); } catch (e) {}
       if (chat !== p.jid) { try { await wa.sendMessage(chat, `okay — denied ${p.id}.`); } catch (e) {} }
       return true;
     }
-    TEMP[p.jid] = TEMP[p.jid] || {};
-    TEMP[p.jid][p.phone] = Date.now();
-    scheduleBridgeStateSave();
+    setGroupPermission(p.jid, p.phone, true);
     try { await wa.sendMessage(p.jid, `okay, I'll reply to ${p.phone} for the next ${humanWindow(PERMISSION_TTL_MS)}.`); } catch (e) {}
     markReadAndTyping(p.jid, p.quoted);
     try {
@@ -1521,7 +1879,9 @@ async function handleApprovalCommand(text, phone, chat, isGroup) {
 // cares about. LIAM_WA_LOG (or /diag&walog=) can raise it temporarily when a
 // protocol-level bug has to be seen.
 const WA_LOG_ORDER = ["trace", "debug", "info", "warn", "error", "fatal"];
+const WA_LOG_ONCE_MS = 5 * 60 * 1000;
 let waLogLevel = String(process.env.LIAM_WA_LOG || "silent").toLowerCase();
+let waLogResetTimer = null;
 function waLogEnabled(name) {
   const idx = WA_LOG_ORDER.indexOf(waLogLevel);
   return idx >= 0 && WA_LOG_ORDER.indexOf(name) >= idx;
@@ -1559,6 +1919,7 @@ function handleReady() {
   readyHandled = true;
   registered = true;
   sockReadyForPairing = false;
+  waLastQrAt = 0;
   reconnectDelayMs = 3000;
   closeCount = 0;
   closeWindowStart = 0;
@@ -1572,6 +1933,9 @@ function handleReady() {
   // attempt.
   markLinked({ wid: socketUserId() || "linked" });
   startAgent();
+  // A reconnect can be the first moment the block has lifted. Do not make a
+  // held answer wait for the next 5-minute timer or probe.
+  void flushHeldReplies();
   // Start backups only after WhatsApp is actually linked. Before this point
   // the profile is disposable and must never replace a good cloud copy.
   sync.startPeriodicBackup(DATA_DIR, SESSION_DIR, DATA_DIR);
@@ -1580,13 +1944,14 @@ function handleReady() {
   // process: reconnects re-enter this function and must not re-archive.
   if (!immediateBackupScheduled) {
     immediateBackupScheduled = true;
-    setTimeout(() => {
+    const backupTimer = setTimeout(() => {
       try {
         Promise.resolve(sync.backupNow(DATA_DIR, SESSION_DIR, DATA_DIR))
           .then((r) => { if (!r || !r.ok) console.log("warn: immediate backup did not complete"); })
           .catch((e) => console.log("warn: immediate backup failed:", String(e)));
       } catch (e) {}
     }, 3000);
+    if (typeof backupTimer.unref === "function") backupTimer.unref();
   }
 }
 
@@ -1610,6 +1975,7 @@ function scheduleReconnect(reason, delay) {
 
 function handleConnectionClose(socket, status, detail) {
   if (socket !== sock) return;
+  stopAllTyping();
   sockReadyForPairing = false;
   registered = false;
   readyHandled = false;
@@ -1641,9 +2007,9 @@ function handleConnectionClose(socket, status, detail) {
 
   const rateLimited = status === 429 || /rate[- ]?overlimit|too many|429/i.test(reason);
   if (rateLimited) {
-    setWaState("disconnected", "WhatsApp is limiting this number; waiting 5 minutes");
+    setWaState("disconnected", `WhatsApp is limiting this number; waiting ${humanWindow(RATE_LIMIT_COOLDOWN_MS)}`);
     noteWaEvent("rate_limited", reason);
-    scheduleReconnect("rate limited", 5 * 60 * 1000);
+    scheduleReconnect("rate limited", RATE_LIMIT_COOLDOWN_MS);
     return;
   }
 
@@ -1716,17 +2082,20 @@ async function closeSocket(reason) {
     reconnectTimer = null;
   }
   const current = sock;
-  sock = null;
-  connecting = false;
-  sockReadyForPairing = false;
-  registered = false;
   if (!current) return;
+  stopAllTyping();
   try { current.ev.removeAllListeners("connection.update"); } catch (e) {}
   try { current.ev.removeAllListeners("creds.update"); } catch (e) {}
   try { current.end(new Error(reason || "closing")); } catch (e) {}
   // Give the websocket a moment to send the close frame; it is not required for
   // correctness, but avoids reconnecting while the old socket is still open.
   await sleep(150);
+  // Clear the global last, so teardown events cannot fire handlers that read a
+  // null socket while closing the previous one.
+  if (sock === current) sock = null;
+  connecting = false;
+  sockReadyForPairing = false;
+  registered = false;
 }
 
 async function connectSocket(reason) {
@@ -1772,7 +2141,13 @@ async function connectSocket(reason) {
     registered = false;
     sockReadyForPairing = false;
     watchSocketWire(socket);
-    socket.ev.on("creds.update", saveCreds);
+    socket.ev.on("creds.update", () => {
+      // Baileys emits this without awaiting. A failed write must not become an
+      // unhandled rejection that takes the whole bridge down.
+      Promise.resolve(saveCreds()).catch((e) => {
+        console.log("warn: could not save WhatsApp credentials:", String(e && e.message ? e.message : e).slice(0, 200));
+      });
+    });
     socket.ev.on("connection.update", (update) => onConnectionUpdate(socket, update));
     socket.ev.on("messages.upsert", (event) => {
       if (!event || event.type !== "notify" || !Array.isArray(event.messages)) return;
@@ -1842,13 +2217,16 @@ function splitMessage(text, limit = 4000) {
   return chunks;
 }
 
-async function sendLong(to, text, options) {
+async function sendLong(to, text, options, onChunk, resumeFromChunks = 0) {
   let last = null;
-  let first = true;
-  for (const chunk of splitMessage(text)) {
+  const chunks = splitMessage(text);
+  const start = Math.max(0, Math.min(chunks.length, Number(resumeFromChunks) || 0));
+  for (let i = start; i < chunks.length; i += 1) {
+    const chunk = chunks[i];
     if (!chunk.trim()) continue;
-    last = await wa.sendMessage(to, chunk, first ? options : undefined);
-    first = false;
+    const sendOptions = start === 0 && i === 0 ? options : undefined;
+    last = await wa.sendMessage(to, chunk, sendOptions);
+    if (typeof onChunk === "function") onChunk(i + 1);
   }
   return last;
 }
@@ -1867,10 +2245,6 @@ function deliverProgress(text, where) {
   });
 }
 
-async function ownerPresentInGroup(jid) {
-  return (await ownerIdsInGroup(jid)).length > 0;
-}
-
 const recentMessageIds = new Set();
 function seenMessage(id) {
   if (!id) return false;
@@ -1883,18 +2257,32 @@ function seenMessage(id) {
   return false;
 }
 
+const TEXT_MESSAGE_TYPES = new Set([
+  "conversation", "extendedTextMessage", "buttonsResponseMessage",
+  "listResponseMessage", "templateButtonReplyMessage", "buttonsMessage",
+  "listMessage", "contactMessage", "contactsArrayMessage",
+  "pollCreationMessage", "pollResponseMessage",
+]);
 function messageText(content, type) {
   const part = content && content[type];
   if (!part) return "";
   switch (type) {
     case "conversation": return String(content.conversation || "");
-    case "extendedTextMessage": return String(part.text || "");
+    case "extendedTextMessage":
+    case "buttonsMessage": return String(part.text || "");
     case "imageMessage":
     case "videoMessage":
     case "documentMessage": return String(part.caption || "");
     case "buttonsResponseMessage": return String(part.selectedButtonId || part.selectedDisplayText || "");
     case "listResponseMessage": return String(part.title || (part.singleSelectReply && part.singleSelectReply.selectedRowId) || "");
     case "templateButtonReplyMessage": return String(part.selectedDisplayText || part.selectedId || "");
+    case "listMessage": return String(part.description || part.title || "");
+    case "contactMessage": return String(part.displayName || part.name || "");
+    case "contactsArrayMessage": return String((Array.isArray(part.contacts) ? part.contacts : [])
+      .map((c) => c && (c.displayName || c.name)).filter(Boolean).join(", "));
+    case "pollCreationMessage": return String(part.name || part.question || "");
+    case "pollResponseMessage": return String((Array.isArray(part.selectedOptions) ? part.selectedOptions : [])
+      .map((o) => o && (o.optionName || o.name)).filter(Boolean).join(", "));
     default: return "";
   }
 }
@@ -1904,15 +2292,32 @@ function messageText(content, type) {
 // and permission flow and lets her answer honestly (see the system prompt).
 function mediaPlaceholder(content, type) {
   const part = content && content[type];
-  if (!part) return "";
+  if (!part || TEXT_MESSAGE_TYPES.has(type)) return "";
   switch (type) {
     case "audioMessage": return "[sent a voice note]";
     case "imageMessage": return "[sent an image]";
     case "videoMessage": return "[sent a video]";
     case "documentMessage": return "[sent a document]";
     case "stickerMessage": return "[sent a sticker]";
-    default: return "";
+    default: {
+      const label = String(type || "message")
+        .replace(/Message$/i, "")
+        .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+        .replace(/[_-]+/g, " ")
+        .trim()
+        .toLowerCase() || "message";
+      return `[sent a ${label}]`;
+    }
   }
+}
+
+// Captioned media must not lose the fact that something was attached, and a
+// message type with no readable text still needs a clear placeholder.
+function displayText(content, type) {
+  const text = messageText(content, type);
+  const placeholder = mediaPlaceholder(content, type);
+  if (text && placeholder) return `${placeholder}: ${text}`;
+  return text || placeholder;
 }
 
 function contentContext(content, type) {
@@ -1941,8 +2346,7 @@ async function handleIncomingMessage(msg) {
     const type = getContentType(content);
     if (!type || type === "protocolMessage" || type === "reactionMessage" ||
         type === "senderKeyDistributionMessage" || type === "messageContextInfo") return;
-    let text = messageText(content, type);
-    if (!text) text = mediaPlaceholder(content, type);
+    const text = displayText(content, type);
     if (!text) return;
 
     const isGroup = isJidGroup(from) || from.endsWith("@g.us");
@@ -1956,6 +2360,11 @@ async function handleIncomingMessage(msg) {
       // them makes Liam look dead, so fall back to the LID as their identity:
       // a group request can still be approved, and a DM is answered at the LID.
       const fallback = bareId(senderId);
+      if (isJidGroup(senderId) || isJidGroup(from) || /@g\.us/i.test(String(senderId))) {
+        lastInboundError = "group sender has no phone identity";
+        console.log("warn: ignoring group JID used as a member sender", senderId);
+        return;
+      }
       if (!/^\d{6,20}$/.test(fallback)) {
         lastInboundError = "could not resolve sender to a phone number";
         console.log("warn: could not resolve sender", senderId);
@@ -1979,14 +2388,19 @@ async function handleIncomingMessage(msg) {
       // being delivered; the phone-number JID always delivers, and the number is
       // already resolved for this sender. When only a LID identity is known,
       // reply to the LID itself (a made-up phone JID would not deliver).
-      const dmTarget = (!lidOnly && from.endsWith("@lid") && phone) ? `${phone}@s.whatsapp.net` : from;
+      const dmTarget = (!lidOnly && phone) ? `${phone}@s.whatsapp.net` : from;
       // .allowdm: owners + admins + known group members. .disallowdm: owners + admins.
       if (!OWNERS.includes(phone) && (text === ".allowdm" || text === ".disallowdm")) return;
       if (OWNERS.includes(phone) && (text === ".allowdm" || text === ".disallowdm")) {
         setDmOpen(text === ".allowdm");
+        const adminNames = Object.values(ADMINS)
+          .map((a) => String(a && a.name || "").trim()).filter(Boolean);
+        const family = adminNames.length
+          ? adminNames.join(", ")
+          : `${Object.keys(ADMINS).length} admin${Object.keys(ADMINS).length === 1 ? "" : "s"}`;
         const reply = dmOpen
           ? "okay babe, DMs are open to owners, admins and people I already know from groups"
-          : "okay babe, DMs are closed again — only you, Precious and Temi can reach me now";
+          : `okay babe, DMs are closed again — only you and ${family} can reach me now`;
         console.log(`\n📩 [toggle] ${phone}\n💬 Liam: ${reply}\n`);
         await sendLong(dmTarget, reply);
         return;
@@ -2046,7 +2460,16 @@ async function handleIncomingMessage(msg) {
       const decision = tempDecision(from, phone);
       if (decision === "deny") return;
       if (decision !== "allow") {
-        const p = await createPermissionRequest(from, phone, text, msg);
+        let p = null;
+        try {
+          p = await createPermissionRequest(from, phone, text, msg);
+        } catch (e) {
+          if (e && e.code === "permission_reprompt_limit") {
+            try { await wa.sendMessage(from, String(e.message)); } catch (e2) {}
+            return;
+          }
+          throw e;
+        }
         if (!p) {
           try { await wa.sendMessage(from, "I couldn't reach an owner to approve that, so I didn't reply."); } catch (e) {}
           return;
@@ -2103,11 +2526,14 @@ const INSTABOX_API_URL = String(process.env.INSTABOX_API_URL || "https://api.ins
 // and putting this directory on PYTHONPATH is reliable either way.
 const INSTABOX_PYLIB_DIR = String(process.env.INSTABOX_PYLIB_DIR || "/data/home/liam_pylibs");
 
-function instaboxIdempotency(prefix) {
-  const rand = (typeof crypto !== "undefined" && crypto.randomUUID)
-    ? crypto.randomUUID()
-    : Math.random().toString(16).slice(2) + Date.now().toString(16);
-  return `${prefix}-${rand}`;
+function instaboxIdempotency(prefix, target = "liam") {
+  // Lifecycle retries must reuse the same key, including across a redeploy.
+  // Deriving it from the account key and target avoids duplicate machines or
+  // duplicate start charges when a response is lost. The key itself is never
+  // logged or returned.
+  const digest = crypto.createHash("sha256")
+    .update(INSTABOX_API_KEY).update("\0").update(String(target)).digest("hex");
+  return `${prefix}-${digest.slice(0, 32)}`;
 }
 
 // One place for every InstaBox HTTP call. Lifecycle calls need an
@@ -2241,7 +2667,7 @@ async function instaboxEnsureRunning(id) {
   }
   const op = await instaboxRequest(`/v1/machines/${encodeURIComponent(id)}/start`, {
     method: "POST",
-    idempotency: instaboxIdempotency("liam-start"),
+    idempotency: instaboxIdempotency("liam-start", id),
   });
   if (op && op.state === "succeeded") return;
   await instaboxWaitOperation(op && op.id, 180000);
@@ -2385,6 +2811,10 @@ function assertRate() {
   while (outboundLog.length && now - outboundLog[0] > OUTBOUND_WINDOW) outboundLog.shift();
   if (outboundLog.length >= OUTBOUND_MAX) throw new BadRequest("too many outbound messages - slow down");
   outboundLog.push(now);
+  // The 20/minute budget must survive a Render redeploy, otherwise a fresh
+  // process starts with a fresh allowance while WhatsApp still counts the old
+  // sends and the number trips its own reach-out limit.
+  scheduleBridgeStateSave();
 }
 
 function assertOutbox(value) {
@@ -2491,16 +2921,13 @@ async function handleAction(d, ctx = {}) {
     const who = bareId(d.who);
     if (!/^\d{6,20}$/.test(who)) throw new BadRequest("invalid member");
     if (typeof d.allow !== "boolean") throw new BadRequest("allow must be true or false");
-    TEMP[jid] = TEMP[jid] || {};
-    if (d.allow) TEMP[jid][who] = Date.now();
-    else TEMP[jid][who] = -Date.now();
+    setGroupPermission(jid, who, d.allow);
     return d.allow ? "okay, I'll reply " + who : "okay, I'll ignore " + who;
   }
 
   if (action === "stop") {
     assertOwner(d);
     writeFileAtomic(STOP_FILE, "1");
-    if (ctx.hard || d.hard === true) setTimeout(() => stopAgent(), 100);
     return "stopping…";
   }
 
@@ -2615,16 +3042,21 @@ function pairCookieHeader(req) {
   return attrs.join("; ");
 }
 
-function clearPairCookieHeader(req) {
-  const attrs = [
-    "liam_pair=",
-    "Path=/",
-    "HttpOnly",
-    "SameSite=Strict",
-    "Max-Age=0",
-  ];
-  if (wantsSecureCookie(req)) attrs.push("Secure");
-  return attrs.join("; ");
+function sameOriginRequest(req) {
+  if (String(req.headers["sec-fetch-site"] || "").toLowerCase() === "cross-site") return false;
+  const origin = String(req.headers.origin || "");
+  const referer = String(req.headers.referer || "");
+  if (!origin && !referer) return true; // non-browser token clients
+  const host = String(req.headers.host || "");
+  let publicOrigin = "";
+  try { if (PUBLIC_URL) publicOrigin = new URL(PUBLIC_URL).origin; } catch (e) {}
+  for (const value of [origin, referer].filter(Boolean)) {
+    try {
+      const u = new URL(value);
+      if (u.host === host || (publicOrigin && u.origin === publicOrigin)) return true;
+    } catch (e) {}
+  }
+  return false;
 }
 
 function pairAuth(req, url, extraToken = "") {
@@ -2638,10 +3070,15 @@ function pairAuth(req, url, extraToken = "") {
   return { ok: false, via: "" };
 }
 
-function authorized(req) {
+function authorizedWith(req, token) {
   const header = String(req.headers.authorization || "");
   if (!header.startsWith("Bearer ")) return false;
-  return safeEqual(header.slice(7), TOOL_TOKEN);
+  return safeEqual(header.slice(7), token);
+}
+function authorized(req) { return authorizedWith(req, TOOL_TOKEN); }
+function claimsOwner(d) {
+  const actor = bareId(d && d.sender);
+  return !!actor && OWNERS.includes(actor);
 }
 
 function allowedHost(host) {
@@ -2655,6 +3092,69 @@ function allowedHost(host) {
 function isLoopback(address) {
   const value = String(address || "").toLowerCase();
   return value === "127.0.0.1" || value === "::1" || value === "::ffff:127.0.0.1";
+}
+
+function isPrivateAddress(host) {
+  const value = String(host || "").toLowerCase().replace(/^\[|\]$/g, "");
+  if (value === "localhost" || value.endsWith(".localhost") || value.endsWith(".local")) return true;
+  const kind = net.isIP(value);
+  if (!kind) return false;
+  if (kind === 6) {
+    const v = value.split("%")[0];
+    if (v === "::1" || v === "::") return true;
+    if (/^f[cd][0-9a-f]:/.test(v) || /^fe[89ab][0-9a-f]:/.test(v)) return true;
+    if (/^::ffff:/.test(v)) return isPrivateAddress(v.slice(7));
+    return false;
+  }
+  const octets = value.split(".").map((n) => Number.parseInt(n, 10));
+  if (octets.length !== 4 || octets.some((n) => !Number.isFinite(n))) return true;
+  const [a, b] = octets;
+  return a === 0 || a === 10 || a === 127 || a >= 224 ||
+    (a === 100 && b >= 64 && b <= 127) ||
+    (a === 169 && b === 254) ||
+    (a === 172 && b >= 16 && b <= 31) ||
+    (a === 192 && b === 168) ||
+    (a === 198 && (b === 18 || b === 19));
+}
+
+function safeExternalUrl(raw) {
+  let url;
+  try { url = new URL(String(raw || "")); } catch (e) { return null; }
+  if (!/^https?:$/i.test(url.protocol)) return null;
+  if (url.username || url.password) return null;
+  const host = url.hostname;
+  if (!host || isPrivateAddress(host)) return null;
+  return url.toString();
+}
+
+function redactLogs(logs) {
+  return logs.map((entry) => {
+    let line = String(entry && entry.line || "");
+    line = line
+      .replace(/(📩[^\n]*?:\s*).+$/, "$1[redacted]")
+      .replace(/(💬[^\n]*?:\s*).+$/, "$1[redacted]")
+      .replace(/(AGENT ERROR:|TOOL ACTION FAILED:|MSG HANDLER ERROR:|probeReply:|emailProbe:).+$/i, "$1 [redacted]")
+      .replace(/\b\d{7,15}\b/g, (value) => maskPhone(value));
+    return { ...entry, line };
+  });
+}
+
+function maskedLinkMarker(marker) {
+  if (!marker || typeof marker !== "object") return marker || null;
+  const out = { ...marker };
+  if (out.wid) {
+    out.widKind = jidType(out.wid);
+    out.wid = maskPhone(out.wid);
+  }
+  return out;
+}
+
+function diagOwnerTarget(raw) {
+  // Diagnostic sends use the lower-value pairing token, so they must never be
+  // able to message an arbitrary number or bypass the outbound budget.
+  const to = String(raw || OWNERS[0]).replace(/\D/g, "");
+  if (!OWNERS.includes(to)) throw new BadRequest("diagnostics can only use the owner's number");
+  return to;
 }
 
 function statusPayload() {
@@ -2673,7 +3173,7 @@ function statusPayload() {
     memory: containerMemoryInfo(),
     lastQrAt: waLastQrAt || null,
     lastError: waInitError ? waInitError.split("\n")[0].slice(0, 300) : "",
-    pairingEnabled: true,
+    pairingEnabled: !!PAIR_TOKEN && waState !== "ready",
     pendingGroupPermissions: pendingPerms.size,
     pendingToolApprovals: pendingTools.size,
     // WhatsApp's own reach-out time-lock: when active, replies cannot be
@@ -2749,17 +3249,23 @@ function pairPage(opts = {}) {
 
 function readBody(req, limit) {
   return new Promise((resolve, reject) => {
-    let body = "";
+    // Collect Buffer chunks and decode once at the end. String concatenation
+    // corrupts a multibyte character that happens to straddle two chunks.
+    const parts = [];
+    let size = 0;
     let done = false;
     req.on("data", (chunk) => {
       if (done) return;
-      body += chunk;
-      if (Buffer.byteLength(body, "utf8") > limit) {
+      const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      size += buf.length;
+      if (size > limit) {
         done = true;
         reject(new BadRequest("request too large"));
+        return;
       }
+      parts.push(buf);
     });
-    req.on("end", () => { if (!done) resolve(body); });
+    req.on("end", () => { if (!done) resolve(Buffer.concat(parts).toString("utf8")); });
     req.on("error", reject);
   });
 }
@@ -2905,7 +3411,7 @@ function startReachoutWatch() {
 function friendlyWaError(message) {
   const text = String(message || "");
   if (/429|rate[- ]?overlimit|too many|overlimit/i.test(text)) {
-    return "WhatsApp is limiting code requests for this number. Wait 10-15 minutes, " +
+    return `WhatsApp is limiting code requests for this number. Wait ${humanWindow(RATE_LIMIT_COOLDOWN_MS)}, ` +
       "remove old Liam entries from Linked devices on the phone, then try once.";
   }
   if (/couldn'?t link|bad session|401|not[- ]?authorized|conflict|already/i.test(text)) {
@@ -2943,11 +3449,17 @@ async function requestPairing(phone) {
     // device" failure, so wait for that stage instead of guessing.
     while (Date.now() < deadline) {
       if (epoch !== pairingEpoch) throw new BadRequest("pairing was cancelled");
+      // The phone can finish linking while a code request is still looping.
+      // Waiting for the QR stage in that case only produces a spurious timeout.
+      if (waState === "ready" || registered || socketIsRegistered()) break;
       if (sock && sockReadyForPairing) break;
       if (!sock && !connecting && !reconnectTimer) {
         await initializeWhatsApp("pairing code request").catch(() => {});
       }
       await sleep(500);
+    }
+    if (waState === "ready" || registered || socketIsRegistered()) {
+      throw new BadRequest("this WhatsApp account was just linked - no code is needed");
     }
     if (!sock || !sockReadyForPairing) {
       throw new BadRequest("WhatsApp is still starting - wait a few seconds and press the button again");
@@ -2995,7 +3507,10 @@ const server = http.createServer(async (req, res) => {
       return;
     }
     if (pathname === "/ready") {
-      const ready = waState === "ready" && !!(agentProc && agentProc.exitCode === null && !agentProc.killed);
+      // Render readiness is about the WhatsApp socket. The Python agent is
+      // reported separately and restarted in-process, so its crash must not
+      // cause a container restart that would drop the linked session.
+      const ready = waState === "ready";
       sendJson(res, ready ? 200 : 503, { ...statusPayload(), ok: ready });
       return;
     }
@@ -3009,16 +3524,9 @@ const server = http.createServer(async (req, res) => {
       if (auth.via === "query") {
         return sendJson(res, 302, { ok: true }, { Location: "/cancelpair", "Set-Cookie": pairCookieHeader(req) });
       }
-      try {
-        await Promise.race([
-          cancelPairing(),
-          sleep(20000).then(() => { throw new Error("cancel timed out"); }),
-        ]);
-        sendJson(res, 200, { ok: true, ...statusPayload() });
-      } catch (e) {
-        sendJson(res, 500, { ok: false, msg: String(e && e.message ? e.message : e) });
-      }
-      return;
+      // A token in a link may only establish the secure session above. The
+      // destructive action itself needs an explicit POST.
+      return sendJson(res, 405, { ok: false, msg: "use POST to cancel pairing" });
     }
     if (pathname === "/reset") {
       const auth = pairAuth(req, url);
@@ -3026,17 +3534,7 @@ const server = http.createServer(async (req, res) => {
       if (auth.via === "query") {
         return sendJson(res, 302, { ok: true }, { Location: "/reset", "Set-Cookie": pairCookieHeader(req) });
       }
-      if (waState === "ready") return sendJson(res, 409, { ok: false, msg: "already linked; a reset is not needed" });
-      try {
-        await Promise.race([
-          resetWhatsApp("manual reset"),
-          sleep(180000).then(() => { throw new Error("reset timed out"); }),
-        ]);
-        sendJson(res, 200, { ok: true, ...statusPayload() });
-      } catch (e) {
-        sendJson(res, 500, { ok: false, msg: String(e && e.message ? e.message : e) });
-      }
-      return;
+      return sendJson(res, 405, { ok: false, msg: "use POST to reset" });
     }
     if (pathname === "/diag") {
       // Unlinked-startup diagnostics, plus safe message counters once linked.
@@ -3115,8 +3613,18 @@ const server = http.createServer(async (req, res) => {
         // without a redeploy. Token-protected like everything else here.
         const waLog = url.searchParams.get("walog");
         if (waLog !== null) {
+          if (waLogResetTimer) { clearTimeout(waLogResetTimer); waLogResetTimer = null; }
           const want = String(waLog).toLowerCase();
           waLogLevel = (want === "" || want === "silent" || want === "off") ? "silent" : want;
+          // A trace requested for one debugging session must not keep logging
+          // message content forever (or fill the in-memory log ring).
+          if (waLogLevel !== "silent") {
+            waLogResetTimer = setTimeout(() => {
+              waLogLevel = "silent";
+              waLogResetTimer = null;
+            }, WA_LOG_ONCE_MS);
+            if (typeof waLogResetTimer.unref === "function") waLogResetTimer.unref();
+          }
         }
         if (probe === "instabox") {
           try {
@@ -3170,7 +3678,8 @@ const server = http.createServer(async (req, res) => {
             "        print('found:', hit)",
             "print('disk', run('df', '-h', '/data/home'))",
           ].join("\n");
-          const heredoc = "PYTHONPATH=" + INSTABOX_PYLIB_DIR + " python3 - <<'PY'\n" + script + "\nPY";
+          const heredoc = "export PYTHONPATH=" + JSON.stringify(INSTABOX_PYLIB_DIR)
+            + "; python3 - <<'PY'\n" + script + "\nPY";
           try {
             const out = await instaboxExec(heredoc, 180);
             const result = { ok: true, out: String(out).slice(0, 3000) };
@@ -3180,26 +3689,30 @@ const server = http.createServer(async (req, res) => {
               // needed - the scripts launch the system binary. Install into an
               // explicit --target directory because root ignores user site.
               const installScript = [
-                "import subprocess",
+                "import os, subprocess",
                 "def run(*a):",
                 "    p = subprocess.run(a, capture_output=True, text=True)",
                 "    return (p.stdout + p.stderr).strip()",
+                "target = os.environ['LIAM_PYLIB_DIR']",
                 "print('installing playwright...')",
-                "print(run('python3', '-m', 'pip', 'install', '--quiet', '--disable-pip-version-check', '--break-system-packages', '--target', '" + INSTABOX_PYLIB_DIR + "', 'playwright')[-1200:])",
+                "print(run('python3', '-m', 'pip', 'install', '--quiet', '--disable-pip-version-check', '--break-system-packages', '--target', target, 'playwright')[-1200:])",
                 // Verify in a FRESH process. This interpreter looked for the
                 // package before the install created the directory, so importing
                 // it here would still report 'missing' even on success.
                 "print('playwright import:', run('python3', '-c', 'import playwright.sync_api as p; print(p.__name__)'))",
               ].join("\n");
               try {
-                const inst = await instaboxExec("PYTHONPATH=" + INSTABOX_PYLIB_DIR + " python3 - <<'PY'\n" + installScript + "\nPY", 420);
+                const inst = await instaboxExec(
+                  "export LIAM_PYLIB_DIR=" + JSON.stringify(INSTABOX_PYLIB_DIR)
+                  + "; export PYTHONPATH=" + JSON.stringify(INSTABOX_PYLIB_DIR)
+                  + "; python3 - <<'PY'\n" + installScript + "\nPY", 420);
                 result.install = String(inst).slice(0, 2000);
               } catch (e) {
                 result.install = "install failed: " + String(e && e.message ? e.message : e).slice(0, 300);
               }
             }
-            const shotUrl = String(url.searchParams.get("shot") || "").trim();
-            if (/^https?:\/\//i.test(shotUrl)) {
+            const shotUrl = safeExternalUrl(url.searchParams.get("shot"));
+            if (shotUrl) {
               // End-to-end proof: drive Chromium on the VM exactly as the
               // screenshot tool would, and report the PNG size.
               const shotScript = [
@@ -3222,7 +3735,7 @@ const server = http.createServer(async (req, res) => {
               try {
                 await instaboxUpload(scriptPath, Buffer.from(shotScript, "utf8"));
                 const quoted = "'" + shotUrl.replace(/'/g, "'\\''") + "'";
-                const chromeEnv = 'export PYTHONPATH=' + INSTABOX_PYLIB_DIR
+                const chromeEnv = 'export PYTHONPATH=' + JSON.stringify(INSTABOX_PYLIB_DIR)
                   + '; export LIAM_CHROMIUM_PATH="$(command -v chromium '
                   + '|| command -v chromium-browser || command -v google-chrome || true)"; ';
                 const cmd = chromeEnv + "python3 " + scriptPath + " " + quoted
@@ -3231,6 +3744,8 @@ const server = http.createServer(async (req, res) => {
               } catch (e) {
                 result.shot = "shot failed: " + String(e && e.message ? e.message : e).slice(0, 300);
               }
+            } else if (url.searchParams.has("shot")) {
+              result.shot = "shot skipped: only public http(s) URLs are allowed";
             }
             return sendJson(res, 200, { ...base, vpsProbe: result });
           } catch (e) {
@@ -3273,16 +3788,19 @@ const server = http.createServer(async (req, res) => {
           }
         }
         if (probe === "logs") {
-          // The last console lines, so a delivery problem is visible without
-          // dashboard access. Token-protected, and can contain message text.
-          return sendJson(res, 200, { ...base, logs: RECENT_LOGS.slice(-50) });
+          // The last console lines help diagnose delivery problems, but some
+          // lines echo messages. Redact those before exposing them here.
+          return sendJson(res, 200, { ...base, logs: redactLogs(RECENT_LOGS.slice(-50)) });
         }
         if (probe === "send") {
           // Send one real message to the owner and report whether WhatsApp
           // accepted it. This isolates an outbound-delivery problem from the
           // inbound/agent path.
-          const to = String(url.searchParams.get("to") || OWNERS[0]).replace(/\D/g, "");
+          const rawTo = url.searchParams.get("to");
+          let to = "";
           try {
+            to = diagOwnerTarget(rawTo);
+            assertRate();
             const sent = await wa.sendMessage(to, "diagnostic ping from Liam");
             return sendJson(res, 200, {
               ...base,
@@ -3291,7 +3809,7 @@ const server = http.createServer(async (req, res) => {
           } catch (e) {
             return sendJson(res, 200, {
               ...base,
-              sendProbe: { ok: false, to: maskPhone(to), error: String(e && e.message ? e.message : e).slice(0, 400) },
+              sendProbe: { ok: false, to: maskPhone(to || rawTo), error: String(e && e.message ? e.message : e).slice(0, 400) },
             });
           }
         }
@@ -3299,9 +3817,12 @@ const server = http.createServer(async (req, res) => {
           // Send a real message and wait for WhatsApp's delivery receipt. A
           // reply that is accepted but never gets past "server" ack is exactly
           // the "she answered but I never got it" symptom.
-          const to = String(url.searchParams.get("to") || OWNERS[0]).replace(/\D/g, "");
+          const rawTo = url.searchParams.get("to");
+          let to = "";
           const wait = Math.min(30000, Math.max(0, Number.parseInt(url.searchParams.get("wait") || "10000", 10) || 10000));
           try {
+            to = diagOwnerTarget(rawTo);
+            assertRate();
             const sent = await wa.sendMessage(to, "delivery check from Liam");
             const id = messageId(sent);
             let ack = null;
@@ -3326,10 +3847,14 @@ const server = http.createServer(async (req, res) => {
           // Send the same text to the phone-number JID and to the LID WhatsApp
           // maps that number to, then report which one actually gets a delivery
           // receipt. This pinpoints a LID/PN delivery mismatch.
-          const to = String(url.searchParams.get("to") || OWNERS[0]).replace(/\D/g, "");
+          const rawTo = url.searchParams.get("to");
+          let to = "";
           const wait = Math.min(30000, Math.max(0, Number.parseInt(url.searchParams.get("wait") || "12000", 10) || 12000));
           const out = { to: maskPhone(to), targets: [] };
           try {
+            to = diagOwnerTarget(rawTo);
+            out.to = maskPhone(to);
+            assertRate();
             let lid = "";
             try {
               const list = await sock.onWhatsApp(to);
@@ -3366,13 +3891,17 @@ const server = http.createServer(async (req, res) => {
           // The strongest single test: send one message and capture what
           // actually crossed the socket. Frame sizes show whether an encrypted
           // payload was produced, and the ack nodes show what WhatsApp replied.
-          const to = String(url.searchParams.get("to") || OWNERS[0]).replace(/\D/g, "");
+          const rawTo = url.searchParams.get("to");
+          let to = "";
           const wait = Math.min(30000, Math.max(0, Number.parseInt(url.searchParams.get("wait") || "8000", 10) || 8000));
           ackNodeCount = 0;
           ackNodeSamples.length = 0;
           outFrameSizes.length = 0;
-          const out = { to: maskPhone(to) };
+          const out = { to: "" };
           try {
+            to = diagOwnerTarget(rawTo);
+            out.to = maskPhone(to);
+            assertRate();
             const sent = await wa.sendMessage(to, "wire check from Liam");
             out.id = messageId(sent) || "sent";
           } catch (e) { out.error = String(e && e.message ? e.message : e).slice(0, 300); }
@@ -3386,9 +3915,11 @@ const server = http.createServer(async (req, res) => {
         if (probe === "token") {
           // Why an outbound 1:1 message is rejected with 463: is the privacy
           // token present for this contact, and can we read it? Masked, no text.
-          const to = String(url.searchParams.get("to") || OWNERS[0]).replace(/\D/g, "");
+          const rawTo = url.searchParams.get("to");
+          let to = "";
           const out = {};
           try {
+            to = diagOwnerTarget(rawTo);
             out.waLogLevel = waLogLevel;
             out.privacyTokenOn1to1 = !!(sock && sock.serverProps && sock.serverProps.privacyTokenOn1to1);
             out.issueToLid = !!(sock && sock.serverProps && sock.serverProps.lidTrustedTokenIssueToLid);
@@ -3485,7 +4016,13 @@ const server = http.createServer(async (req, res) => {
           // Run the agent's real browser_task tool (which now runs Chromium on
           // the VM) and report what it printed. This exercises the exact path
           // the tool uses, without sending a WhatsApp message.
-          const target = String(url.searchParams.get("url") || "https://example.com").trim();
+          const target = safeExternalUrl(url.searchParams.get("url") || "https://example.com");
+          if (!target) {
+            return sendJson(res, 200, {
+              ...base,
+              browserProbe: { ok: false, error: "only public http(s) URLs are allowed" },
+            });
+          }
           const result = await runProbeScript(["--browser", target], 150000);
           return sendJson(res, 200, { ...base, browserProbe: { target, ...result } });
         }
@@ -3515,7 +4052,9 @@ const server = http.createServer(async (req, res) => {
             );
             return sendJson(res, 200, { ...base, probeReply: String(reply == null ? "" : reply).slice(0, 600) });
           } catch (e) {
-            return sendJson(res, 500, {
+            // All probes use the same convention: 200 with an error field, so a
+            // caller does not need a special case for this one probe.
+            return sendJson(res, 200, {
               ...base,
               probeError: String(e && e.message ? e.message : e).slice(0, 600),
             });
@@ -3539,7 +4078,8 @@ const server = http.createServer(async (req, res) => {
         socketOpen: !!(sock && registered),
         readyForPairing: !!sockReadyForPairing,
         registered: !!(creds && creds.registered),
-        socketUserId: socketUserId(),
+        socketUserIdKind: jidType(socketUserId()),
+        socketUserId: maskPhone(socketUserId()),
         reconnectScheduled: !!reconnectTimer,
         waVersion: waVersion ? waVersion.join(".") : null,
         startedAt: STARTED_AT,
@@ -3547,7 +4087,7 @@ const server = http.createServer(async (req, res) => {
         memoryMiB: containerMemoryMiB(),
         memory: containerMemoryInfo(),
         linkedMarker: hasLinkMarker(),
-        marker: readLinkMarker(),
+        marker: maskedLinkMarker(readLinkMarker()),
         credsPresent: profileHasCredentials(),
         sessionFiles: (() => {
           try { return fs.readdirSync(SESSION_PROFILE_DIR).length; } catch (e) { return 0; }
@@ -3599,6 +4139,9 @@ const server = http.createServer(async (req, res) => {
         bodyToken = String(data.token || "");
         const auth = pairAuth(req, url, bodyToken);
         if (!auth.ok) return sendHtml(res, 403, pairPage({ needToken: true, error: "Invalid or missing pairing token." }));
+        // Cookie-authenticated browser posts must come from our own page. Token
+        // clients (no Origin/Referer) are unaffected.
+        if (!sameOriginRequest(req)) return sendHtml(res, 403, pairPage({ error: "Invalid request origin." }));
         const phone = String(data.phone || "");
         const code = await requestPairing(phone);
         const headers = (auth.via === "body" || auth.via === "query") ? { "Set-Cookie": pairCookieHeader(req) } : {};
@@ -3629,6 +4172,7 @@ const server = http.createServer(async (req, res) => {
         bodyToken = String(data.token || "");
         const auth = pairAuth(req, url, bodyToken);
         if (!auth.ok) return sendJson(res, 403, { ok: false, msg: "forbidden" });
+        if (!sameOriginRequest(req)) return sendJson(res, 403, { ok: false, msg: "invalid origin" });
         await Promise.race([
           cancelPairing(),
           sleep(20000).then(() => { throw new Error("cancel timed out"); }),
@@ -3653,6 +4197,7 @@ const server = http.createServer(async (req, res) => {
         bodyToken = String(data.token || "");
         const auth = pairAuth(req, url, bodyToken);
         if (!auth.ok) return sendJson(res, 403, { ok: false, msg: "forbidden" });
+        if (!sameOriginRequest(req)) return sendJson(res, 403, { ok: false, msg: "invalid origin" });
         if (waState === "ready") return sendJson(res, 409, { ok: false, msg: "already linked; a reset is not needed" });
         await Promise.race([
           resetWhatsApp("manual reset"),
@@ -3691,7 +4236,9 @@ const server = http.createServer(async (req, res) => {
     req.resume();
     return sendJson(res, 415, { ok: false, msg: "content-type must be application/json" });
   }
-  if (!authorized(req)) {
+  const toolAuthed = authorized(req);
+  const ownerAuthed = authorizedWith(req, OWNER_TOKEN);
+  if (!toolAuthed && !ownerAuthed) {
     req.resume();
     return sendJson(res, 401, { ok: false, msg: "unauthorized" });
   }
@@ -3701,21 +4248,32 @@ const server = http.createServer(async (req, res) => {
     return sendJson(res, 413, { ok: false, msg: "request too large" });
   }
 
-  let body = "";
+  const bodyParts = [];
+  let bodySize = 0;
   let tooBig = false;
   req.on("data", (chunk) => {
     if (tooBig) return;
-    body += chunk;
-    if (Buffer.byteLength(body, "utf8") > MAX_BODY) {
+    const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    bodySize += buf.length;
+    if (bodySize > MAX_BODY) {
       tooBig = true;
       sendJson(res, 413, { ok: false, msg: "request too large" });
+      return;
     }
+    bodyParts.push(buf);
   });
   req.on("end", async () => {
     if (tooBig) return;
+    const body = Buffer.concat(bodyParts).toString("utf8");
     let data;
     try { data = JSON.parse(body || "{}"); }
     catch (e) { return sendJson(res, 400, { ok: false, msg: "invalid request" }); }
+    // The loopback token can request approvals and act as the person whose turn
+    // it is carrying. It cannot claim to be an owner: owner-scoped actions need
+    // the separate token the bridge gave only to its own agent process.
+    if (claimsOwner(data) && !ownerAuthed) {
+      return sendJson(res, 403, { ok: false, msg: "owner token required" });
+    }
     try {
       const message = await handleAction(data);
       sendJson(res, 200, { ok: true, msg: message });
@@ -3816,8 +4374,11 @@ async function boot() {
     setWaState("needs_qr", "no saved login - press the button once on the pairing page");
   } else {
     const marker = readLinkMarker();
-    if (marker && marker.wid) console.log(`info: restoring linked WhatsApp session (${marker.wid})`);
+    if (marker && marker.wid) console.log(`info: restoring linked WhatsApp session (${maskPhone(marker.wid)})`);
   }
+  // Resolve the interpreter off the hot path. A synchronous probe here used to
+  // block Baileys long enough to starve its handshake and keepalive.
+  void resolvePythonBinAsync();
   await initializeWhatsApp("startup");
   startMemoryGuard();
   startKeepAlive();
@@ -3879,7 +4440,8 @@ module.exports = {
   messageId, jidForSend, socketUserId, friendlyWaError,
   SERVER_DOWN_TEXT, startKeepAlive, markReadAndTyping, stopTyping,
   pnFromParticipant, rememberLidContacts, lidContacts, resolvePhone,
-  messageText, mediaPlaceholder,
+  messageText, mediaPlaceholder, displayText,
+  OWNER_TOKEN, sameOriginRequest, diagOwnerTarget, safeExternalUrl, isPrivateAddress,
   loadBridgeState, saveBridgeStateLocal, applyBridgeState, bridgeStateSnapshot,
   scheduleBridgeStateSave, heldReplies, deliverProgress,
 };

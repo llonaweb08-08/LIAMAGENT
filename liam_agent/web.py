@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import html
+import http.client
 import imaplib
 import ipaddress
 import json
@@ -7,7 +9,6 @@ import os
 import re
 import shlex
 import socket
-import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -17,6 +18,10 @@ from .runtime import BASE_DIR, FILE_READ_MAX, SHELL_OUTPUT_MAX, _atomic_write_te
 from .state import _clamp_timeout
 
 _BLOCKED_HOST_SUFFIXES = (".local", ".internal", ".localhost", ".home", ".lan")
+
+
+class _SafeUrl(str):
+    """A validated URL that also carries the vetted address for this hop."""
 
 
 def _generous_timeout(env_name, default=3600):
@@ -45,6 +50,7 @@ def _safe_url(url: str) -> str:
         raise ValueError("could not resolve that site") from exc
     if not addresses:
         raise ValueError("could not resolve that site")
+    pinned = None
     for info in addresses:
         try:
             ip = ipaddress.ip_address(str(info[4][0]).split("%", 1)[0])
@@ -52,7 +58,11 @@ def _safe_url(url: str) -> str:
             raise ValueError("could not resolve that site") from exc
         if not ip.is_global:
             raise ValueError("local addresses are not allowed")
-    return value
+        if pinned is None:
+            pinned = str(ip)
+    safe = _SafeUrl(value)
+    safe.pinned_ip = pinned
+    return safe
 
 
 class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -63,10 +73,54 @@ class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
+def _pinned_connection(scheme, base):
+    """Build a connection class that dials the vetted IP, not a fresh lookup.
+
+    Keeping the original host on the connection preserves the Host header and
+    TLS SNI. Only the TCP destination is pinned, so DNS cannot be flipped to a
+    private address between validation and connect (or on a redirect).
+    """
+    class _PinnedConnection(base):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            # HTTPConnection stores this on the instance in __init__, so a class
+            # method alone would never be called. Replace the instance copy too.
+            self._create_connection = self._pinned_create_connection
+
+        def _pinned_create_connection(self, address, timeout=None, source_address=None):
+            host, port = address
+            netloc = f"[{host}]" if ":" in host else host
+            safe = _safe_url(f"{scheme}://{netloc}:{port}")
+            return socket.create_connection(
+                (safe.pinned_ip, port), timeout, source_address)
+
+    return _PinnedConnection
+
+
+class _PinnedHTTPHandler(urllib.request.HTTPHandler):
+    def http_open(self, req):
+        return self.do_open(_pinned_connection("http", http.client.HTTPConnection), req)
+
+
+class _PinnedHTTPSHandler(urllib.request.HTTPSHandler):
+    def https_open(self, req):
+        return self.do_open(_pinned_connection("https", http.client.HTTPSConnection), req)
+
+
+def _build_opener():
+    # Empty ProxyHandler: a local proxy would bypass the pinned destination.
+    return urllib.request.build_opener(
+        urllib.request.ProxyHandler({}),
+        _PinnedHTTPHandler(),
+        _PinnedHTTPSHandler(),
+        _SafeRedirectHandler(),
+    )
+
+
 def _open_url(url, timeout=None, headers=None):
-    request = urllib.request.Request(url, headers=dict(headers or {}))
-    opener = urllib.request.build_opener(_SafeRedirectHandler())
-    return opener.open(request, timeout=timeout or _generous_timeout("LIAM_WEB_TIMEOUT"))
+    safe = _safe_url(url)
+    request = urllib.request.Request(str(safe), headers=dict(headers or {}))
+    return _build_opener().open(request, timeout=timeout or _generous_timeout("LIAM_WEB_TIMEOUT"))
 
 
 def _http_json(url, payload=None, headers=None, timeout=None):
@@ -84,9 +138,10 @@ def _http_json(url, payload=None, headers=None, timeout=None):
     if payload is not None:
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         request_headers["Content-Type"] = "application/json"
-    request = urllib.request.Request(url, data=data, headers=request_headers)
-    opener = urllib.request.build_opener(_SafeRedirectHandler())
-    with opener.open(request, timeout=timeout or _generous_timeout("LIAM_WEB_TIMEOUT")) as response:
+    safe = _safe_url(url)
+    request = urllib.request.Request(str(safe), data=data, headers=request_headers)
+    with _build_opener().open(
+            request, timeout=timeout or _generous_timeout("LIAM_WEB_TIMEOUT")) as response:
         return json.loads(response.read().decode("utf-8", "replace"))
 
 
@@ -103,11 +158,13 @@ def web_fetch(url):
             data = response.read(300000)
             charset = response.headers.get_content_charset() or "utf-8"
         text = data.decode(charset, "replace")
-        # Strip active content and markup, then collapse whitespace.
+        # Markup removal is best-effort: active blocks and tags are dropped,
+        # entities are decoded, then whitespace is collapsed for readability.
         text = re.sub(r"<script.*?</script>", " ", text, flags=re.S | re.I)
         text = re.sub(r"<style.*?</style>", " ", text, flags=re.S | re.I)
         text = re.sub(r"<noscript.*?</noscript>", " ", text, flags=re.S | re.I)
         text = re.sub(r"<[^>]+>", " ", text)
+        text = html.unescape(text)
         text = re.sub(r"\s+", " ", text).strip()
         return text[:8000] or "(empty page)"
     except ValueError:
@@ -320,7 +377,7 @@ def shell_exec(command, timeout=None):
                 return "empty command"
             if len(text) > 4000:
                 return "command is too long"
-            args = shlex.split(text, posix=(os.name != "nt"))
+            args = shlex.split(text, posix=True)
         if not args:
             return "empty command"
         timeout = _generous_timeout("LIAM_SHELL_TIMEOUT", int(timeout or 3600))
@@ -334,11 +391,11 @@ def shell_exec(command, timeout=None):
         return f"exec failed: {type(e).__name__}"
 
 
-def email_read(host="", username="", password="", folder="INBOX", limit=5):
-    """Read recent mail. Credentials come from LIAM_EMAIL_* env vars by default."""
-    host = str(host or os.environ.get("LIAM_EMAIL_HOST") or "").strip()
-    username = str(username or os.environ.get("LIAM_EMAIL_USER") or "").strip()
-    password = str(password or os.environ.get("LIAM_EMAIL_PASSWORD") or "")
+def email_read(folder="INBOX", limit=5):
+    """Read recent mail; credentials always come from LIAM_EMAIL_* env vars."""
+    host = str(os.environ.get("LIAM_EMAIL_HOST") or "").strip()
+    username = str(os.environ.get("LIAM_EMAIL_USER") or "").strip()
+    password = str(os.environ.get("LIAM_EMAIL_PASSWORD") or "")
     folder = str(folder or os.environ.get("LIAM_EMAIL_FOLDER") or "INBOX").strip() or "INBOX"
     if not host or not username or not password:
         return "email is not configured (set LIAM_EMAIL_HOST, LIAM_EMAIL_USER and LIAM_EMAIL_PASSWORD)"

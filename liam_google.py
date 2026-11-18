@@ -64,11 +64,13 @@ def _remove(path: str) -> None:
 
 
 def _post(model: str, payload: dict, timeout: int = 90) -> dict:
-    url = f"{API_ROOT}/{model}:generateContent?key={_key()}"
+    # Pass the key as a header, not a query parameter: URLs end up in proxy and
+    # server logs. The Generative Language API accepts x-goog-api-key.
+    url = f"{API_ROOT}/{model}:generateContent"
     request = urllib.request.Request(
         url,
         data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
+        headers={"Content-Type": "application/json", "x-goog-api-key": _key()},
     )
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:

@@ -48,7 +48,18 @@ def _secret(name, default):
         if value:
             return value
     except ImportError:
+        # A normal install has no local secrets file; env vars are enough.
         pass
+    except Exception as exc:
+        # A broken local secrets module must not crash the agent. Log only the
+        # exception type - never a value or a traceback that might contain one.
+        try:
+            sys.stderr.write(
+                f"[security] liam_secrets import failed ({type(exc).__name__}); "
+                "using environment defaults\n")
+            sys.stderr.flush()
+        except Exception:
+            pass
     return default
 
 

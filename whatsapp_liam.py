@@ -8,7 +8,6 @@ message; raw HTTP bodies and stack traces never reach the model.
 from __future__ import annotations
 
 import os
-import tempfile
 
 import requests
 
@@ -49,6 +48,23 @@ def _token() -> str:
     return token
 
 
+def _auth_token(payload: dict) -> str:
+    """Pick the owner-scoped token for owner actions, else the loopback token.
+
+    The bridge will reject owner-only actions unless LIAM_OWNER_TOKEN is used.
+    Member actions, including vps_exec approval requests, keep the old token.
+    Neither token is ever printed or returned to the model.
+    """
+    sender = payload.get("sender")
+    if sender:
+        from liam_agent.people import _is_owner
+        if _is_owner(sender):
+            owner_token = os.environ.get("LIAM_OWNER_TOKEN") or ""
+            if owner_token:
+                return owner_token
+    return _token()
+
+
 def _post(action: str, http_timeout: float = 60, **kwargs) -> str:
     payload = {"action": action}
     # The bridge needs to know who is acting so it can enforce owner-only
@@ -56,9 +72,9 @@ def _post(action: str, http_timeout: float = 60, **kwargs) -> str:
     payload.update({key: value for key, value in kwargs.items() if value is not None})
     try:
         response = requests.post(
-            BRIDGE_URL,
+            _bridge_url(),  # resolved per call so env overrides take effect
             json=payload,
-            headers={"Authorization": "Bearer " + _token()},
+            headers={"Authorization": "Bearer " + _auth_token(payload)},
             timeout=http_timeout,
         )
     except requests.RequestException as exc:
@@ -97,7 +113,12 @@ def send_voice(to: str, text: str, sender: str | None = None,
         path, mimetype = liam_voice.synth(text)
     except liam_voice.VoiceUnavailable as exc:
         if str(getattr(liam_keys, "GOOGLE_API_KEY", "") or "").strip():
-            path, mimetype = liam_google.synth_voice(text)
+            try:
+                path, mimetype = liam_google.synth_voice(text)
+            except Exception as google_exc:
+                # Google errors can carry provider detail; expose only the type.
+                raise ToolError(
+                    f"voice synthesis failed ({type(google_exc).__name__})") from google_exc
         else:
             raise ToolError(str(exc)) from exc
     try:
@@ -158,20 +179,9 @@ def vps_download(path: str, sender: str | None = None,
 
 
 def _atomic_write(path: str, value: str) -> None:
-    directory = os.path.dirname(path) or "."
-    os.makedirs(directory, exist_ok=True)
-    fd, temporary = tempfile.mkstemp(prefix=".liam_", dir=directory, text=True)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(value)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, path)
-    finally:
-        try:
-            os.remove(temporary)
-        except OSError:
-            pass
+    # Keep the name for old callers; the implementation is the shared helper.
+    from liam_agent.runtime import _atomic_write_text
+    _atomic_write_text(path, value)
 
 
 def set_stop(value: bool) -> None:
@@ -179,8 +189,17 @@ def set_stop(value: bool) -> None:
 
 
 def get_stop() -> bool:
+    return get_stop_state()[0] == "1"
+
+
+def get_stop_state() -> tuple[str, float]:
+    """Return (raw content, mtime_ns) for per-turn stop detection (PY-31)."""
+    try:
+        mtime = float(os.path.getmtime(STOP_FILE)) * 1e9
+    except OSError:
+        mtime = 0.0
     try:
         with open(STOP_FILE, encoding="utf-8") as handle:
-            return handle.read().strip() == "1"
+            return handle.read().strip(), mtime
     except OSError:
-        return False
+        return "", mtime

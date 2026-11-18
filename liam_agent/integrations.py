@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import json
 import os
 import re
@@ -11,7 +12,7 @@ import liam_keys
 
 from ._compat import agent_mod
 from .people import OWNERS
-from .runtime import BASE_DIR, DATA_DIR, _env_int, _log, _safe_remove, _unique_file
+from .runtime import BASE_DIR, OUTBOX_DIR, _env_int, _log, _safe_remove, _unique_file
 from .state import _clamp_timeout, _remaining_budget
 from .web import _safe_url
 
@@ -160,17 +161,59 @@ def vps_exec(command, timeout=120, cwd="", sender=None, chat="", group=False):
     except (TypeError, ValueError):
         seconds = 120
     left = _remaining_budget()
+    if left is not None and left <= 0:
+        return "no time left in this turn to run that"
     if left is not None:
-        seconds = max(5, min(seconds, int(left)))
+        seconds = max(1, min(seconds, int(left)))
     return agent_mod().wa.vps_exec(
         command, timeout=seconds, cwd=cwd, sender=sender, chat=chat, group=group)
 
 
 def report_progress(text, sender=None):
-    try:
-        return agent_mod().wa.send_message(OWNERS[0], str(text or ""), sender=sender or OWNERS[0])
-    except Exception as e:
-        return f"progress report failed: {type(e).__name__}"
+    """Send an explicit report to every configured owner, not just the first."""
+    a = agent_mod()
+    value = str(text or "")
+    owners = list(getattr(a, "OWNERS", OWNERS) or [])
+    if not owners:
+        return "progress report failed: no owners configured"
+    sent, failures = 0, []
+    for owner in owners:
+        try:
+            a.wa.send_message(owner, value, sender=sender or owner)
+            sent += 1
+        except Exception as e:
+            failures.append(type(e).__name__)
+    if not sent:
+        return "progress report failed: " + ", ".join(failures)
+    if failures:
+        return f"progress sent to {sent} of {len(owners)} owners ({', '.join(failures)})"
+    return f"progress sent to {sent} owner(s)"
+
+
+def _progress_throttled(value, now=None):
+    """The single throttle for every progress line (auto heartbeat or explicit).
+
+    Rules, in order: suppress an identical update inside the dedupe window,
+    enforce one minimum gap between any two updates, and cap how many updates
+    one turn may emit. Returns an honest "not sent ..." reason, or "" to send.
+    """
+    from . import state
+    now = time.monotonic() if now is None else now
+    last_text = str(getattr(state, "_LAST_PROGRESS_TEXT", "") or "")
+    last_emit = float(getattr(state, "_LAST_PROGRESS_EMIT_AT", 0.0) or 0.0)
+    # LIAM_PROGRESS_GAP is the old auto-heartbeat name; accept both.
+    gap = _env_int("LIAM_PROGRESS_MIN_GAP",
+                   _env_int("LIAM_PROGRESS_GAP", 20, 0, 600), 0, 600)
+    dedupe = _env_int("LIAM_PROGRESS_DEDUPE", 120, 10, 3600)
+    if value == last_text and (now - last_emit) < dedupe:
+        return "not sent (already reported)"
+    if (now - last_emit) < gap:
+        return "not sent (rate-limited)"
+    max_per_turn = _env_int("LIAM_PROGRESS_MAX_PER_TURN", 3, 1, 20)
+    count = int(getattr(state, "_PROGRESS_COUNT", 0) or 0)
+    if count >= max_per_turn:
+        return "not sent (progress limit reached for this turn)"
+    return ""
 
 
 def _emit_progress(text):
@@ -180,38 +223,22 @@ def _emit_progress(text):
         return "nothing to report"
     if len(value) > 1200:
         value = value[:1200].rstrip() + "…"
+    now = time.monotonic()
     try:
-        a = agent_mod()
-        now = time.monotonic()
-        # Specific fix for progress spam: do not send the exact same update again
-        # in quick succession (common when a slow tool is called repeatedly), and
-        # rate-limit explicit progress messages so a chat is never flooded.
-        last_text = str(getattr(state, "_LAST_PROGRESS_TEXT", "") or "")
-        last_emit = float(getattr(state, "_LAST_PROGRESS_EMIT_AT", 0.0) or 0.0)
-        if value == last_text and (now - last_emit) < _env_int("LIAM_PROGRESS_DEDUPE", 120, 10, 3600):
+        reason = _progress_throttled(value, now)
+        if reason:
             state._LAST_PROGRESS_AT = now
-            a._LAST_PROGRESS_AT = now
-            return "sent (already reported)"
-        if (now - last_emit) < _env_int("LIAM_PROGRESS_MIN_GAP", 8, 0, 600):
-            state._LAST_PROGRESS_AT = now
-            a._LAST_PROGRESS_AT = now
-            return "progress update rate-limited"
-        max_per_turn = _env_int("LIAM_PROGRESS_MAX_PER_TURN", 3, 1, 20)
-        count = int(getattr(state, "_PROGRESS_COUNT", 0) or 0)
-        if count >= max_per_turn:
-            return "progress limit reached for this turn"
-        print(json.dumps({"progress": value}, ensure_ascii=False), flush=True)
+            return reason
+        # BR-10: the bridge only delivers frames whose id matches the turn it
+        # is waiting for. Outside a turn there is no id, so send null.
+        print(json.dumps({"progress": value, "id": getattr(state, "_REQUEST_ID", None)},
+                         ensure_ascii=False), flush=True)
     except Exception:
         return "couldn't send that update"
-    now = time.monotonic()
     state._LAST_PROGRESS_AT = now
-    agent_mod()._LAST_PROGRESS_AT = now
     state._LAST_PROGRESS_TEXT = value
-    agent_mod()._LAST_PROGRESS_TEXT = value
     state._LAST_PROGRESS_EMIT_AT = now
-    agent_mod()._LAST_PROGRESS_EMIT_AT = now
-    state._PROGRESS_COUNT = count + 1
-    agent_mod()._PROGRESS_COUNT = state._PROGRESS_COUNT
+    state._PROGRESS_COUNT = int(getattr(state, "_PROGRESS_COUNT", 0) or 0) + 1
     return "sent"
 
 
@@ -315,7 +342,7 @@ def _vps_stage(name, text):
     if len(text) > 40000:
         raise ValueError("script is too large to send to the VM")
     path = VPS_BROWSER_DIR + "/" + name
-    agent_mod().vps_exec("mkdir -p " + VPS_BROWSER_DIR, timeout=30, sender=OWNERS[0])
+    agent_mod().vps_exec("mkdir -p " + shlex.quote(VPS_BROWSER_DIR), timeout=30, sender=OWNERS[0])
     agent_mod().wa.vps_upload(path, base64.b64encode(text.encode("utf-8")).decode("ascii"),
                               sender=OWNERS[0])
     return path
@@ -361,8 +388,12 @@ def _remote_screenshot(to, url, sender):
         raise RuntimeError("remote screenshot was empty")
     path = _unique_file(".png")
     try:
+        try:
+            raw = base64.b64decode(data, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise RuntimeError("remote screenshot returned invalid data") from exc
         with open(path, "wb") as handle:
-            handle.write(base64.b64decode(data))
+            handle.write(raw)
         if os.path.getsize(path) == 0:
             raise RuntimeError("remote screenshot was empty")
         return agent_mod().wa.send_image(to, path, sender=sender)
@@ -402,17 +433,31 @@ def browser_task(script, sender=None, chat="", group=False):
         _safe_remove(path)
 
 
+_DENIED_IMAGE_NAMES = {
+    "liam_secrets.py", "liam_config.json", "liam_memory.db", "tool_token",
+    "stop_flag", "brain_state", "preferred_keys.json", ".env", ".env.local",
+}
+
+
 def _local_image_data_url(path):
+    # Only the agent's own outbox is a legitimate image source. BASE_DIR holds
+    # secrets and config, so it must never be exposed through this helper.
     real = os.path.realpath(os.path.abspath(str(path or "")))
-    roots = [os.path.realpath(DATA_DIR), os.path.realpath(BASE_DIR)]
-    if not any(real == root or real.startswith(root + os.sep) for root in roots):
-        raise ValueError("local images must be inside the Liam data directory")
+    root = os.path.realpath(OUTBOX_DIR)
+    if not (real == root or real.startswith(root + os.sep)):
+        raise ValueError("local images must be inside the Liam outbox directory")
+    name = os.path.basename(real).lower()
+    if name in _DENIED_IMAGE_NAMES or name.startswith("."):
+        raise ValueError("that file cannot be read as an image")
+    if any(part in ("node_modules", "__pycache__") for part in real.split(os.sep)):
+        raise ValueError("that file cannot be read as an image")
     if not os.path.isfile(real):
         raise ValueError("image not found")
     size = os.path.getsize(real)
     if size <= 0 or size > 4 * 1024 * 1024:
         raise ValueError("image is empty or larger than 4 MB")
-    mime = __import__('mimetypes').guess_type(real)[0] or "image/png"
+    import mimetypes
+    mime = mimetypes.guess_type(real)[0] or "image/png"
     if not mime.startswith("image/"):
         raise ValueError("that file is not an image")
     with open(real, "rb") as handle:
@@ -431,7 +476,12 @@ def analyze_image(path_or_url, question="describe this image"):
             {"type": "text", "text": str(question or "describe this image")[:1000]},
             {"type": "image_url", "image_url": {"url": img}},
         ]}]
-        message = agent_mod().call_model(messages, None, brain="moonmath", tools=None, budget=45)
+        # Vision is a MoonMath-only capability; call_model's normal fallback
+        # chain includes brains that cannot read images, so keep it empty.
+        message = agent_mod().call_model(
+            messages, None, brain="moonmath", tools=None, budget=45, fallbacks=())
+        if message.get("_brain") in ("none", "offline"):
+            return "vision failed: no vision-capable model answered"
         return message.get("content") or "no response"
     except ValueError as e:
         return f"vision failed: {e}"
