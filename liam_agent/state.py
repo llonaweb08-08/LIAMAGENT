@@ -9,6 +9,7 @@ _DEADLINE = None
 _LAST_PROGRESS_AT = 0.0
 _LAST_PROGRESS_TEXT = ""
 _LAST_PROGRESS_EMIT_AT = 0.0
+_PROGRESS_COUNT = 0
 _EXHAUSTED = {}
 _vps_browser_retry_at = 0.0
 

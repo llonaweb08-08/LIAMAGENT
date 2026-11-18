@@ -1325,6 +1325,54 @@ class ClippedReplyTests(unittest.TestCase):
         self.assertEqual(out, "L")
 
 
+class ProgressAndTimeoutTests(unittest.TestCase):
+    def setUp(self):
+        from liam_agent import state
+        agent._PROGRESS_COUNT = 0
+        state._PROGRESS_COUNT = 0
+        agent._LAST_PROGRESS_TEXT = ""
+        state._LAST_PROGRESS_TEXT = ""
+        agent._LAST_PROGRESS_EMIT_AT = 0.0
+        state._LAST_PROGRESS_EMIT_AT = 0.0
+
+    def test_auto_progress_is_contextual(self):
+        text = agent._auto_progress_text("screenshot", {"url": "https://sportybet.com/bet"})
+        self.assertIn("sportybet.com", text)
+        self.assertIn("screenshot", text.lower())
+        text = agent._auto_progress_text("browser_task",
+                                          {"script": "goto('https://opayweb.com')"})
+        self.assertIn("opayweb.com", text)
+
+    def test_command_tools_do_not_post_progress(self):
+        self.assertNotIn("shell_exec", agent.AUTO_PROGRESS_TOOLS)
+        self.assertNotIn("vps_exec", agent.AUTO_PROGRESS_TOOLS)
+        self.assertIn("screenshot", agent.AUTO_PROGRESS_TOOLS)
+
+    def test_progress_is_capped_per_turn(self):
+        buf = io.StringIO()
+        results = []
+        with mock.patch.dict(os.environ, {"LIAM_PROGRESS_MIN_GAP": "0"}), \
+                contextlib.redirect_stdout(buf):
+            for i in range(6):
+                results.append(agent._emit_progress(f"Milestone {i} at example.com"))
+        self.assertEqual(results.count("sent"), 3)
+        self.assertIn("progress limit reached", results[-1])
+        self.assertEqual(len(buf.getvalue().strip().splitlines()), 3)
+
+    def test_web_timeouts_have_no_short_cap(self):
+        from liam_agent import state
+        old_agent, old_state = agent._DEADLINE, state._DEADLINE
+        agent._DEADLINE = None
+        state._DEADLINE = None
+        try:
+            self.assertGreaterEqual(agent._generous_timeout("LIAM_WEB_TIMEOUT"), 3000)
+            self.assertGreaterEqual(agent._generous_timeout("LIAM_FETCH_TIMEOUT"), 3000)
+            self.assertGreaterEqual(agent._generous_timeout("LIAM_EMAIL_TIMEOUT"), 3000)
+        finally:
+            agent._DEADLINE = old_agent
+            state._DEADLINE = old_state
+
+
 class KeyRotationTests(unittest.TestCase):
     """MoonMath key rotation and the MoonMath -> HCNSec -> Agnes chain."""
 
@@ -1334,15 +1382,15 @@ class KeyRotationTests(unittest.TestCase):
     def tearDown(self):
         agent._EXHAUSTED.clear()
 
-    def test_chain_order_and_hcn_timeout(self):
+    def test_chain_order_and_uniform_timeout(self):
         self.assertEqual(agent.FALLBACK_ORDER, ["moonmath", "hcn", "agnes"])
-        self.assertGreaterEqual(agent.BRAIN_TIMEOUT["hcn"], 30)
-        self.assertGreater(agent.CALL_BUDGET, 70)
-        self.assertLessEqual(agent.BRAIN_TIMEOUT["hcn"], agent.CALL_BUDGET)
+        self.assertGreaterEqual(agent.ATTEMPT_TIMEOUT, 35)
+        self.assertLessEqual(agent.ATTEMPT_TIMEOUT, agent.CALL_BUDGET)
+        # Three keys + hcn + agnes at 35s each must fit inside one step.
+        self.assertGreaterEqual(agent.CALL_BUDGET, 5 * agent.ATTEMPT_TIMEOUT)
 
-    def test_agnes_timeout_is_raised(self):
-        self.assertGreaterEqual(agent.BRAIN_TIMEOUT["agnes"], 35)
-        self.assertLessEqual(agent.BRAIN_TIMEOUT["agnes"], agent.CALL_BUDGET)
+    def test_no_per_brain_timeout_exists(self):
+        self.assertFalse(hasattr(agent, "BRAIN_TIMEOUT"))
 
     def test_quota_errors_flag_the_whole_key_for_24_hours(self):
         fake = {"base": "https://x", "model": "m", "keys": ["k1"], "label": "M"}

@@ -19,6 +19,11 @@ from .state import _clamp_timeout
 _BLOCKED_HOST_SUFFIXES = (".local", ".internal", ".localhost", ".home", ".lan")
 
 
+def _generous_timeout(env_name, default=3600):
+    """No short per-call cap; only the overall turn deadline bounds a call."""
+    return _clamp_timeout(_env_int(env_name, default, 5, 7200))
+
+
 def _safe_url(url: str) -> str:
     """Only allow public http(s) targets; block file://, localhost and SSRF."""
     value = str(url or "").strip()
@@ -58,13 +63,13 @@ class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
-def _open_url(url, timeout=20, headers=None):
+def _open_url(url, timeout=None, headers=None):
     request = urllib.request.Request(url, headers=dict(headers or {}))
     opener = urllib.request.build_opener(_SafeRedirectHandler())
-    return opener.open(request, timeout=timeout)
+    return opener.open(request, timeout=timeout or _generous_timeout("LIAM_WEB_TIMEOUT"))
 
 
-def _http_json(url, payload=None, headers=None, timeout=20):
+def _http_json(url, payload=None, headers=None, timeout=None):
     from ._compat import agent_mod
     try:
         ua = agent_mod().liam_keys.BROWSER_UA
@@ -81,7 +86,7 @@ def _http_json(url, payload=None, headers=None, timeout=20):
         request_headers["Content-Type"] = "application/json"
     request = urllib.request.Request(url, data=data, headers=request_headers)
     opener = urllib.request.build_opener(_SafeRedirectHandler())
-    with opener.open(request, timeout=timeout) as response:
+    with opener.open(request, timeout=timeout or _generous_timeout("LIAM_WEB_TIMEOUT")) as response:
         return json.loads(response.read().decode("utf-8", "replace"))
 
 
@@ -90,7 +95,7 @@ def web_fetch(url):
     a = agent_mod()
     safe = a._safe_url(url)
     try:
-        timeout = _clamp_timeout(_env_int("LIAM_FETCH_TIMEOUT", 20, 5, 60))
+        timeout = _generous_timeout("LIAM_FETCH_TIMEOUT")
         with a._open_url(safe, timeout=timeout, headers={
             "User-Agent": a.liam_keys.BROWSER_UA,
             "Accept": "text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.8",
@@ -119,7 +124,7 @@ def _search_tavily(query):
         "query": query,
         "max_results": 8,
         "search_depth": "basic",
-    }, timeout=20)
+    })
     out = []
     for item in (body.get("results") or [])[:8]:
         if not isinstance(item, dict):
@@ -140,7 +145,7 @@ def _search_brave(query):
     body = a._http_json(url, headers={
         "X-Subscription-Token": a.liam_keys.BRAVE_API_KEY,
         "Accept": "application/json",
-    }, timeout=20)
+    })
     out = []
     for item in (((body.get("web") or {}).get("results")) or [])[:8]:
         if not isinstance(item, dict):
@@ -157,7 +162,7 @@ def _search_serper(query):
     a = agent_mod()
     body = a._http_json("https://google.serper.dev/search", {
         "q": query, "num": 8,
-    }, headers={"X-API-KEY": a.liam_keys.SERPER_API_KEY}, timeout=20)
+    }, headers={"X-API-KEY": a.liam_keys.SERPER_API_KEY})
     out = []
     for item in (body.get("organic") or [])[:8]:
         if not isinstance(item, dict):
@@ -249,7 +254,7 @@ def _search_duckduckgo(query):
     problems = []
     for name, url, parser in endpoints:
         try:
-            with a._open_url(url, timeout=20, headers=headers) as response:
+            with a._open_url(url, headers=headers) as response:
                 page = response.read(400000).decode("utf-8", "replace")
             results = parser(page)
             if results:
@@ -303,7 +308,7 @@ def file_write(path, content):
         return f"write failed: {type(e).__name__}"
 
 
-def shell_exec(command, timeout=30):
+def shell_exec(command, timeout=None):
     from ._compat import agent_mod
     sp = agent_mod().subprocess
     try:
@@ -318,7 +323,7 @@ def shell_exec(command, timeout=30):
             args = shlex.split(text, posix=(os.name != "nt"))
         if not args:
             return "empty command"
-        timeout = _clamp_timeout(_env_int("LIAM_SHELL_TIMEOUT", timeout, 1, 3600))
+        timeout = _generous_timeout("LIAM_SHELL_TIMEOUT", int(timeout or 3600))
         result = sp.run(
             args, shell=False, capture_output=True, text=True, timeout=timeout)
         output = ((result.stdout or "") + (result.stderr or ""))[:SHELL_OUTPUT_MAX]
@@ -341,7 +346,7 @@ def email_read(host="", username="", password="", folder="INBOX", limit=5):
     try:
         import email
         port = _env_int("LIAM_EMAIL_PORT", 993, 1, 65535)
-        timeout = _clamp_timeout(_env_int("LIAM_EMAIL_TIMEOUT", 20, 5, 60))
+        timeout = _generous_timeout("LIAM_EMAIL_TIMEOUT")
         limit = max(1, min(20, int(limit or 5)))
         mail = imaplib.IMAP4_SSL(host, port, timeout=timeout)
         mail.login(username, password)

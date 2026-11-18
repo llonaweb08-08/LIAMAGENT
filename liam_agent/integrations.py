@@ -196,6 +196,10 @@ def _emit_progress(text):
             state._LAST_PROGRESS_AT = now
             a._LAST_PROGRESS_AT = now
             return "progress update rate-limited"
+        max_per_turn = _env_int("LIAM_PROGRESS_MAX_PER_TURN", 3, 1, 20)
+        count = int(getattr(state, "_PROGRESS_COUNT", 0) or 0)
+        if count >= max_per_turn:
+            return "progress limit reached for this turn"
         print(json.dumps({"progress": value}, ensure_ascii=False), flush=True)
     except Exception:
         return "couldn't send that update"
@@ -206,26 +210,52 @@ def _emit_progress(text):
     agent_mod()._LAST_PROGRESS_TEXT = value
     state._LAST_PROGRESS_EMIT_AT = now
     agent_mod()._LAST_PROGRESS_EMIT_AT = now
+    state._PROGRESS_COUNT = count + 1
+    agent_mod()._PROGRESS_COUNT = state._PROGRESS_COUNT
     return "sent"
 
 
-_AUTO_PROGRESS = {
-    "browser_task": "I'm working on the browser task now - give me a moment.",
-    "screenshot": "Taking the screenshot now - one moment.",
-    "vps_exec": "Running that on the pentest machine now - give me a moment.",
-    "web_fetch": "Fetching that page now - one moment.",
-    "email_read": "Checking your inbox now - one moment.",
-    "analyze_image": "Looking at that image now - one moment.",
-    "shell_exec": "Running that command now - one moment.",
-}
+def _target_from_args(args):
+    """Pull the real page/site/file out of a tool call for a contextual update."""
+    for key in ("url", "path_or_url"):
+        value = str((args or {}).get(key) or "").strip()
+        if value:
+            match = re.match(r"https?://([^/:\s]+)", value, re.I)
+            return (match.group(1) if match else value)[:80]
+    script = str((args or {}).get("script") or "")
+    match = re.search(r"https?://([^/:\s\"'`]+)", script, re.I)
+    if match:
+        return match.group(1)[:80]
+    folder = str((args or {}).get("folder") or "").strip()
+    return folder[:80] if folder else ""
 
 
-def _auto_progress_text(name):
-    return _AUTO_PROGRESS.get(name, "Working on it - give me a moment.")
+def _auto_progress_text(name, args=None):
+    """Build a specific update from the tool call, not a fixed canned line."""
+    target = _target_from_args(args)
+    if name == "screenshot":
+        return (f"I'm on {target} - taking the screenshot now." if target
+                else "Taking the screenshot now - one moment.")
+    if name == "browser_task":
+        return (f"I'm on {target} in the browser now - one moment." if target
+                else "I'm working in the browser now - one moment.")
+    if name == "web_fetch":
+        return (f"Fetching {target} now - one moment." if target
+                else "Fetching that page now - one moment.")
+    if name == "email_read":
+        return (f"Checking your {target} folder now - one moment." if target
+                else "Checking your inbox now - one moment.")
+    if name == "analyze_image":
+        return "Looking at that image now - one moment."
+    return "Working on it - give me a moment."
 
 
+# Long tools get a saved task so a reconnect cannot forget them. Only the
+# genuinely visible ones post progress: routine shell/vps commands never do.
 SLOW_TOOLS = {"browser_task", "screenshot", "vps_exec", "web_fetch",
               "email_read", "analyze_image", "shell_exec"}
+AUTO_PROGRESS_TOOLS = {"browser_task", "screenshot", "web_fetch",
+                       "email_read", "analyze_image"}
 
 VPS_BROWSER_DIR = os.environ.get("LIAM_VPS_BROWSER_DIR") or "/data/home/liam_browser"
 VPS_PYLIB_DIR = os.environ.get("LIAM_VPS_PYLIB_DIR") or "/data/home/liam_pylibs"

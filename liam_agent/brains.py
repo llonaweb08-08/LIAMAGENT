@@ -125,7 +125,7 @@ def check_status():
     def probe(name, key):
         p = a.BRAINS[name]
         # HCNSec needs ~30s to answer; an 8s probe reports a false timeout.
-        timeout = a.BRAIN_TIMEOUT.get(name, a.ATTEMPT_TIMEOUT)
+        timeout = a.ATTEMPT_TIMEOUT
         ok, why = a._probe(p["base"], p["model"], key, timeout=timeout, brain=name)
         return (name, ok, why)
     first = {name: (p["keys"][0] if p["keys"] else "") for name, p in a.BRAINS.items()}
@@ -260,7 +260,7 @@ def check_key(brain=None, key=1, sender=None):
         if not 1 <= number <= len(keys):
             return f"{name} has {len(keys)} key(s); give a number from 1 to {len(keys)}"
         positions = [number - 1]
-    timeout = a.BRAIN_TIMEOUT.get(name, a.ATTEMPT_TIMEOUT)
+    timeout = a.ATTEMPT_TIMEOUT
     results = []
     for pos in positions:
         k = keys[pos]
@@ -277,9 +277,10 @@ def check_key(brain=None, key=1, sender=None):
 
 
 ATTEMPT_TIMEOUT = 35
-# One model step must have room for three slow MoonMath keys, then HCNSec, then
-# Agnes. HCNSec needs ~30s to answer, so 70s consistently died before Agnes.
-CALL_BUDGET = _env_int("LIAM_CALL_BUDGET", 150, 30, 900)
+# One uniform attempt wait for every brain - there is no per-brain timeout.
+# The budget must still fit three slow keys, then HCNSec, then Agnes, so it is
+# larger than before to keep the last fallback reachable at 35s per attempt.
+CALL_BUDGET = _env_int("LIAM_CALL_BUDGET", 210, 30, 900)
 MAX_ATTEMPTS = 8
 # No hidden provider default. Omitting max_tokens makes each provider apply its
 # own small default, which cuts long replies off mid-sentence. This is a high
@@ -288,9 +289,6 @@ MAX_ATTEMPTS = 8
 MAX_OUTPUT_TOKENS = _env_int("LIAM_MAX_OUTPUT_TOKENS", 16384, 1, 131072)
 # Requested chain: MoonMath keys 1-3, then HCNSec, then Agnes as the last resort.
 FALLBACK_ORDER = ["moonmath", "hcn", "agnes"]
-# HCNSec answers in ~30s but times out below that, so a 20s cap made it look
-# dead. Give it enough room, while the per-step budget above still bounds a turn.
-BRAIN_TIMEOUT = {"moonmath": 20, "agnes": 35, "hcn": 35}
 OFFLINE = os.environ.get("LIAM_OFFLINE") == "1"
 
 
@@ -450,7 +448,7 @@ def call_model(messages, sender, brain=None, tools=None, budget=None):
                 try:
                     out = a._http_post(a.BRAINS[b]["base"].rstrip("/"), model, key, messages,
                                        tools if use_tools else None,
-                                       min(BRAIN_TIMEOUT.get(b, ATTEMPT_TIMEOUT), remaining))
+                                       min(ATTEMPT_TIMEOUT, remaining))
                     out["_brain"] = b
                     out["_model"] = model
                     return out

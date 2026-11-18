@@ -50,7 +50,7 @@ for _directory in (DATA_DIR, OUTBOX_DIR):
 # Load split implementation (also performs DB init and config/people load).
 from liam_agent import brains, integrations, loop, memory, people, registry, runtime, state, web
 from liam_agent.brains import (
-    ATTEMPT_TIMEOUT, BRAIN_STATE, BRAIN_TIMEOUT, BRAINS, CALL_BUDGET, FALLBACK_ORDER,
+    ATTEMPT_TIMEOUT, BRAIN_STATE, BRAINS, CALL_BUDGET, FALLBACK_ORDER,
     LEGACY_BRAIN_STATE, MAX_ATTEMPTS, OFFLINE, PREFERRED_KEY_STATE, QUOTA_COOLDOWN,
     _BRAIN_ALIASES, _attempt_plan, _clear_exhausted, _exhaust_key, _exhausted_at,
     _get_preferred_key, _http_post, _is_transient, _key_exhausted, _mark_exhausted,
@@ -58,7 +58,7 @@ from liam_agent.brains import (
     check_key, check_status, check_tokens, get_brain, set_brain, switch_brain,
 )
 from liam_agent.integrations import (
-    SLOW_TOOLS, VPS_BROWSER_DIR, VPS_PYLIB_DIR, _AUTO_PROGRESS, _SCREENSHOT_SCRIPT, _VPS_ENV,
+    AUTO_PROGRESS_TOOLS, SLOW_TOOLS, VPS_BROWSER_DIR, VPS_PYLIB_DIR, _SCREENSHOT_SCRIPT, _VPS_ENV,
     _auto_progress_text, _browser_script_text, _emit_progress, _local_image_data_url,
     _remote_browser_task, _remote_screenshot, _vps_browser_enabled, _vps_browser_note,
     _vps_ok, _vps_stage, analyze_image, browser_task, leave_group, permission,
@@ -90,6 +90,7 @@ from liam_agent.runtime import (
 from liam_agent.state import _clamp_timeout, _remaining_budget
 from liam_agent.web import (
     _BLOCKED_HOST_SUFFIXES, _SafeRedirectHandler, _ddg_clean_title, _ddg_parse_html,
+    _generous_timeout,
     _ddg_parse_lite, _ddg_target, _http_json, _open_url, _safe_url, _search_brave,
     _search_duckduckgo, _search_serper, _search_tavily, create_tool, email_read,
     file_read, file_write, shell_exec, web_fetch, web_search,
@@ -102,6 +103,7 @@ _DEADLINE = state._DEADLINE
 _LAST_PROGRESS_AT = state._LAST_PROGRESS_AT
 _LAST_PROGRESS_TEXT = state._LAST_PROGRESS_TEXT
 _LAST_PROGRESS_EMIT_AT = state._LAST_PROGRESS_EMIT_AT
+_PROGRESS_COUNT = state._PROGRESS_COUNT
 _EXHAUSTED = state._EXHAUSTED
 _vps_browser_retry_at = state._vps_browser_retry_at
 

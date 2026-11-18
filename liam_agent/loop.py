@@ -198,6 +198,8 @@ def run_agent(user_message, sender, is_group, group_jid, mentioned, reply_to, no
     a._LAST_PROGRESS_TEXT = ""
     state._LAST_PROGRESS_EMIT_AT = 0.0
     a._LAST_PROGRESS_EMIT_AT = 0.0
+    state._PROGRESS_COUNT = 0
+    a._PROGRESS_COUNT = 0
     trace = {"events": []}
     tool_failures = []
     task_started = False
@@ -242,7 +244,7 @@ def run_agent(user_message, sender, is_group, group_jid, mentioned, reply_to, no
         return text
 
     from .runtime import MAX_STEPS, MAX_TOOL_CALLS, TOOL_RESULT_MAX
-    from .integrations import SLOW_TOOLS
+    from .integrations import AUTO_PROGRESS_TOOLS, SLOW_TOOLS
 
     for _step in range(MAX_STEPS):
         remaining = turn_deadline - time.monotonic()
@@ -297,12 +299,13 @@ def run_agent(user_message, sender, is_group, group_jid, mentioned, reply_to, no
                     if not task_started:
                         a.set_active_task(chat_key, "running", turn[:1200])
                         task_started = True
-                    now = time.monotonic()
-                    if now - state._LAST_PROGRESS_AT >= _env_int("LIAM_PROGRESS_GAP", 20, 5, 600):
-                        a._emit_progress(a._auto_progress_text(name))
-                        ts = time.monotonic()
-                        state._LAST_PROGRESS_AT = ts
-                        a._LAST_PROGRESS_AT = ts
+                    if name in AUTO_PROGRESS_TOOLS:
+                        now = time.monotonic()
+                        if now - state._LAST_PROGRESS_AT >= _env_int("LIAM_PROGRESS_GAP", 20, 5, 600):
+                            a._emit_progress(a._auto_progress_text(name, args))
+                            ts = time.monotonic()
+                            state._LAST_PROGRESS_AT = ts
+                            a._LAST_PROGRESS_AT = ts
                 _t = time.monotonic()
                 try:
                     result = str(tool_map[name](**args))
