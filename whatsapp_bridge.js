@@ -2931,6 +2931,24 @@ async function handleAction(d, ctx = {}) {
     return "stopping…";
   }
 
+  if (action === "stop_agent") {
+    // Hard stop straight from the dashboard. Killing the process clears any
+    // pending turn immediately, instead of waiting for the in-agent stop flag
+    // to be noticed mid-turn. A later power-on just respawns the agent.
+    assertOwner(d);
+    stopAgent();
+    return "stopping…";
+  }
+
+  if (action === "start_agent") {
+    // Power the agent back up. Clearing the stop flag first means a fresh turn
+    // is not born already stopped.
+    assertOwner(d);
+    try { writeFileAtomic(STOP_FILE, "0"); } catch (e) {}
+    const proc = startAgent();
+    return proc ? "starting…" : "the agent could not be started";
+  }
+
   if (action === "vps_exec") {
     // Members and admins may *request* a pentest command, but an owner must
     // approve each one. Owners run directly.

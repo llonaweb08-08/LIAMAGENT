@@ -447,6 +447,15 @@ test('bridge endpoint security and actions', async (t) => {
     assert.equal(fs.readFileSync(path.join(DATA, 'stop_flag'), 'utf8'), '1');
   });
 
+  await t.test('hard-stops the agent and can power it back on from the tool endpoint', async () => {
+    const hardStop = await post({ action: 'stop_agent', sender: OWNER });
+    assert.equal(hardStop.status, 200);
+    assert.equal(hardStop.json.ok, true);
+    const start = await post({ action: 'start_agent', sender: OWNER });
+    assert.equal(start.status, 200);
+    assert.equal(start.json.ok, true);
+  });
+
   await t.test('exposes health, readiness and status separately', async () => {
     const health = await request(port, { method: 'GET', path: '/health' });
     assert.equal(health.status, 200);

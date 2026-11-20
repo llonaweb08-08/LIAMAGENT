@@ -21,9 +21,10 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # sqlite3 gives the bridge a WAL-safe snapshot tool, and ffmpeg converts the
 # voice to OGG/Opus (edge-tts returns MP3). curl is used by the HEALTHCHECK.
 # The official Python image already provides ensurepip, so python3-pip and
-# python3-venv are not needed.
+# python3-venv are not needed. libatomic1 is required by the Playwright chromium
+# driver (libatomic.so.1); --with-deps does not always pull it in on slim images.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates curl ffmpeg gzip sqlite3 tar \
+        ca-certificates curl ffmpeg gzip sqlite3 tar libatomic1 \
     && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*
