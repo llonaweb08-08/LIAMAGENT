@@ -342,7 +342,7 @@ def _vps_stage(name, text):
     if len(text) > 40000:
         raise ValueError("script is too large to send to the VM")
     path = VPS_BROWSER_DIR + "/" + name
-    agent_mod().vps_exec("mkdir -p " + shlex.quote(VPS_BROWSER_DIR), timeout=30, sender=OWNERS[0])
+    agent_mod().vps_exec("mkdir -p " + shlex.quote(VPS_BROWSER_DIR), timeout=120, sender=OWNERS[0])
     agent_mod().wa.vps_upload(path, base64.b64encode(text.encode("utf-8")).decode("ascii"),
                               sender=OWNERS[0])
     return path
@@ -353,36 +353,63 @@ def _vps_ok(output):
     return bool(match) and match.group(1) == "0"
 
 
+def _vps_script_exec(name, text, run_command, timeout):
+    """Write a script and run it in one VM exec (one wake/check cycle).
+
+    A separate mkdir + upload + exec makes an idle box wake up three times for
+    one browser task, and the short staging call can surface as a bridge
+    timeout. A single heredoc command keeps the whole task in the long,
+    generous exec. Oversized scripts keep the upload path so nothing that
+    worked before is lost.
+    """
+    script = str(text or "")
+    if len(script) > 40000:
+        raise ValueError("script is too large to send to the VM")
+    path = VPS_BROWSER_DIR + "/" + name
+    delimiter = "LIAM_PY_" + os.urandom(8).hex().upper()
+    while delimiter in script:
+        delimiter = "LIAM_PY_" + os.urandom(8).hex().upper()
+    command = (
+        "mkdir -p %s && cat > %s <<'%s'\n%s\n%s\n%s"
+        % (shlex.quote(VPS_BROWSER_DIR), shlex.quote(path), delimiter,
+           script, delimiter, run_command)
+    )
+    if len(command) > 7800:
+        _vps_stage(name, script)
+        command = run_command
+    output = agent_mod().vps_exec(command, timeout=timeout, sender=OWNERS[0])
+    if not _vps_ok(output):
+        raise RuntimeError("remote script failed")
+    return output
+
+
 _VPS_ENV = ("export PYTHONPATH=%s; export LIAM_CHROMIUM_PATH=$(command -v chromium "
             "|| command -v chromium-browser || command -v google-chrome "
             "|| command -v google-chrome-stable || true); " % VPS_PYLIB_DIR)
 
 
 def _remote_browser_task(script):
-    path = _vps_stage("task_%s.py" % os.urandom(6).hex(),
-                      _browser_script_text(script, extensions=False))
-    command = "cd %s && %sLIAM_USER_AGENT=%s python3 %s" % (
+    name = "task_%s.py" % os.urandom(6).hex()
+    path = VPS_BROWSER_DIR + "/" + name
+    run = "cd %s && %sLIAM_USER_AGENT=%s python3 %s" % (
         shlex.quote(VPS_BROWSER_DIR), _VPS_ENV,
         shlex.quote(liam_keys.BROWSER_UA), shlex.quote(path))
-    output = agent_mod().vps_exec(
-        command, timeout=_clamp_timeout(_env_int("LIAM_BROWSER_TIMEOUT", 1800, 10, 3600)),
-        sender=OWNERS[0])
-    if not _vps_ok(output):
-        raise RuntimeError("remote browser task failed")
+    output = _vps_script_exec(
+        name, _browser_script_text(script, extensions=False), run,
+        _clamp_timeout(_env_int("LIAM_BROWSER_TIMEOUT", 1800, 10, 3600)))
     return output[:8000]
 
 
 def _remote_screenshot(to, url, sender):
-    script_path = _vps_stage("shot_%s.py" % os.urandom(6).hex(), _SCREENSHOT_SCRIPT)
+    name = "shot_%s.py" % os.urandom(6).hex()
+    script_path = VPS_BROWSER_DIR + "/" + name
     remote_png = VPS_BROWSER_DIR + "/shot_%s.png" % os.urandom(6).hex()
     command = "cd %s && %spython3 %s %s %s %s" % (
         shlex.quote(VPS_BROWSER_DIR), _VPS_ENV, shlex.quote(script_path),
         shlex.quote(url), shlex.quote(remote_png), shlex.quote(liam_keys.BROWSER_UA))
-    output = agent_mod().vps_exec(
-        command, timeout=_clamp_timeout(_env_int("LIAM_SCREENSHOT_TIMEOUT", 900, 20, 1800)),
-        sender=OWNERS[0])
-    if not _vps_ok(output):
-        raise RuntimeError("remote screenshot failed")
+    _vps_script_exec(
+        name, _SCREENSHOT_SCRIPT, command,
+        _clamp_timeout(_env_int("LIAM_SCREENSHOT_TIMEOUT", 900, 20, 1800)))
     data = agent_mod().wa.vps_download(remote_png, sender=OWNERS[0])
     if not data:
         raise RuntimeError("remote screenshot was empty")

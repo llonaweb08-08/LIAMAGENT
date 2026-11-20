@@ -78,7 +78,10 @@ def _post(action: str, http_timeout: float = 60, **kwargs) -> str:
             timeout=http_timeout,
         )
     except requests.RequestException as exc:
-        raise ToolError("the WhatsApp bridge is not reachable") from exc
+        # Name the failure type so logs can tell a timeout from a refused
+        # connection. Never echo the URL, headers or tokens.
+        raise ToolError(
+            "the WhatsApp bridge is not reachable (%s)" % type(exc).__name__) from exc
 
     try:
         data = response.json()

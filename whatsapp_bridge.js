@@ -962,7 +962,8 @@ function runProbeScript(args, timeoutMs) {
     try {
       proc = spawn(bin, ["-X", "utf8", "debug_probe.py", ...args], {
         cwd: BASE_DIR,
-        env: { ...process.env, PYTHONUTF8: "1", PYTHONIOENCODING: "utf-8" },
+        env: { ...process.env, PYTHONUTF8: "1", PYTHONIOENCODING: "utf-8",
+               LIAM_OWNER_TOKEN: OWNER_TOKEN },
       });
     } catch (e) { return resolve({ error: String(e) }); }
     let out = "", err = "";

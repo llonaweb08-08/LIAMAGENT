@@ -880,6 +880,13 @@ test('bridge endpoint security and actions', async (t) => {
     }
   });
 
+  await t.test('diagnostic probe subprocess receives the owner token', async () => {
+    const source = fs.readFileSync(path.join(APP, 'whatsapp_bridge.js'), 'utf8');
+    const start = source.indexOf('function runProbeScript');
+    const block = source.slice(start, start + 2000);
+    assert.match(block, /LIAM_OWNER_TOKEN:\s*OWNER_TOKEN/);
+  });
+
   await t.test('captioned media keeps its caption and its attachment hint', async () => {
     assert.equal(bridge.displayText({ imageMessage: { caption: 'look' } }, 'imageMessage'), '[sent an image]: look');
     assert.equal(bridge.displayText({ imageMessage: {} }, 'imageMessage'), '[sent an image]');

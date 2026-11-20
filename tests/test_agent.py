@@ -150,6 +150,15 @@ class ToolClientTests(unittest.TestCase):
             with self.assertRaises(wa.ToolError) as ctx:
                 wa._post("send", to="123", text="hi")
         self.assertIn("not reachable", str(ctx.exception))
+        self.assertIn("ConnectionError", str(ctx.exception))
+        self.assertNotIn("boom", str(ctx.exception))
+
+    def test_timeout_names_the_failure_without_leaking_detail(self):
+        with mock.patch.object(wa.requests, "post", side_effect=wa.requests.Timeout("secret-url")):
+            with self.assertRaises(wa.ToolError) as ctx:
+                wa._post("vps_exec", command="id", sender=OWNER)
+        self.assertIn("Timeout", str(ctx.exception))
+        self.assertNotIn("secret-url", str(ctx.exception))
 
     def test_send_voice_posts_mimetype_and_cleans_up(self):
         path = str(Path(TEST_DATA) / "voice.wav")
@@ -316,6 +325,18 @@ class AgentToolTests(unittest.TestCase):
                 with self.assertRaises(RuntimeError):
                     agent.browser_task("print(1)")
             self.assertTrue(agent._vps_browser_enabled())
+
+    def test_remote_browser_task_uses_one_box_exec(self):
+        # Staging must not wake the box three times (mkdir + upload + exec).
+        with mock.patch.object(agent, "vps_exec", return_value="exit=0\nTITLE ok") as exec_call, \
+                mock.patch.object(agent.wa, "vps_upload") as upload:
+            agent._remote_browser_task("print('hi')")
+        exec_call.assert_called_once()
+        upload.assert_not_called()
+        command = exec_call.call_args.args[0]
+        self.assertIn("<<'LIAM_PY_", command)
+        self.assertIn("python3", command)
+        self.assertGreaterEqual(exec_call.call_args.kwargs["timeout"], 10)
 
     def test_browser_offload_is_off_without_a_key_or_when_disabled(self):
         agent._vps_browser_note(True)
