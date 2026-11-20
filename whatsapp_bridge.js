@@ -45,7 +45,7 @@ for (const level of ["log", "warn", "error"]) {
     try {
       const line = args.map(safeInspect).join(" ").slice(0, 800);
       RECENT_LOGS.push({ at: Date.now(), level, line });
-      while (RECENT_LOGS.length > 80) RECENT_LOGS.shift();
+      while (RECENT_LOGS.length > 400) RECENT_LOGS.shift();
       if (TOKEN_LOG_RE.test(line)) {
         TOKEN_LOGS.push({ at: Date.now(), level, line });
         while (TOKEN_LOGS.length > 40) TOKEN_LOGS.shift();
@@ -89,6 +89,9 @@ const TOKEN_FILE = path.join(DATA_DIR, "tool_token");
 const PAIR_TOKEN_FILE = path.join(DATA_DIR, "pair_token");
 const KNOWN_MEMBERS_FILE = path.join(DATA_DIR, "known_members.json");
 const STOP_FILE = path.join(DATA_DIR, "stop_flag");
+// Deliberate "stay down" state. A plain hard stop is transient: the watchdog
+// brings the agent back. This marker tells the watchdog the owner meant it.
+const OFFLINE_FILE = path.join(DATA_DIR, "agent_offline");
 const QR_FILE = path.join(DATA_DIR, "qr.png");
 const DM_OPEN_FILE = path.join(DATA_DIR, "dm_open");
 
@@ -150,6 +153,21 @@ const PORT = resolvePort();
 for (const dir of [DATA_DIR, OUTBOX_DIR]) {
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   try { fs.chmodSync(dir, 0o700); } catch (e) {}
+}
+
+// The marker survives a bridge restart, so a deploy cannot silently undo the
+// owner's decision to keep Liam offline.
+let agentOffline = false;
+try { agentOffline = fs.existsSync(OFFLINE_FILE); } catch (e) { agentOffline = false; }
+function setAgentOffline(on) {
+  agentOffline = !!on;
+  try {
+    if (agentOffline) writeFileAtomic(OFFLINE_FILE, "1");
+    else { try { fs.unlinkSync(OFFLINE_FILE); } catch (e) {} }
+  } catch (e) {
+    console.log("warn: could not persist offline state:",
+      String(e && e.message ? e.message : e).slice(0, 160));
+  }
 }
 
 const CONFIG = require("./liam_config.json");
@@ -666,6 +684,10 @@ function bridgeStateSnapshot() {
   return {
     v: 1,
     savedAt: Date.now(),
+    // Render's free disk is wiped on redeploy, so the offline decision must
+    // travel with the rest of the state or a deploy would quietly bring the
+    // agent back online against the owner's wishes.
+    offline: agentOffline,
     // Deep-enough copy: the caller may mutate TEMP before the debounced upload,
     // and the snapshot must reflect the state at the moment it was taken.
     temp: Object.fromEntries(Object.entries(TEMP).map(([jid, map]) => [jid, { ...map }])),
@@ -775,6 +797,9 @@ function applyBridgeState(state) {
   trimPending(pendingPerms);
   trimPending(pendingTools);
   sweepTemp(now); // drop anything that expired while we were down
+  // Older snapshots have no offline field; leave the file-based value alone
+  // in that case rather than guessing.
+  if (typeof state.offline === "boolean") setAgentOffline(state.offline);
 }
 
 function saveBridgeStateLocal() {
@@ -990,6 +1015,9 @@ function runProbeScript(args, timeoutMs) {
 function startAgent() {
   // Tests drive the HTTP surface without spawning Python.
   if (String(process.env.LIAM_DISABLE_AGENT || "") === "1") return null;
+  // Offline is a deliberate state, not a crash. Only an explicit power-on
+  // clears it, so nothing (startup, watchdog, deploy) quietly overrides it.
+  if (agentOffline) return null;
   if (agentProc && agentProc.exitCode === null && !agentProc.killed) return agentProc;
   let bin;
   try { bin = pythonBin(); }
@@ -1091,10 +1119,10 @@ function scheduleAgentRestart() {
   // A crash must not make /ready fail just because the child died. WhatsApp is
   // still healthy here, so bring the assistant back without recycling the whole
   // container (which would drop the socket and held state).
-  if (agentRestartTimer || shuttingDown || waState !== "ready") return;
+  if (agentOffline || agentRestartTimer || shuttingDown || waState !== "ready") return;
   agentRestartTimer = setTimeout(() => {
     agentRestartTimer = null;
-    if (shuttingDown || waState !== "ready" || agentProc) return;
+    if (agentOffline || shuttingDown || waState !== "ready" || agentProc) return;
     console.log("warn: restarting the agent process after an unexpected exit");
     startAgent();
   }, 1000);
@@ -2941,12 +2969,25 @@ async function handleAction(d, ctx = {}) {
     return "stopping…";
   }
 
-  if (action === "start_agent") {
-    // Power the agent back up. Clearing the stop flag first means a fresh turn
-    // is not born already stopped.
+  if (action === "offline") {
+    // Deliberate stay-down: kill the child and leave a marker the watchdog
+    // honours. WhatsApp stays linked and the bridge stays up.
     assertOwner(d);
+    setAgentOffline(true);
+    try { writeFileAtomic(STOP_FILE, "1"); } catch (e) {}
+    stopAgent();
+    scheduleBridgeStateSave();
+    return "offline";
+  }
+
+  if (action === "start_agent") {
+    // Power the agent back up. Clearing the offline marker and the stop flag
+    // first means a fresh turn is not born already stopped or suppressed.
+    assertOwner(d);
+    setAgentOffline(false);
     try { writeFileAtomic(STOP_FILE, "0"); } catch (e) {}
     const proc = startAgent();
+    scheduleBridgeStateSave();
     return proc ? "starting…" : "the agent could not be started";
   }
 
@@ -3183,6 +3224,10 @@ function statusPayload() {
     detail: waStateDetail,
     whatsappReady: waState === "ready",
     agentRunning: !!(agentProc && agentProc.exitCode === null && !agentProc.killed),
+    agentOffline,
+    mode: agentOffline ? "offline"
+      : (waState !== "ready" ? "unlinked"
+        : (agentProc && agentProc.exitCode === null && !agentProc.killed ? "online" : "agent-down")),
     needsQr: waState === "needs_qr",
     hasSessionData: hasSessionData(),
     linkedMarker: hasLinkMarker(),
@@ -3264,6 +3309,167 @@ function pairPage(opts = {}) {
     `${tokenField}` +
     `<button type="submit">Get pairing code</button></form>` +
     `<p style="opacity:.7">This page only asks WhatsApp for a code when you press the button. Sensitive actions use a secure session (no token in the URL).</p>`);
+}
+
+// ---------------------------------------------------------------------------
+// Owner dashboard
+// ---------------------------------------------------------------------------
+// dashboard.html is a static shell loaded once. Only the CSP nonce and the bot
+// phone are injected, so the page can stay a readable file instead of a giant
+// template living inside this process.
+let DASHBOARD_HTML = "";
+try {
+  DASHBOARD_HTML = fs.readFileSync(path.join(BASE_DIR, "dashboard.html"), "utf8");
+} catch (e) {
+  console.log("warn: dashboard.html could not be loaded:",
+    String(e && e.message ? e.message : e).slice(0, 160));
+}
+
+function formatPairCode(code) {
+  const clean = String(code || "").replace(/[^0-9A-Za-z]/g, "").toUpperCase();
+  return clean.length === 8 ? clean.slice(0, 4) + "-" + clean.slice(4) : clean;
+}
+
+function dashboardCsp(nonce) {
+  const script = nonce ? `script-src 'nonce-${nonce}'; ` : "script-src 'none'; ";
+  return {
+    "Content-Security-Policy":
+      "default-src 'none'; style-src 'unsafe-inline'; " + script +
+      "connect-src 'self'; img-src data:; form-action 'self'; " +
+      "base-uri 'none'; frame-ancestors 'none'",
+  };
+}
+
+function dashboardPage(nonce) {
+  if (!DASHBOARD_HTML) {
+    return pageShell("Liam dashboard",
+      "<h1>Dashboard unavailable</h1><p>dashboard.html is missing from this deployment.</p>");
+  }
+  return DASHBOARD_HTML
+    .replace(/__NONCE__/g, nonce)
+    .replace(/__BOT_PHONE__/g, escapeHtml(BOT_PHONE));
+}
+
+function dashboardLoginPage(error) {
+  const msg = error ? `<p class="err">${escapeHtml(error)}</p>` : "";
+  return `<!doctype html><html><head><meta charset="utf-8">` +
+    `<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">` +
+    `<meta name="theme-color" content="#05070a">` +
+    `<title>liam // owner access</title><style>` +
+    `:root{color-scheme:dark}*{box-sizing:border-box}` +
+    `body{margin:0;min-height:100vh;display:grid;place-items:center;padding:1.5rem;` +
+    `background:#05070a;color:#c8d6df;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}` +
+    `body:before{content:"";position:fixed;inset:0;pointer-events:none;opacity:.4;` +
+    `background-image:linear-gradient(rgba(94,234,212,.035) 1px,transparent 1px),` +
+    `linear-gradient(90deg,rgba(94,234,212,.035) 1px,transparent 1px);background-size:28px 28px}` +
+    `.gate{position:relative;width:min(100%,24rem);border:1px solid #16222b;background:#0a0f14;` +
+    `padding:1.4rem;box-shadow:0 0 60px rgba(94,234,212,.06)}` +
+    `.gate:before,.gate:after{content:"";position:absolute;width:14px;height:14px;border-color:#5eead4;border-style:solid}` +
+    `.gate:before{top:-1px;left:-1px;border-width:1px 0 0 1px}` +
+    `.gate:after{bottom:-1px;right:-1px;border-width:0 1px 1px 0}` +
+    `.kicker{margin:0 0 .4rem;font-size:.62rem;letter-spacing:.28em;color:#5eead4;text-transform:uppercase}` +
+    `h1{margin:0;font-size:1.35rem;font-weight:600;letter-spacing:.06em;text-transform:uppercase}` +
+    `.sub{margin:.6rem 0 1.2rem;color:#6b7f8c;font-size:.8rem;line-height:1.5}` +
+    `label{display:block;margin:0 0 .35rem;font-size:.62rem;letter-spacing:.18em;color:#6b7f8c;text-transform:uppercase}` +
+    `input{width:100%;padding:.75rem .8rem;background:#05070a;color:#e6f1f5;border:1px solid #1f3a45;` +
+    `border-radius:2px;font:inherit;font-size:1rem;outline:none}` +
+    `input:focus{border-color:#5eead4;box-shadow:0 0 0 1px rgba(94,234,212,.25)}` +
+    `button{width:100%;margin-top:.8rem;padding:.8rem;background:#5eead4;color:#04110f;border:0;` +
+    `font:inherit;font-weight:700;letter-spacing:.14em;text-transform:uppercase;cursor:pointer}` +
+    `button:active{transform:translateY(1px)}` +
+    `.err{margin:.8rem 0 0;padding:.55rem .7rem;border-left:2px solid #f87171;` +
+    `background:rgba(248,113,113,.08);color:#fca5a5;font-size:.75rem}` +
+    `.fine{margin:1rem 0 0;color:#4b5f6b;font-size:.65rem;line-height:1.5}` +
+    `</style></head><body><main class="gate">` +
+    `<p class="kicker">liam // control</p><h1>owner access</h1>` +
+    `<p class="sub">enter the pairing token to open the control surface. this page is owner-only.</p>` +
+    msg +
+    `<form method="post" action="/dashboard/login">` +
+    `<label for="token">pairing token</label>` +
+    `<input id="token" name="token" type="password" autocomplete="current-password" required autofocus>` +
+    `<button type="submit">unlock</button></form>` +
+    `<p class="fine">the token is exchanged for an http-only session cookie and is never kept in the url.</p>` +
+    `</main></body></html>`;
+}
+
+function dashboardStatePayload() {
+  const agentAlive = !!(agentProc && agentProc.exitCode === null && !agentProc.killed);
+  return {
+    ok: true,
+    waState,
+    waDetail: waStateDetail,
+    linked: waState === "ready",
+    agentRunning: agentAlive,
+    agentOffline,
+    mode: agentOffline ? "offline"
+      : (waState !== "ready" ? "unlinked" : (agentAlive ? "online" : "agent-down")),
+    uptimeSeconds: Math.round((Date.now() - STARTED_AT) / 1000),
+    memoryMiB: containerMemoryMiB(),
+    inboundCount,
+    lastInboundAt: lastInboundAt || null,
+    lastOutboundAt: lastOutboundAt || null,
+    lastAgentRequestAt: lastAgentRequestAt || null,
+    lastAgentStartedAt: lastAgentStartedAt || null,
+    lastAgentReplyAt: lastAgentReplyAt || null,
+    lastTurnMs: (lastAgentStartedAt && lastAgentReplyAt)
+      ? Math.max(0, lastAgentReplyAt - lastAgentStartedAt) : null,
+    lastQueueWaitMs: (lastAgentRequestAt && lastAgentStartedAt)
+      ? Math.max(0, lastAgentStartedAt - lastAgentRequestAt) : null,
+    lastAgentError: String(lastAgentError || "").slice(0, 400),
+    sendingBlocked: reachoutLockActive(),
+    pendingToolApprovals: pendingTools.size,
+    pendingGroupPermissions: pendingPerms.size,
+    botPhone: BOT_PHONE,
+    pairCooldownMs: PAIRING_COOLDOWN_MS,
+    lastPairAt: lastPairAt || null,
+    lastPairCode: lastPairCode ? formatPairCode(lastPairCode) : null,
+    pairingError: pairingError || "",
+    config: {
+      image: !!process.env.GOOGLE_API_KEY,
+      voice: true,
+      tavily: !!process.env.TAVILY_API_KEY,
+      brave: !!process.env.BRAVE_API_KEY,
+      serper: !!process.env.SERPER_API_KEY,
+      instabox: !!INSTABOX_API_KEY,
+      email: !!(process.env.LIAM_EMAIL_HOST && process.env.LIAM_EMAIL_USER
+        && process.env.LIAM_EMAIL_PASSWORD),
+    },
+  };
+}
+
+function readJsonBody(req, limit) {
+  return readBody(req, limit).then((raw) => {
+    if (!raw) return {};
+    try { return JSON.parse(raw); }
+    catch (e) { throw new BadRequest("invalid json"); }
+  });
+}
+
+function dashboardPost(req, res, url, run) {
+  (async () => {
+    try {
+      if (!/^application\/json(?:\s*;|$)/i.test(String(req.headers["content-type"] || ""))) {
+        req.resume();
+        return sendJson(res, 415, { ok: false, error: "content-type must be application/json" });
+      }
+      const auth = pairAuth(req, url);
+      if (!auth.ok || auth.via === "query") {
+        return sendJson(res, 401, { ok: false, error: "unauthorized" });
+      }
+      if (!sameOriginRequest(req)) {
+        return sendJson(res, 403, { ok: false, error: "invalid origin" });
+      }
+      const data = await readJsonBody(req, 16 * 1024);
+      const result = await run(data);
+      return sendJson(res, 200, { ok: true, ...(result || {}) });
+    } catch (e) {
+      const status = e instanceof BadRequest ? 400 : 500;
+      return sendJson(res, status, {
+        ok: false,
+        error: String(e && e.message ? e.message : e).slice(0, 600),
+      });
+    }
+  })();
 }
 
 function readBody(req, limit) {
@@ -3517,7 +3723,7 @@ async function requestPairing(phone) {
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url || "/", "http://localhost");
   const pathname = url.pathname;
-  const publicGet = req.method === "GET" && ["/health", "/ready", "/status", "/qr", "/pair", "/diag", "/cancelpair", "/reset"].includes(pathname);
+  const publicGet = req.method === "GET" && ["/health", "/ready", "/status", "/qr", "/pair", "/diag", "/cancelpair", "/reset", "/dashboard", "/dashboard/state", "/dashboard/logs"].includes(pathname);
 
   if (publicGet) {
     if (pathname === "/health") {
@@ -3536,6 +3742,34 @@ const server = http.createServer(async (req, res) => {
     if (pathname === "/status") {
       sendJson(res, 200, statusPayload());
       return;
+    }
+    if (pathname === "/dashboard") {
+      // The pairing token is the owner's browser credential. It is accepted
+      // once in the query only to establish the secure session cookie, then
+      // stripped from the URL. The owner token never reaches the browser.
+      const auth = pairAuth(req, url);
+      if (!auth.ok) return sendHtml(res, 403, dashboardLoginPage(""), dashboardCsp(""));
+      if (auth.via === "query") {
+        return sendHtml(res, 302, "", { Location: "/dashboard", "Set-Cookie": pairCookieHeader(req) });
+      }
+      const nonce = crypto.randomBytes(18).toString("base64");
+      return sendHtml(res, 200, dashboardPage(nonce), dashboardCsp(nonce));
+    }
+    if (pathname === "/dashboard/state") {
+      const auth = pairAuth(req, url);
+      if (!auth.ok || auth.via === "query") {
+        return sendJson(res, 401, { ok: false, error: "unauthorized" });
+      }
+      return sendJson(res, 200, dashboardStatePayload());
+    }
+    if (pathname === "/dashboard/logs") {
+      const auth = pairAuth(req, url);
+      if (!auth.ok || auth.via === "query") {
+        return sendJson(res, 401, { ok: false, error: "unauthorized" });
+      }
+      const limit = Math.min(300, Math.max(1,
+        Number.parseInt(url.searchParams.get("limit") || "200", 10) || 200));
+      return sendJson(res, 200, { ok: true, logs: redactLogs(RECENT_LOGS.slice(-limit)) });
     }
     if (pathname === "/cancelpair") {
       const auth = pairAuth(req, url);
@@ -4231,6 +4465,67 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // Owner dashboard. The browser authenticates with the pairing session cookie;
+  // LIAM_OWNER_TOKEN is never sent to it. Mutations are JSON POSTs guarded by
+  // sameOriginRequest, matching the existing BR-3/BR-18 rule.
+  if (req.method === "POST" && pathname === "/dashboard/login") {
+    (async () => {
+      try {
+        const raw = await readBody(req, 8 * 1024);
+        const type = String(req.headers["content-type"] || "");
+        const data = /application\/json/i.test(type)
+          ? JSON.parse(raw || "{}")
+          : Object.fromEntries(new URLSearchParams(raw || ""));
+        if (!sameOriginRequest(req)) {
+          return sendHtml(res, 403, dashboardLoginPage("invalid request origin"), dashboardCsp(""));
+        }
+        if (!pairTokenOk(String(data.token || ""))) {
+          // Slow down guessing without making a legitimate retry painful.
+          await sleep(350);
+          return sendHtml(res, 403, dashboardLoginPage("invalid token"), dashboardCsp(""));
+        }
+        return sendHtml(res, 303, "", { Location: "/dashboard", "Set-Cookie": pairCookieHeader(req) });
+      } catch (e) {
+        return sendHtml(res, 400, dashboardLoginPage("could not read the request"), dashboardCsp(""));
+      }
+    })();
+    return;
+  }
+
+  if (req.method === "POST" && pathname === "/dashboard/action") {
+    return dashboardPost(req, res, url, async (data) => {
+      const action = String(data.action || "");
+      if (!["stop", "stop_agent", "offline", "start_agent"].includes(action)) {
+        throw new BadRequest("unknown action");
+      }
+      console.log("info: dashboard action", action);
+      const msg = await handleAction({ action, sender: OWNERS[0] });
+      return { msg: String(msg == null ? "" : msg) };
+    });
+  }
+
+  if (req.method === "POST" && pathname === "/dashboard/exec") {
+    return dashboardPost(req, res, url, async (data) => {
+      const command = String(data.command || "").trim();
+      if (!command) throw new BadRequest("command is empty");
+      if (command.length > 8000) throw new BadRequest("command is too long");
+      const timeout = Math.min(3600, Math.max(1, Number.parseInt(data.timeout, 10) || 120));
+      // Never log the command itself: it may contain a secret.
+      console.log("info: dashboard exec (" + command.length + " chars)");
+      const output = await instaboxExec(command, timeout, String(data.cwd || "").slice(0, 500));
+      return { output: String(output == null ? "" : output) };
+    });
+  }
+
+  if (req.method === "POST" && pathname === "/dashboard/pair") {
+    return dashboardPost(req, res, url, async (data) => {
+      const phone = String(data.phone || "").replace(/\D/g, "");
+      console.log("info: dashboard pairing code requested");
+      const code = await requestPairing(phone);
+      return { code: formatPairCode(code), requestedAt: lastPairAt || Date.now() };
+    });
+  }
+
   // Any other GET (including "/") is not a tool call.
   if (req.method !== "POST") {
     req.resume();
@@ -4452,6 +4747,7 @@ module.exports = {
   sync, pythonBin, sanitizeChromeLocks: sync.sanitizeChromeLocks,
   statusPayload, TEMP, tempDecision, sweepTemp, _setState: setWaState,
   stopAgent, initializeWhatsApp, hasSessionData, requestPairing, instaboxExec,
+  setAgentOffline, isAgentOffline: () => agentOffline, dashboardStatePayload,
   pendingPerms, pendingTools, PAIR_TOKEN, ownerIdsInGroup, sendApprovalPrompt,
   createToolApproval, executeToolApproval, handleApprovalCommand, createPermissionRequest,
   dmAllowed, setDmOpen, rememberKnownMember, knownMembers,

@@ -21,6 +21,7 @@ const OUTBOX = path.join(DATA, 'outbox');
 fs.mkdirSync(OUTBOX, { recursive: true });
 
 fs.copyFileSync(path.join(ROOT, 'whatsapp_bridge.js'), path.join(APP, 'whatsapp_bridge.js'));
+fs.copyFileSync(path.join(ROOT, 'dashboard.html'), path.join(APP, 'dashboard.html'));
 fs.copyFileSync(path.join(ROOT, 'supabase_sync.js'), path.join(APP, 'supabase_sync.js'));
 fs.copyFileSync(path.join(ROOT, 'liam_config.json'), path.join(APP, 'liam_config.json'));
 
@@ -885,6 +886,108 @@ test('bridge endpoint security and actions', async (t) => {
     const start = source.indexOf('function runProbeScript');
     const block = source.slice(start, start + 2000);
     assert.match(block, /LIAM_OWNER_TOKEN:\s*OWNER_TOKEN/);
+  });
+
+  const dashboardCookie = `liam_pair=${encodeURIComponent(bridge.PAIR_TOKEN)}`;
+  const dashboardGet = (path, extra = {}) => request(port, { method: 'GET', path, ...extra });
+  const dashboardPost = (path, body, extra = {}) => request(port, {
+    method: 'POST', path, cookie: dashboardCookie, body, ...extra,
+  });
+
+  await t.test('dashboard requires the pairing session and strips the token from the url', async () => {
+    const denied = await dashboardGet('/dashboard');
+    assert.equal(denied.status, 403);
+    assert.match(denied.text, /owner access/);
+
+    const bootstrap = await dashboardGet(`/dashboard?token=${bridge.PAIR_TOKEN}`);
+    assert.equal(bootstrap.status, 302);
+    assert.equal(bootstrap.headers.location, '/dashboard');
+    assert.match(String(bootstrap.headers['set-cookie']), /liam_pair=/);
+    assert.match(String(bootstrap.headers['set-cookie']), /HttpOnly/);
+    assert.match(String(bootstrap.headers['set-cookie']), /SameSite=Strict/);
+
+    const page = await dashboardGet('/dashboard', { cookie: dashboardCookie });
+    assert.equal(page.status, 200);
+    assert.match(page.text, /liam \/\/ control/);
+    const csp = String(page.headers['content-security-policy']);
+    assert.match(csp, /script-src 'nonce-/);
+    assert.match(csp, /connect-src 'self'/);
+    assert.doesNotMatch(page.text, /__NONCE__/);
+  });
+
+  await t.test('dashboard state and logs need the session', async () => {
+    assert.equal((await dashboardGet('/dashboard/state')).status, 401);
+    assert.equal((await dashboardGet('/dashboard/logs')).status, 401);
+
+    const state = await dashboardGet('/dashboard/state', { cookie: dashboardCookie });
+    assert.equal(state.status, 200);
+    assert.equal(state.json.ok, true);
+    assert.equal(state.json.botPhone, bridge.dashboardStatePayload().botPhone);
+    assert.ok(['online', 'offline', 'agent-down', 'unlinked'].includes(state.json.mode));
+
+    const logs = await dashboardGet('/dashboard/logs?limit=5', { cookie: dashboardCookie });
+    assert.equal(logs.status, 200);
+    assert.equal(logs.json.ok, true);
+    assert.ok(Array.isArray(logs.json.logs));
+  });
+
+  await t.test('dashboard control actions drive the same agent path', async () => {
+    const denied = await request(port, {
+      method: 'POST', path: '/dashboard/action', body: { action: 'offline' },
+    });
+    assert.equal(denied.status, 401);
+
+    const csrf = await dashboardPost('/dashboard/action', { action: 'offline' }, {
+      headers: { Origin: 'https://evil.example' },
+    });
+    assert.equal(csrf.status, 403);
+
+    const offline = await dashboardPost('/dashboard/action', { action: 'offline' });
+    assert.equal(offline.status, 200);
+    assert.equal(offline.json.ok, true);
+    assert.equal(bridge.isAgentOffline(), true);
+    assert.equal(bridge.bridgeStateSnapshot().offline, true);
+    assert.equal(fs.readFileSync(path.join(DATA, 'stop_flag'), 'utf8'), '1');
+    assert.equal(fs.existsSync(path.join(DATA, 'agent_offline')), true);
+
+    const online = await dashboardPost('/dashboard/action', { action: 'start_agent' });
+    assert.equal(online.status, 200);
+    assert.equal(bridge.isAgentOffline(), false);
+    assert.equal(bridge.bridgeStateSnapshot().offline, false);
+    assert.equal(fs.readFileSync(path.join(DATA, 'stop_flag'), 'utf8'), '0');
+    assert.equal(fs.existsSync(path.join(DATA, 'agent_offline')), false);
+
+    const stopped = await dashboardPost('/dashboard/action', { action: 'stop_agent' });
+    assert.equal(stopped.status, 200);
+    assert.equal(stopped.json.msg, 'stopping…');
+
+    const bad = await dashboardPost('/dashboard/action', { action: 'nope' });
+    assert.equal(bad.status, 400);
+  });
+
+  await t.test('dashboard pairing validates the phone through requestPairing', async () => {
+    const bad = await dashboardPost('/dashboard/pair', { phone: '12' });
+    assert.equal(bad.status, 400);
+    assert.match(bad.json.error, /full international number/);
+  });
+
+  await t.test('dashboard exec validates the command before touching the box', async () => {
+    const empty = await dashboardPost('/dashboard/exec', { command: '   ' });
+    assert.equal(empty.status, 400);
+    assert.match(empty.json.error, /command is empty/);
+
+    const long = await dashboardPost('/dashboard/exec', { command: 'x'.repeat(8001) });
+    assert.equal(long.status, 400);
+    assert.match(long.json.error, /too long/);
+  });
+
+  await t.test('dashboard logs redact phone numbers', async () => {
+    console.log('info: dashboard log redaction 2348012345678');
+    const res = await dashboardGet('/dashboard/logs?limit=50', { cookie: dashboardCookie });
+    assert.equal(res.status, 200);
+    const text = res.json.logs.map((e) => e.line).join('\n');
+    assert.match(text, /dashboard log redaction/);
+    assert.doesNotMatch(text, /2348012345678/);
   });
 
   await t.test('captioned media keeps its caption and its attachment hint', async () => {
