@@ -923,10 +923,28 @@ test('bridge endpoint security and actions', async (t) => {
     assert.equal(form.headers.location, '/dashboard');
     assert.match(String(form.headers['set-cookie']), /liam_pair=/);
 
+    // Phone webviews and proxies can rewrite Origin/Host. The token is the
+    // credential on login, so a rewritten origin must not lock the owner out.
+    const proxied = await request(port, {
+      method: 'POST', path: '/dashboard/login',
+      body: `token=${encodeURIComponent(bridge.PAIR_TOKEN)}`,
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        Origin: 'https://proxy.example',
+        'Sec-Fetch-Site': 'same-origin',
+      },
+    });
+    assert.equal(proxied.status, 303);
+    assert.match(String(proxied.headers['set-cookie']), /liam_pair=/);
+
     const wrong = await request(port, {
       method: 'POST', path: '/dashboard/login',
       body: 'token=nope',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        Origin: 'https://proxy.example',
+        'Sec-Fetch-Site': 'same-origin',
+      },
     });
     assert.equal(wrong.status, 403);
     assert.match(wrong.text, /invalid token/);
@@ -958,6 +976,19 @@ test('bridge endpoint security and actions', async (t) => {
       headers: { Origin: 'https://evil.example' },
     });
     assert.equal(csrf.status, 403);
+
+    // A cross-site fetch is still rejected even with a valid session.
+    const crossSite = await dashboardPost('/dashboard/action', { action: 'stop_agent' }, {
+      headers: { Origin: 'https://liamagent.onrender.com', 'Sec-Fetch-Site': 'cross-site' },
+    });
+    assert.equal(crossSite.status, 403);
+
+    // A same-origin request behind a rewriting proxy is trusted by the
+    // browser-controlled Sec-Fetch-Site header.
+    const proxied = await dashboardPost('/dashboard/action', { action: 'stop_agent' }, {
+      headers: { Origin: 'https://proxy.example', 'Sec-Fetch-Site': 'same-origin' },
+    });
+    assert.equal(proxied.status, 200);
 
     const offline = await dashboardPost('/dashboard/action', { action: 'offline' });
     assert.equal(offline.status, 200);

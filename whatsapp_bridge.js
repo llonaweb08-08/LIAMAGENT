@@ -3103,7 +3103,12 @@ function pairCookieHeader(req) {
 }
 
 function sameOriginRequest(req) {
-  if (String(req.headers["sec-fetch-site"] || "").toLowerCase() === "cross-site") return false;
+  const site = String(req.headers["sec-fetch-site"] || "").toLowerCase();
+  // Sec-Fetch-Site is set by the browser and cannot be forged by page script.
+  // A same-origin request is safe even when a proxy or webview rewrites the
+  // Origin/Host headers; a cross-site one is not.
+  if (site === "same-origin" || site === "none") return true;
+  if (site === "cross-site") return false;
   const origin = String(req.headers.origin || "");
   const referer = String(req.headers.referer || "");
   if (!origin && !referer) return true; // non-browser token clients
@@ -4476,9 +4481,11 @@ const server = http.createServer(async (req, res) => {
         const data = /application\/json/i.test(type)
           ? JSON.parse(raw || "{}")
           : Object.fromEntries(new URLSearchParams(raw || ""));
-        if (!sameOriginRequest(req)) {
-          return sendHtml(res, 403, dashboardLoginPage("invalid request origin"), dashboardCsp(""));
-        }
+        // The pair token is the credential here. A cross-site form post cannot
+        // do anything without it, and the session cookie is SameSite=Strict, so
+        // the origin gate that protects cookie-authenticated mutations is not
+        // needed on login. Some phone webviews report a null/rewritten origin,
+        // which would otherwise lock the owner out of their own dashboard.
         if (!pairTokenOk(String(data.token || ""))) {
           // Slow down guessing without making a legitimate retry painful.
           await sleep(350);
