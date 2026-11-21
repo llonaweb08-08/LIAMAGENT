@@ -913,6 +913,23 @@ test('bridge endpoint security and actions', async (t) => {
     assert.match(csp, /script-src 'nonce-/);
     assert.match(csp, /connect-src 'self'/);
     assert.doesNotMatch(page.text, /__NONCE__/);
+
+    const form = await request(port, {
+      method: 'POST', path: '/dashboard/login',
+      body: `token=${encodeURIComponent(bridge.PAIR_TOKEN)}`,
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    });
+    assert.equal(form.status, 303);
+    assert.equal(form.headers.location, '/dashboard');
+    assert.match(String(form.headers['set-cookie']), /liam_pair=/);
+
+    const wrong = await request(port, {
+      method: 'POST', path: '/dashboard/login',
+      body: 'token=nope',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    });
+    assert.equal(wrong.status, 403);
+    assert.match(wrong.text, /invalid token/);
   });
 
   await t.test('dashboard state and logs need the session', async () => {
